@@ -54,12 +54,17 @@ def pack_solution(output_path: Path = None) -> Path:
 
     # Create build spec
     dps = build_config.get("destination_passing_style", True)
-    spec = BuildSpec(
-        language=language,
-        target_hardware=["cuda"],
-        entry_point=entry_point,
-        destination_passing_style=dps,
-    )
+    spec_kwargs = {
+        "language": language,
+        "target_hardware": ["cuda"],
+        "entry_point": entry_point,
+        "destination_passing_style": dps,
+    }
+    binding = build_config.get("binding")
+    if binding:
+        spec_kwargs["binding"] = binding
+
+    spec = BuildSpec(**spec_kwargs)
 
     # Pack the solution
     solution = pack_solution_from_files(
