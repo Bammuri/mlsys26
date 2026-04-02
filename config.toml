@@ -7,6 +7,6 @@ author = "team-name"                         # Team/author name
 [build]
 language = "cuda"                 # triton | cuda
 # entry_point = "kernel.cu::gdn_prefill" # Switch to kernel.cu::gdn_prefill for prefill
-entry_point = "kernel.cu::gdn_decode" # Switch to kernel.cu::gdn_prefill for prefill
-binding = "torch"
-destination_passing_style = false
+entry_point = "kernel.cu::gdn_decode_qk4_v8_d128_k_last" # TVM FFI decode entrypoint
+binding = "tvm-ffi"
+destination_passing_style = true

@@ -1,536 +1,275 @@
-#include <cmath>
-#include <tuple>
+/*
+ * Gated Delta Net decode kernel for MLSys 2026.
+ *
+ * This is a correctness-first implementation that mirrors the reference
+ * definition in definitions/gdn/gdn_decode_qk4_v8_d128_k_last.json.
+ */
 
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
+#include <cmath>
+#include <cstdint>
+
+#include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-namespace py = pybind11;
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/error.h>
+#include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/function.h>
+
 namespace {
 
-constexpr int64_t kNumQHeads = 4;
-constexpr int64_t kNumKHeads = 4;
-constexpr int64_t kNumVHeads = 8;
-constexpr int64_t kHeadSize = 128;
+using tvm::ffi::TensorView;
+namespace cg = cooperative_groups;
 
-double resolve_scale(double scale) {
-    return scale == 0.0 ? 1.0 / std::sqrt(static_cast<double>(kHeadSize)) : scale;
+constexpr int kSeqLen = 1;
+constexpr int kNumQHeads = 4;
+constexpr int kNumKHeads = 4;
+constexpr int kNumVHeads = 8;
+constexpr int kHeadSize = 128;
+constexpr int kVTileRows = 32;
+constexpr int kMaxTrackedCudaDevices = 16;
+
+__device__ inline float load_bf16(const __nv_bfloat16* ptr, int64_t idx) {
+  return __bfloat162float(ptr[idx]);
 }
 
-void check_common_inputs(
-    const torch::Tensor& A_log,
-    const torch::Tensor& dt_bias) {
-    TORCH_CHECK(A_log.dim() == 1 && A_log.size(0) == kNumVHeads, "A_log must have shape [8]");
-    TORCH_CHECK(dt_bias.dim() == 1 && dt_bias.size(0) == kNumVHeads, "dt_bias must have shape [8]");
+__device__ inline void store_bf16(__nv_bfloat16* ptr, int64_t idx, float value) {
+  ptr[idx] = __float2bfloat16(value);
 }
 
-torch::Tensor expand_heads(const torch::Tensor& tensor, int64_t target_heads) {
-    const auto source_heads = tensor.size(1);
-    TORCH_CHECK(target_heads % source_heads == 0, "target heads must be divisible by source heads");
-    const auto factor = target_heads / source_heads;
-    auto indices = torch::floor_divide(
-        torch::arange(target_heads, tensor.options().dtype(torch::kLong)),
-        factor
-    );
-    return tensor.index_select(1, indices);
+__global__ void gdn_decode_optimized_kernel(const __nv_bfloat16* __restrict__ q,
+                                            const __nv_bfloat16* __restrict__ k,
+                                            const __nv_bfloat16* __restrict__ v,
+                                            const float* __restrict__ state,
+                                            const float* __restrict__ A_log,
+                                            const __nv_bfloat16* __restrict__ a,
+                                            const float* __restrict__ dt_bias,
+                                            const __nv_bfloat16* __restrict__ b, float scale,
+                                            __nv_bfloat16* __restrict__ output,
+                                            float* __restrict__ new_state) {
+  int64_t batch_idx = blockIdx.x;
+  int64_t hv_idx = blockIdx.y;
+  int64_t v_tile = blockIdx.z;
+  int local_v_idx = threadIdx.x;
+  int64_t v_idx = v_tile * kVTileRows + local_v_idx;
+  if (v_idx >= kHeadSize) {
+    return;
+  }
+
+  constexpr int64_t kGroupQ = kNumVHeads / kNumQHeads;
+  constexpr int64_t kGroupK = kNumVHeads / kNumKHeads;
+  int64_t q_head = hv_idx / kGroupQ;
+  int64_t k_head = hv_idx / kGroupK;
+
+  int64_t q_base = (((batch_idx * kSeqLen) * kNumQHeads + q_head) * kHeadSize);
+  int64_t k_base = (((batch_idx * kSeqLen) * kNumKHeads + k_head) * kHeadSize);
+  int64_t v_base = (((batch_idx * kSeqLen) * kNumVHeads + hv_idx) * kHeadSize);
+  int64_t state_base = (((batch_idx * kNumVHeads + hv_idx) * kHeadSize + v_idx) * kHeadSize);
+  int64_t output_base = (((batch_idx * kSeqLen) * kNumVHeads + hv_idx) * kHeadSize + v_idx);
+
+  cg::thread_block cta = cg::this_thread_block();
+  extern __shared__ float shared_storage[];
+  float* state_sh = shared_storage;
+  float* q_sh = state_sh + (kVTileRows * kHeadSize);
+  float* k_sh = q_sh + kHeadSize;
+  __shared__ float g_gate_sh;
+  __shared__ float beta_sh;
+
+  const float* state_tile =
+      state + ((((batch_idx * kNumVHeads + hv_idx) * kHeadSize) + v_tile * kVTileRows) * kHeadSize);
+  cg::memcpy_async(cta, state_sh, state_tile, sizeof(float) * kVTileRows * kHeadSize);
+
+  const __nv_bfloat162* q_vec2 = reinterpret_cast<const __nv_bfloat162*>(q + q_base);
+  const __nv_bfloat162* k_vec2 = reinterpret_cast<const __nv_bfloat162*>(k + k_base);
+  for (int idx = local_v_idx; idx < kHeadSize / 2; idx += blockDim.x) {
+    float2 q_vals = __bfloat1622float2(q_vec2[idx]);
+    float2 k_vals = __bfloat1622float2(k_vec2[idx]);
+    int dst = idx * 2;
+    q_sh[dst] = q_vals.x;
+    q_sh[dst + 1] = q_vals.y;
+    k_sh[dst] = k_vals.x;
+    k_sh[dst + 1] = k_vals.y;
+  }
+
+  if (local_v_idx == 0) {
+    int64_t gate_base = ((batch_idx * kSeqLen) * kNumVHeads + hv_idx);
+    g_gate_sh =
+        expf(-expf(A_log[hv_idx]) * log1pf(expf(load_bf16(a, gate_base) + dt_bias[hv_idx])));
+    beta_sh = 1.0f / (1.0f + expf(-load_bf16(b, gate_base)));
+  }
+  cg::wait(cta);
+  __syncthreads();
+
+  float v_value = load_bf16(v, v_base + v_idx);
+  float* state_row = state_sh + static_cast<int64_t>(local_v_idx) * kHeadSize;
+  const float4* state_row_vec4 = reinterpret_cast<const float4*>(state_row);
+  const float4* q_vec4 = reinterpret_cast<const float4*>(q_sh);
+  const float4* k_vec4 = reinterpret_cast<const float4*>(k_sh);
+
+  float old_v = 0.0f;
+  #pragma unroll
+  for (int k_idx = 0; k_idx < kHeadSize / 4; ++k_idx) {
+    float4 state_vals = state_row_vec4[k_idx];
+    float4 k_vals = k_vec4[k_idx];
+    old_v += k_vals.x * state_vals.x + k_vals.y * state_vals.y + k_vals.z * state_vals.z +
+             k_vals.w * state_vals.w;
+  }
+  old_v *= g_gate_sh;
+
+  float new_v = beta_sh * v_value + (1.0f - beta_sh) * old_v;
+  float delta = new_v - old_v;
+  float out = 0.0f;
+  float4* new_state_vec4 = reinterpret_cast<float4*>(new_state + state_base);
+  #pragma unroll
+  for (int k_idx = 0; k_idx < kHeadSize / 4; ++k_idx) {
+    float4 state_vals = state_row_vec4[k_idx];
+    float4 q_vals = q_vec4[k_idx];
+    float4 k_vals = k_vec4[k_idx];
+    float4 new_state_vals = make_float4(g_gate_sh * state_vals.x + k_vals.x * delta,
+                                        g_gate_sh * state_vals.y + k_vals.y * delta,
+                                        g_gate_sh * state_vals.z + k_vals.z * delta,
+                                        g_gate_sh * state_vals.w + k_vals.w * delta);
+    new_state_vec4[k_idx] = new_state_vals;
+    out += q_vals.x * new_state_vals.x + q_vals.y * new_state_vals.y +
+           q_vals.z * new_state_vals.z + q_vals.w * new_state_vals.w;
+  }
+
+  store_bf16(output, output_base, scale * out);
 }
 
-__device__ __forceinline__ float load_bf16(const __nv_bfloat16* ptr) {
-    return __bfloat162float(*ptr);
+inline void check_cuda_tensor(const TensorView& tensor, const char* name) {
+  TVM_FFI_ICHECK_EQ(tensor.device().device_type, kDLCUDA)
+      << name << " must be a CUDA tensor";
+  TVM_FFI_ICHECK(tensor.IsContiguous()) << name << " must be contiguous";
 }
 
-__device__ __forceinline__ float4 load_global_v4(const float* ptr) {
-    float4 value;
-    asm volatile(
-        "ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
-        : "=f"(value.x), "=f"(value.y), "=f"(value.z), "=f"(value.w)
-        : "l"(ptr)
-    );
-    return value;
+inline void check_bfloat16_tensor(const TensorView& tensor, const char* name) {
+  TVM_FFI_ICHECK_EQ(tensor.dtype().code, kDLBfloat) << name << " must use bfloat16";
+  TVM_FFI_ICHECK_EQ(tensor.dtype().bits, 16) << name << " must use bfloat16";
 }
 
-__device__ __forceinline__ void store_global_v4(float* ptr, const float4& value) {
-    asm volatile(
-        "st.global.v4.f32 [%0], {%1, %2, %3, %4};"
-        :
-        : "l"(ptr), "f"(value.x), "f"(value.y), "f"(value.z), "f"(value.w)
-    );
-}
-
-__device__ __forceinline__ float warp_sum(float value) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        value += __shfl_down_sync(0xffffffff, value, offset);
-    }
-    return value;
-}
-
-__global__ __launch_bounds__(128, 8) void gdn_decode_kernel(
-    const __nv_bfloat16* __restrict__ q,
-    const __nv_bfloat16* __restrict__ k,
-    const __nv_bfloat16* __restrict__ v,
-    const float* __restrict__ state,
-    const float* __restrict__ A_log,
-    const __nv_bfloat16* __restrict__ a,
-    const float* __restrict__ dt_bias,
-    const __nv_bfloat16* __restrict__ b,
-    __nv_bfloat16* __restrict__ output,
-    float* __restrict__ new_state,
-    int batch_size,
-    float scale) {
-    const int batch_idx = blockIdx.x;
-    const int v_head_idx = blockIdx.y;
-    const int lane = threadIdx.x;
-
-    __shared__ float sh_q[kHeadSize];
-    __shared__ float sh_k[kHeadSize];
-    __shared__ float sh_qk;
-    __shared__ float sh_g;
-    __shared__ float sh_beta;
-    __shared__ float warp_partials[4];
-
-    const int q_head_idx = v_head_idx >> 1;
-    const int q_base = (((batch_idx * 1 + 0) * kNumQHeads + q_head_idx) * kHeadSize);
-    const int k_base = (((batch_idx * 1 + 0) * kNumKHeads + q_head_idx) * kHeadSize);
-    if (lane < kHeadSize) {
-        sh_q[lane] = load_bf16(q + q_base + lane);
-        sh_k[lane] = load_bf16(k + k_base + lane);
-    }
-
-    float qk_partial = sh_q[lane] * sh_k[lane];
-    qk_partial = warp_sum(qk_partial);
-    if ((lane & 31) == 0) {
-        warp_partials[lane >> 5] = qk_partial;
-    }
-    __syncthreads();
-
-    if (lane == 0) {
-        float qk = 0.0f;
-        #pragma unroll
-        for (int warp_idx = 0; warp_idx < 4; ++warp_idx) {
-            qk += warp_partials[warp_idx];
-        }
-        sh_qk = qk;
-
-        const int gate_base = (batch_idx * 1 + 0) * kNumVHeads + v_head_idx;
-        const float a_val = load_bf16(a + gate_base);
-        const float b_val = load_bf16(b + gate_base);
-        const float x = a_val + dt_bias[v_head_idx];
-        sh_g = expf(-expf(A_log[v_head_idx]) * log1pf(expf(x)));
-        sh_beta = 1.0f / (1.0f + expf(-b_val));
-    }
-    __syncthreads();
-
-    const int row_idx = lane;
-    const int state_row_base =
-        (((batch_idx * kNumVHeads + v_head_idx) * kHeadSize + row_idx) * kHeadSize);
-    const int output_base =
-        (((batch_idx * 1 + 0) * kNumVHeads + v_head_idx) * kHeadSize + row_idx);
-
-    const float* state_row_ptr = state + state_row_base;
-    float* new_state_row_ptr = new_state + state_row_base;
-
-    float old_v = 0.0f;
-    float q_old = 0.0f;
-    #pragma unroll 8
-    for (int k_idx = 0; k_idx < kHeadSize; k_idx += 4) {
-        const float4 state_vec = load_global_v4(state_row_ptr + k_idx);
-        const float4 q_vec = *reinterpret_cast<const float4*>(&sh_q[k_idx]);
-        const float4 k_vec = *reinterpret_cast<const float4*>(&sh_k[k_idx]);
-        old_v = fmaf(k_vec.x, state_vec.x, old_v);
-        old_v = fmaf(k_vec.y, state_vec.y, old_v);
-        old_v = fmaf(k_vec.z, state_vec.z, old_v);
-        old_v = fmaf(k_vec.w, state_vec.w, old_v);
-        q_old = fmaf(q_vec.x, state_vec.x, q_old);
-        q_old = fmaf(q_vec.y, state_vec.y, q_old);
-        q_old = fmaf(q_vec.z, state_vec.z, q_old);
-        q_old = fmaf(q_vec.w, state_vec.w, q_old);
-    }
-    old_v *= sh_g;
-    q_old *= sh_g;
-
-    const float v_val = load_bf16(v + output_base);
-    const float delta = sh_beta * (v_val - old_v);
-
-    #pragma unroll 8
-    for (int k_idx = 0; k_idx < kHeadSize; k_idx += 4) {
-        const float4 state_vec = load_global_v4(state_row_ptr + k_idx);
-        const float4 k_vec = *reinterpret_cast<const float4*>(&sh_k[k_idx]);
-        float4 updated;
-        updated.x = fmaf(k_vec.x, delta, sh_g * state_vec.x);
-        updated.y = fmaf(k_vec.y, delta, sh_g * state_vec.y);
-        updated.z = fmaf(k_vec.z, delta, sh_g * state_vec.z);
-        updated.w = fmaf(k_vec.w, delta, sh_g * state_vec.w);
-        store_global_v4(new_state_row_ptr + k_idx, updated);
-    }
-
-    const float out_val = scale * (q_old + sh_qk * delta);
-    output[output_base] = __float2bfloat16(out_val);
-}
-
-__global__ __launch_bounds__(256, 4) void gdn_decode_paired_heads_kernel(
-    const __nv_bfloat16* __restrict__ q,
-    const __nv_bfloat16* __restrict__ k,
-    const __nv_bfloat16* __restrict__ v,
-    const float* __restrict__ state,
-    const float* __restrict__ A_log,
-    const __nv_bfloat16* __restrict__ a,
-    const float* __restrict__ dt_bias,
-    const __nv_bfloat16* __restrict__ b,
-    __nv_bfloat16* __restrict__ output,
-    float* __restrict__ new_state,
-    float scale) {
-    const int batch_idx = blockIdx.x;
-    const int q_head_idx = blockIdx.y;
-    const int lane = threadIdx.x & 127;
-    const int group_idx = threadIdx.x >> 7;
-    const int v_head_idx = q_head_idx * 2 + group_idx;
-
-    __shared__ float sh_q[kHeadSize];
-    __shared__ float sh_k[kHeadSize];
-    __shared__ float sh_qk;
-    __shared__ float sh_g[2];
-    __shared__ float sh_beta[2];
-    __shared__ float warp_partials[4];
-
-    const int q_base = (((batch_idx * 1 + 0) * kNumQHeads + q_head_idx) * kHeadSize);
-    const int k_base = (((batch_idx * 1 + 0) * kNumKHeads + q_head_idx) * kHeadSize);
-    if (threadIdx.x < kHeadSize) {
-        sh_q[threadIdx.x] = load_bf16(q + q_base + threadIdx.x);
-        sh_k[threadIdx.x] = load_bf16(k + k_base + threadIdx.x);
-    }
-
-    float qk_partial = 0.0f;
-    if (threadIdx.x < kHeadSize) {
-        qk_partial = sh_q[threadIdx.x] * sh_k[threadIdx.x];
-    }
-    qk_partial = warp_sum(qk_partial);
-    if (threadIdx.x < kHeadSize && (threadIdx.x & 31) == 0) {
-        warp_partials[threadIdx.x >> 5] = qk_partial;
-    }
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-        float qk = 0.0f;
-        #pragma unroll
-        for (int warp_idx = 0; warp_idx < 4; ++warp_idx) {
-            qk += warp_partials[warp_idx];
-        }
-        sh_qk = qk;
-    }
-
-    if (threadIdx.x < 2) {
-        const int head = q_head_idx * 2 + threadIdx.x;
-        const int gate_base = (batch_idx * 1 + 0) * kNumVHeads + head;
-        const float a_val = load_bf16(a + gate_base);
-        const float b_val = load_bf16(b + gate_base);
-        const float x = a_val + dt_bias[head];
-        sh_g[threadIdx.x] = expf(-expf(A_log[head]) * log1pf(expf(x)));
-        sh_beta[threadIdx.x] = 1.0f / (1.0f + expf(-b_val));
-    }
-    __syncthreads();
-
-    const int row_idx = lane;
-    const int state_row_base =
-        (((batch_idx * kNumVHeads + v_head_idx) * kHeadSize + row_idx) * kHeadSize);
-    const int output_base =
-        (((batch_idx * 1 + 0) * kNumVHeads + v_head_idx) * kHeadSize + row_idx);
-
-    const float* state_row_ptr = state + state_row_base;
-    float* new_state_row_ptr = new_state + state_row_base;
-
-    float old_v = 0.0f;
-    float q_old = 0.0f;
-    #pragma unroll 8
-    for (int k_idx = 0; k_idx < kHeadSize; k_idx += 4) {
-        const float4 state_vec = load_global_v4(state_row_ptr + k_idx);
-        const float4 q_vec = *reinterpret_cast<const float4*>(&sh_q[k_idx]);
-        const float4 k_vec = *reinterpret_cast<const float4*>(&sh_k[k_idx]);
-        old_v = fmaf(k_vec.x, state_vec.x, old_v);
-        old_v = fmaf(k_vec.y, state_vec.y, old_v);
-        old_v = fmaf(k_vec.z, state_vec.z, old_v);
-        old_v = fmaf(k_vec.w, state_vec.w, old_v);
-        q_old = fmaf(q_vec.x, state_vec.x, q_old);
-        q_old = fmaf(q_vec.y, state_vec.y, q_old);
-        q_old = fmaf(q_vec.z, state_vec.z, q_old);
-        q_old = fmaf(q_vec.w, state_vec.w, q_old);
-    }
-    old_v *= sh_g[group_idx];
-    q_old *= sh_g[group_idx];
-
-    const float v_val = load_bf16(v + output_base);
-    const float delta = sh_beta[group_idx] * (v_val - old_v);
-
-    #pragma unroll 8
-    for (int k_idx = 0; k_idx < kHeadSize; k_idx += 4) {
-        const float4 state_vec = load_global_v4(state_row_ptr + k_idx);
-        const float4 k_vec = *reinterpret_cast<const float4*>(&sh_k[k_idx]);
-        float4 updated;
-        updated.x = fmaf(k_vec.x, delta, sh_g[group_idx] * state_vec.x);
-        updated.y = fmaf(k_vec.y, delta, sh_g[group_idx] * state_vec.y);
-        updated.z = fmaf(k_vec.z, delta, sh_g[group_idx] * state_vec.z);
-        updated.w = fmaf(k_vec.w, delta, sh_g[group_idx] * state_vec.w);
-        store_global_v4(new_state_row_ptr + k_idx, updated);
-    }
-
-    const float out_val = scale * (q_old + sh_qk * delta);
-    output[output_base] = __float2bfloat16(out_val);
-}
-
-bool use_b200_small_batch_path(int64_t batch_size) {
-    if (batch_size > 8) {
-        return false;
-    }
-    cudaDeviceProp prop{};
-    cudaGetDeviceProperties(&prop, at::cuda::current_device());
-    return prop.major >= 10;
-}
-
-std::tuple<torch::Tensor, torch::Tensor> gdn_decode_reference(
-    const torch::Tensor& q,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const c10::optional<torch::Tensor>& state,
-    const torch::Tensor& A_log,
-    const torch::Tensor& a,
-    const torch::Tensor& dt_bias,
-    const torch::Tensor& b,
-    double scale) {
-    auto q_f32 = q.squeeze(1).to(torch::kFloat);
-    auto k_f32 = k.squeeze(1).to(torch::kFloat);
-    auto v_f32 = v.squeeze(1).to(torch::kFloat);
-    auto a_f32 = a.to(torch::kFloat);
-    auto b_f32 = b.to(torch::kFloat);
-    auto A_log_f32 = A_log.to(q.device(), torch::kFloat);
-    auto dt_bias_f32 = dt_bias.to(q.device(), torch::kFloat);
-
-    auto g = torch::exp(-torch::exp(A_log_f32) * torch::softplus(a_f32 + dt_bias_f32, 1.0, 20.0));
-    auto beta = torch::sigmoid(b_f32);
-
-    auto q_exp = expand_heads(q_f32, kNumVHeads);
-    auto k_exp = expand_heads(k_f32, kNumVHeads);
-
-    torch::Tensor state_f32;
-    if (state.has_value() && state->defined()) {
-        state_f32 = state->to(torch::kFloat);
-    } else {
-        state_f32 = torch::zeros({q.size(0), kNumVHeads, kHeadSize, kHeadSize},
-                                 torch::TensorOptions().device(q.device()).dtype(torch::kFloat));
-    }
-
-    auto new_state = torch::zeros_like(state_f32);
-    auto output = torch::zeros({q.size(0), kNumVHeads, kHeadSize},
-                               torch::TensorOptions().device(q.device()).dtype(torch::kFloat));
-
-    for (int64_t batch_idx = 0; batch_idx < q.size(0); ++batch_idx) {
-        for (int64_t head_idx = 0; head_idx < kNumVHeads; ++head_idx) {
-            auto q_h = q_exp.index({batch_idx, head_idx});
-            auto k_h = k_exp.index({batch_idx, head_idx});
-            auto v_h = v_f32.index({batch_idx, head_idx});
-            auto h_state = state_f32.index({batch_idx, head_idx}).clone().transpose(-1, -2);
-            auto g_val = g.index({batch_idx, 0, head_idx});
-            auto beta_val = beta.index({batch_idx, 0, head_idx});
-
-            auto old_state = g_val * h_state;
-            auto old_v = torch::matmul(k_h, old_state);
-            auto new_v = beta_val * v_h + (1.0 - beta_val) * old_v;
-            auto state_remove = torch::matmul(k_h.unsqueeze(1), old_v.unsqueeze(0));
-            auto state_update = torch::matmul(k_h.unsqueeze(1), new_v.unsqueeze(0));
-            h_state = old_state - state_remove + state_update;
-
-            output.index_put_({batch_idx, head_idx}, scale * torch::matmul(q_h, h_state));
-            new_state.index_put_({batch_idx, head_idx}, h_state.transpose(-1, -2));
-        }
-    }
-
-    return std::make_tuple(output.unsqueeze(1).to(torch::kBFloat16), new_state);
-}
-
-std::tuple<torch::Tensor, torch::Tensor> gdn_decode(
-    const torch::Tensor& q,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const c10::optional<torch::Tensor>& state,
-    const torch::Tensor& A_log,
-    const torch::Tensor& a,
-    const torch::Tensor& dt_bias,
-    const torch::Tensor& b,
-    double scale = 0.0) {
-    TORCH_CHECK(q.dim() == 4 && q.size(1) == 1 && q.size(2) == kNumQHeads && q.size(3) == kHeadSize,
-                "q must have shape [B, 1, 4, 128]");
-    TORCH_CHECK(k.dim() == 4 && k.size(1) == 1 && k.size(2) == kNumKHeads && k.size(3) == kHeadSize,
-                "k must have shape [B, 1, 4, 128]");
-    TORCH_CHECK(v.dim() == 4 && v.size(1) == 1 && v.size(2) == kNumVHeads && v.size(3) == kHeadSize,
-                "v must have shape [B, 1, 8, 128]");
-    TORCH_CHECK(a.dim() == 3 && a.size(0) == q.size(0) && a.size(1) == 1 && a.size(2) == kNumVHeads,
-                "a must have shape [B, 1, 8]");
-    TORCH_CHECK(b.dim() == 3 && b.size(0) == q.size(0) && b.size(1) == 1 && b.size(2) == kNumVHeads,
-                "b must have shape [B, 1, 8]");
-    check_common_inputs(A_log, dt_bias);
-
-    const auto batch_size = q.size(0);
-    const auto scale_value = resolve_scale(scale);
-    if (!q.is_cuda()) {
-        return gdn_decode_reference(q, k, v, state, A_log, a, dt_bias, b, scale_value);
-    }
-
-    const auto device = q.device();
-    auto q_cuda = q.contiguous();
-    auto k_cuda = k.contiguous();
-    auto v_cuda = v.contiguous();
-    auto a_cuda = a.contiguous();
-    auto b_cuda = b.contiguous();
-    auto A_log_cuda = A_log.to(device, torch::kFloat).contiguous();
-    auto dt_bias_cuda = dt_bias.to(device, torch::kFloat).contiguous();
-
-    torch::Tensor state_cuda;
-    if (state.has_value() && state->defined()) {
-        TORCH_CHECK(state->dim() == 4 && state->size(0) == batch_size && state->size(1) == kNumVHeads &&
-                        state->size(2) == kHeadSize && state->size(3) == kHeadSize,
-                    "state must have shape [B, 8, 128, 128]");
-        state_cuda = state->to(device, torch::kFloat).contiguous();
-    } else {
-        state_cuda = torch::zeros({batch_size, kNumVHeads, kHeadSize, kHeadSize},
-                                  torch::TensorOptions().device(device).dtype(torch::kFloat));
-    }
-
-    auto output = torch::empty({batch_size, 1, kNumVHeads, kHeadSize},
-                               torch::TensorOptions().device(device).dtype(torch::kBFloat16));
-    auto new_state = torch::empty_like(state_cuda);
-
-    auto stream = at::cuda::getCurrentCUDAStream();
-    if (use_b200_small_batch_path(batch_size)) {
-        const dim3 grid(batch_size, kNumQHeads);
-        const dim3 block(256);
-        gdn_decode_paired_heads_kernel<<<grid, block, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(q_cuda.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const __nv_bfloat16*>(k_cuda.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const __nv_bfloat16*>(v_cuda.data_ptr<at::BFloat16>()),
-            state_cuda.data_ptr<float>(),
-            A_log_cuda.data_ptr<float>(),
-            reinterpret_cast<const __nv_bfloat16*>(a_cuda.data_ptr<at::BFloat16>()),
-            dt_bias_cuda.data_ptr<float>(),
-            reinterpret_cast<const __nv_bfloat16*>(b_cuda.data_ptr<at::BFloat16>()),
-            reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
-            new_state.data_ptr<float>(),
-            static_cast<float>(scale_value));
-    } else {
-        const dim3 grid(batch_size, kNumVHeads);
-        const dim3 block(kHeadSize);
-        gdn_decode_kernel<<<grid, block, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(q_cuda.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const __nv_bfloat16*>(k_cuda.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const __nv_bfloat16*>(v_cuda.data_ptr<at::BFloat16>()),
-            state_cuda.data_ptr<float>(),
-            A_log_cuda.data_ptr<float>(),
-            reinterpret_cast<const __nv_bfloat16*>(a_cuda.data_ptr<at::BFloat16>()),
-            dt_bias_cuda.data_ptr<float>(),
-            reinterpret_cast<const __nv_bfloat16*>(b_cuda.data_ptr<at::BFloat16>()),
-            reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
-            new_state.data_ptr<float>(),
-            static_cast<int>(batch_size),
-            static_cast<float>(scale_value));
-    }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    return std::make_tuple(output, new_state);
-}
-
-std::tuple<torch::Tensor, torch::Tensor> gdn_prefill(
-    const torch::Tensor& q,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const c10::optional<torch::Tensor>& state,
-    const torch::Tensor& A_log,
-    const torch::Tensor& a,
-    const torch::Tensor& dt_bias,
-    const torch::Tensor& b,
-    const torch::Tensor& cu_seqlens,
-    double scale = 0.0) {
-    TORCH_CHECK(q.dim() == 3 && q.size(1) == kNumQHeads && q.size(2) == kHeadSize,
-                "q must have shape [T, 4, 128]");
-    TORCH_CHECK(k.dim() == 3 && k.size(1) == kNumKHeads && k.size(2) == kHeadSize,
-                "k must have shape [T, 4, 128]");
-    TORCH_CHECK(v.dim() == 3 && v.size(1) == kNumVHeads && v.size(2) == kHeadSize,
-                "v must have shape [T, 8, 128]");
-    TORCH_CHECK(a.dim() == 2 && a.size(0) == q.size(0) && a.size(1) == kNumVHeads,
-                "a must have shape [T, 8]");
-    TORCH_CHECK(b.dim() == 2 && b.size(0) == q.size(0) && b.size(1) == kNumVHeads,
-                "b must have shape [T, 8]");
-    TORCH_CHECK(cu_seqlens.dim() == 1, "cu_seqlens must be 1D");
-    check_common_inputs(A_log, dt_bias);
-
-    const auto total_seq_len = q.size(0);
-    const auto num_seqs = cu_seqlens.size(0) - 1;
-    const auto scale_value = resolve_scale(scale);
-    const auto device = q.device();
-
-    auto q_f32 = q.to(torch::kFloat);
-    auto k_f32 = k.to(torch::kFloat);
-    auto v_f32 = v.to(torch::kFloat);
-    auto a_f32 = a.to(torch::kFloat);
-    auto b_f32 = b.to(torch::kFloat);
-    auto A_log_f32 = A_log.to(device, torch::kFloat);
-    auto dt_bias_f32 = dt_bias.to(device, torch::kFloat);
-
-    auto g = torch::exp(-torch::exp(A_log_f32) * torch::softplus(a_f32 + dt_bias_f32, 1.0, 20.0));
-    auto beta = torch::sigmoid(b_f32);
-
-    auto q_exp = expand_heads(q_f32, kNumVHeads);
-    auto k_exp = expand_heads(k_f32, kNumVHeads);
-
-    torch::Tensor state_f32;
-    if (state.has_value() && state->defined()) {
-        TORCH_CHECK(state->dim() == 4 && state->size(0) == num_seqs && state->size(1) == kNumVHeads &&
-                        state->size(2) == kHeadSize && state->size(3) == kHeadSize,
-                    "state must have shape [N, 8, 128, 128]");
-        state_f32 = state->to(torch::kFloat);
-    } else {
-        state_f32 = torch::zeros({num_seqs, kNumVHeads, kHeadSize, kHeadSize},
-                                 torch::TensorOptions().device(device).dtype(torch::kFloat));
-    }
-
-    auto output = torch::zeros({total_seq_len, kNumVHeads, kHeadSize},
-                               torch::TensorOptions().device(device).dtype(torch::kBFloat16));
-    auto new_state = torch::zeros_like(state_f32);
-    auto cu_seqlens_cpu = cu_seqlens.to(torch::kCPU, torch::kLong);
-    auto cu_ptr = cu_seqlens_cpu.data_ptr<int64_t>();
-
-    for (int64_t seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
-        const auto seq_start = cu_ptr[seq_idx];
-        const auto seq_end = cu_ptr[seq_idx + 1];
-        if (seq_end <= seq_start) {
-            continue;
-        }
-
-        auto state_hkv = state_f32.index({seq_idx}).clone().transpose(-1, -2);
-        for (int64_t token_idx = seq_start; token_idx < seq_end; ++token_idx) {
-            auto q_h1k = q_exp.index({token_idx}).unsqueeze(1);
-            auto k_h1k = k_exp.index({token_idx}).unsqueeze(1);
-            auto v_h1v = v_f32.index({token_idx}).unsqueeze(1);
-            auto g_h11 = g.index({token_idx}).unsqueeze(1).unsqueeze(2);
-            auto beta_h11 = beta.index({token_idx}).unsqueeze(1).unsqueeze(2);
-
-            auto old_state = g_h11 * state_hkv;
-            auto old_v = torch::bmm(k_h1k, old_state);
-            auto new_v = beta_h11 * v_h1v + (1.0 - beta_h11) * old_v;
-            auto state_remove = torch::bmm(k_h1k.transpose(-1, -2), old_v);
-            auto state_update = torch::bmm(k_h1k.transpose(-1, -2), new_v);
-            state_hkv = old_state - state_remove + state_update;
-
-            auto o_h1v = scale_value * torch::bmm(q_h1k, state_hkv);
-            output.index_put_({token_idx}, o_h1v.squeeze(1).to(torch::kBFloat16));
-        }
-
-        new_state.index_put_({seq_idx}, state_hkv.transpose(-1, -2));
-    }
-
-    return std::make_tuple(output, new_state);
+inline void check_float32_tensor(const TensorView& tensor, const char* name) {
+  TVM_FFI_ICHECK_EQ(tensor.dtype().code, kDLFloat) << name << " must use float32";
+  TVM_FFI_ICHECK_EQ(tensor.dtype().bits, 32) << name << " must use float32";
 }
 
 }  // namespace
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("gdn_decode", &gdn_decode, "Gated Delta Net decode");
-    m.def("gdn_prefill", &gdn_prefill, "Gated Delta Net prefill");
+void gdn_decode_qk4_v8_d128_k_last(TensorView q, TensorView k, TensorView v, TensorView state,
+                                   TensorView A_log, TensorView a, TensorView dt_bias,
+                                   TensorView b, double scale, TensorView output,
+                                   TensorView new_state) {
+  check_cuda_tensor(q, "q");
+  check_cuda_tensor(k, "k");
+  check_cuda_tensor(v, "v");
+  check_cuda_tensor(state, "state");
+  check_cuda_tensor(A_log, "A_log");
+  check_cuda_tensor(a, "a");
+  check_cuda_tensor(dt_bias, "dt_bias");
+  check_cuda_tensor(b, "b");
+  check_cuda_tensor(output, "output");
+  check_cuda_tensor(new_state, "new_state");
+
+  check_bfloat16_tensor(q, "q");
+  check_bfloat16_tensor(k, "k");
+  check_bfloat16_tensor(v, "v");
+  check_bfloat16_tensor(a, "a");
+  check_bfloat16_tensor(b, "b");
+  check_bfloat16_tensor(output, "output");
+  check_float32_tensor(state, "state");
+  check_float32_tensor(A_log, "A_log");
+  check_float32_tensor(dt_bias, "dt_bias");
+  check_float32_tensor(new_state, "new_state");
+
+  TVM_FFI_ICHECK_EQ(q.ndim(), 4);
+  TVM_FFI_ICHECK_EQ(k.ndim(), 4);
+  TVM_FFI_ICHECK_EQ(v.ndim(), 4);
+  TVM_FFI_ICHECK_EQ(state.ndim(), 4);
+  TVM_FFI_ICHECK_EQ(A_log.ndim(), 1);
+  TVM_FFI_ICHECK_EQ(a.ndim(), 3);
+  TVM_FFI_ICHECK_EQ(dt_bias.ndim(), 1);
+  TVM_FFI_ICHECK_EQ(b.ndim(), 3);
+  TVM_FFI_ICHECK_EQ(output.ndim(), 4);
+  TVM_FFI_ICHECK_EQ(new_state.ndim(), 4);
+
+  int64_t batch_size = q.size(0);
+  TVM_FFI_ICHECK_GT(batch_size, 0);
+  TVM_FFI_ICHECK_EQ(q.size(1), kSeqLen);
+  TVM_FFI_ICHECK_EQ(k.size(1), kSeqLen);
+  TVM_FFI_ICHECK_EQ(v.size(1), kSeqLen);
+  TVM_FFI_ICHECK_EQ(a.size(1), kSeqLen);
+  TVM_FFI_ICHECK_EQ(b.size(1), kSeqLen);
+  TVM_FFI_ICHECK_EQ(q.size(2), kNumQHeads);
+  TVM_FFI_ICHECK_EQ(k.size(2), kNumKHeads);
+  TVM_FFI_ICHECK_EQ(v.size(2), kNumVHeads);
+  TVM_FFI_ICHECK_EQ(a.size(2), kNumVHeads);
+  TVM_FFI_ICHECK_EQ(b.size(2), kNumVHeads);
+  TVM_FFI_ICHECK_EQ(q.size(3), kHeadSize);
+  TVM_FFI_ICHECK_EQ(k.size(3), kHeadSize);
+  TVM_FFI_ICHECK_EQ(v.size(3), kHeadSize);
+  TVM_FFI_ICHECK_EQ(state.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(state.size(1), kNumVHeads);
+  TVM_FFI_ICHECK_EQ(state.size(2), kHeadSize);
+  TVM_FFI_ICHECK_EQ(state.size(3), kHeadSize);
+  TVM_FFI_ICHECK_EQ(A_log.size(0), kNumVHeads);
+  TVM_FFI_ICHECK_EQ(dt_bias.size(0), kNumVHeads);
+  TVM_FFI_ICHECK_EQ(output.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(output.size(1), kSeqLen);
+  TVM_FFI_ICHECK_EQ(output.size(2), kNumVHeads);
+  TVM_FFI_ICHECK_EQ(output.size(3), kHeadSize);
+  TVM_FFI_ICHECK_EQ(new_state.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(new_state.size(1), kNumVHeads);
+  TVM_FFI_ICHECK_EQ(new_state.size(2), kHeadSize);
+  TVM_FFI_ICHECK_EQ(new_state.size(3), kHeadSize);
+  TVM_FFI_ICHECK_EQ(q.device().device_id, k.device().device_id);
+  TVM_FFI_ICHECK_EQ(q.device().device_id, v.device().device_id);
+  TVM_FFI_ICHECK_EQ(q.device().device_id, state.device().device_id);
+  TVM_FFI_ICHECK_EQ(q.device().device_id, output.device().device_id);
+  TVM_FFI_ICHECK_EQ(q.device().device_id, new_state.device().device_id);
+
+  float scale_f = static_cast<float>(scale);
+  if (scale_f == 0.0f) {
+    scale_f = 1.0f / std::sqrt(static_cast<float>(kHeadSize));
+  }
+
+  constexpr int threads = kVTileRows;
+  constexpr int v_tiles = kHeadSize / kVTileRows;
+  dim3 blocks(static_cast<unsigned int>(batch_size), static_cast<unsigned int>(kNumVHeads),
+              static_cast<unsigned int>(v_tiles));
+  size_t shared_mem_bytes =
+      static_cast<size_t>(kVTileRows * kHeadSize + 2 * kHeadSize) * sizeof(float);
+  int device_id = q.device().device_id;
+  auto stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(q.device().device_type,
+                                                             device_id));
+
+  static bool kernel_attrs_configured[kMaxTrackedCudaDevices] = {};
+  TVM_FFI_ICHECK_GE(device_id, 0);
+  TVM_FFI_ICHECK_LT(device_id, kMaxTrackedCudaDevices);
+  cudaError_t err = cudaSuccess;
+  if (!kernel_attrs_configured[device_id]) {
+    err = cudaFuncSetAttribute(gdn_decode_optimized_kernel,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               static_cast<int>(shared_mem_bytes));
+    TVM_FFI_ICHECK_EQ(err, cudaSuccess)
+        << "Failed to raise dynamic shared memory limit: " << cudaGetErrorString(err);
+    err = cudaFuncSetAttribute(gdn_decode_optimized_kernel,
+                               cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    TVM_FFI_ICHECK_EQ(err, cudaSuccess)
+        << "Failed to set shared memory carveout: " << cudaGetErrorString(err);
+    kernel_attrs_configured[device_id] = true;
+  }
+
+  gdn_decode_optimized_kernel<<<blocks, threads, shared_mem_bytes, stream>>>(
+      static_cast<const __nv_bfloat16*>(q.data_ptr()), static_cast<const __nv_bfloat16*>(k.data_ptr()),
+      static_cast<const __nv_bfloat16*>(v.data_ptr()), static_cast<const float*>(state.data_ptr()),
+      static_cast<const float*>(A_log.data_ptr()), static_cast<const __nv_bfloat16*>(a.data_ptr()),
+      static_cast<const float*>(dt_bias.data_ptr()), static_cast<const __nv_bfloat16*>(b.data_ptr()),
+      scale_f, static_cast<__nv_bfloat16*>(output.data_ptr()), static_cast<float*>(new_state.data_ptr()));
+
+  err = cudaGetLastError();
+  TVM_FFI_ICHECK_EQ(err, cudaSuccess) << "CUDA kernel launch failed: " << cudaGetErrorString(err);
 }
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gdn_decode_qk4_v8_d128_k_last, gdn_decode_qk4_v8_d128_k_last);
