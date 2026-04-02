@@ -102,6 +102,7 @@ __global__ void gdn_decode_kernel(
     if ((lane & 31) == 0) {
         warp_partials[lane >> 5] = qk_partial;
     }
+    __syncthreads();
 
     if (lane == 0) {
         float qk = 0.0f;
@@ -159,6 +160,118 @@ __global__ void gdn_decode_kernel(
 
     const float out_val = scale * (q_old + sh_qk * delta);
     output[output_base] = __float2bfloat16(out_val);
+}
+
+__global__ void gdn_decode_paired_heads_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    const float* __restrict__ state,
+    const float* __restrict__ A_log,
+    const __nv_bfloat16* __restrict__ a,
+    const float* __restrict__ dt_bias,
+    const __nv_bfloat16* __restrict__ b,
+    __nv_bfloat16* __restrict__ output,
+    float* __restrict__ new_state,
+    float scale) {
+    const int batch_idx = blockIdx.x;
+    const int q_head_idx = blockIdx.y;
+    const int lane = threadIdx.x & 127;
+    const int group_idx = threadIdx.x >> 7;
+    const int v_head_idx = q_head_idx * 2 + group_idx;
+
+    __shared__ float sh_q[kHeadSize];
+    __shared__ float sh_k[kHeadSize];
+    __shared__ float sh_qk;
+    __shared__ float sh_g[2];
+    __shared__ float sh_beta[2];
+    __shared__ float warp_partials[4];
+
+    const int q_base = (((batch_idx * 1 + 0) * kNumQHeads + q_head_idx) * kHeadSize);
+    const int k_base = (((batch_idx * 1 + 0) * kNumKHeads + q_head_idx) * kHeadSize);
+    if (threadIdx.x < kHeadSize) {
+        sh_q[threadIdx.x] = load_bf16(q + q_base + threadIdx.x);
+        sh_k[threadIdx.x] = load_bf16(k + k_base + threadIdx.x);
+    }
+
+    float qk_partial = 0.0f;
+    if (threadIdx.x < kHeadSize) {
+        qk_partial = sh_q[threadIdx.x] * sh_k[threadIdx.x];
+    }
+    qk_partial = warp_sum(qk_partial);
+    if (threadIdx.x < kHeadSize && (threadIdx.x & 31) == 0) {
+        warp_partials[threadIdx.x >> 5] = qk_partial;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float qk = 0.0f;
+        #pragma unroll
+        for (int warp_idx = 0; warp_idx < 4; ++warp_idx) {
+            qk += warp_partials[warp_idx];
+        }
+        sh_qk = qk;
+    }
+
+    if (threadIdx.x < 2) {
+        const int head = q_head_idx * 2 + threadIdx.x;
+        const int gate_base = (batch_idx * 1 + 0) * kNumVHeads + head;
+        const float a_val = load_bf16(a + gate_base);
+        const float b_val = load_bf16(b + gate_base);
+        const float x = a_val + dt_bias[head];
+        sh_g[threadIdx.x] = expf(-expf(A_log[head]) * log1pf(expf(x)));
+        sh_beta[threadIdx.x] = 1.0f / (1.0f + expf(-b_val));
+    }
+    __syncthreads();
+
+    const int row_idx = lane;
+    const int state_row_base =
+        (((batch_idx * kNumVHeads + v_head_idx) * kHeadSize + row_idx) * kHeadSize);
+    const int output_base =
+        (((batch_idx * 1 + 0) * kNumVHeads + v_head_idx) * kHeadSize + row_idx);
+
+    const float* state_row_ptr = state + state_row_base;
+    float* new_state_row_ptr = new_state + state_row_base;
+
+    float old_v = 0.0f;
+    float q_old = 0.0f;
+    #pragma unroll 8
+    for (int k_idx = 0; k_idx < kHeadSize; k_idx += 4) {
+        const float4 state_vec = load_global_v4(state_row_ptr + k_idx);
+        const float4 q_vec = *reinterpret_cast<const float4*>(&sh_q[k_idx]);
+        const float4 k_vec = *reinterpret_cast<const float4*>(&sh_k[k_idx]);
+        old_v += k_vec.x * state_vec.x + k_vec.y * state_vec.y + k_vec.z * state_vec.z + k_vec.w * state_vec.w;
+        q_old += q_vec.x * state_vec.x + q_vec.y * state_vec.y + q_vec.z * state_vec.z + q_vec.w * state_vec.w;
+    }
+    old_v *= sh_g[group_idx];
+    q_old *= sh_g[group_idx];
+
+    const float v_val = load_bf16(v + output_base);
+    const float delta = sh_beta[group_idx] * (v_val - old_v);
+
+    #pragma unroll 8
+    for (int k_idx = 0; k_idx < kHeadSize; k_idx += 4) {
+        const float4 state_vec = load_global_v4(state_row_ptr + k_idx);
+        const float4 k_vec = *reinterpret_cast<const float4*>(&sh_k[k_idx]);
+        float4 updated;
+        updated.x = sh_g[group_idx] * state_vec.x + k_vec.x * delta;
+        updated.y = sh_g[group_idx] * state_vec.y + k_vec.y * delta;
+        updated.z = sh_g[group_idx] * state_vec.z + k_vec.z * delta;
+        updated.w = sh_g[group_idx] * state_vec.w + k_vec.w * delta;
+        store_global_v4(new_state_row_ptr + k_idx, updated);
+    }
+
+    const float out_val = scale * (q_old + sh_qk * delta);
+    output[output_base] = __float2bfloat16(out_val);
+}
+
+bool use_b200_small_batch_path(int64_t batch_size) {
+    if (batch_size > 8) {
+        return false;
+    }
+    cudaDeviceProp prop{};
+    cudaGetDeviceProperties(&prop, at::cuda::current_device());
+    return prop.major >= 10;
 }
 
 std::tuple<torch::Tensor, torch::Tensor> gdn_decode_reference(
@@ -273,21 +386,39 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_decode(
                                torch::TensorOptions().device(device).dtype(torch::kBFloat16));
     auto new_state = torch::empty_like(state_cuda);
 
-    const dim3 grid(batch_size, kNumVHeads);
-    const dim3 block(kHeadSize);
-    gdn_decode_kernel<<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
-        reinterpret_cast<const __nv_bfloat16*>(q_cuda.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const __nv_bfloat16*>(k_cuda.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const __nv_bfloat16*>(v_cuda.data_ptr<at::BFloat16>()),
-        state_cuda.data_ptr<float>(),
-        A_log_cuda.data_ptr<float>(),
-        reinterpret_cast<const __nv_bfloat16*>(a_cuda.data_ptr<at::BFloat16>()),
-        dt_bias_cuda.data_ptr<float>(),
-        reinterpret_cast<const __nv_bfloat16*>(b_cuda.data_ptr<at::BFloat16>()),
-        reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
-        new_state.data_ptr<float>(),
-        static_cast<int>(batch_size),
-        static_cast<float>(scale_value));
+    auto stream = at::cuda::getDefaultCUDAStream();
+    if (use_b200_small_batch_path(batch_size)) {
+        const dim3 grid(batch_size, kNumQHeads);
+        const dim3 block(256);
+        gdn_decode_paired_heads_kernel<<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q_cuda.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(k_cuda.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(v_cuda.data_ptr<at::BFloat16>()),
+            state_cuda.data_ptr<float>(),
+            A_log_cuda.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(a_cuda.data_ptr<at::BFloat16>()),
+            dt_bias_cuda.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(b_cuda.data_ptr<at::BFloat16>()),
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
+            new_state.data_ptr<float>(),
+            static_cast<float>(scale_value));
+    } else {
+        const dim3 grid(batch_size, kNumVHeads);
+        const dim3 block(kHeadSize);
+        gdn_decode_kernel<<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q_cuda.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(k_cuda.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(v_cuda.data_ptr<at::BFloat16>()),
+            state_cuda.data_ptr<float>(),
+            A_log_cuda.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(a_cuda.data_ptr<at::BFloat16>()),
+            dt_bias_cuda.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(b_cuda.data_ptr<at::BFloat16>()),
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
+            new_state.data_ptr<float>(),
+            static_cast<int>(batch_size),
+            static_cast<float>(scale_value));
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return std::make_tuple(output, new_state);
