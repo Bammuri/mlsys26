@@ -160,18 +160,18 @@ inline void check_int64_tensor(const TensorView& tensor, const char* name) {
   TVM_FFI_ICHECK_EQ(tensor.dtype().bits, 64) << name << " must use int64";
 }
 
-__global__ void gdn_prefill_baseline_kernel(const __nv_bfloat16* __restrict__ q,
-                                            const __nv_bfloat16* __restrict__ k,
-                                            const __nv_bfloat16* __restrict__ v,
-                                            const float* __restrict__ state,
-                                            const float* __restrict__ A_log,
-                                            const __nv_bfloat16* __restrict__ a,
-                                            const float* __restrict__ dt_bias,
-                                            const __nv_bfloat16* __restrict__ b,
-                                            const int64_t* __restrict__ cu_seqlens,
-                                            float scale,
-                                            __nv_bfloat16* __restrict__ output,
-                                            float* __restrict__ new_state) {
+__global__ void gdn_prefill_optimized_kernel(const __nv_bfloat16* __restrict__ q,
+                                             const __nv_bfloat16* __restrict__ k,
+                                             const __nv_bfloat16* __restrict__ v,
+                                             const float* __restrict__ state,
+                                             const float* __restrict__ A_log,
+                                             const __nv_bfloat16* __restrict__ a,
+                                             const float* __restrict__ dt_bias,
+                                             const __nv_bfloat16* __restrict__ b,
+                                             const int64_t* __restrict__ cu_seqlens,
+                                             float scale,
+                                             __nv_bfloat16* __restrict__ output,
+                                             float* __restrict__ new_state) {
   const int64_t seq_idx = blockIdx.x;
   const int64_t hv_idx = blockIdx.y;
   const int64_t v_tile = blockIdx.z;
@@ -201,12 +201,13 @@ __global__ void gdn_prefill_baseline_kernel(const __nv_bfloat16* __restrict__ q,
   __shared__ float g_gate_sh;
   __shared__ float beta_sh;
 
-  for (int idx = local_v_idx; idx < kVTileRows * kHeadSize; idx += blockDim.x) {
-    state_sh[idx] = state[state_tile_base + idx];
-  }
+  cg::thread_block cta = cg::this_thread_block();
+  cg::memcpy_async(cta, state_sh, state + state_tile_base, sizeof(float) * kVTileRows * kHeadSize);
+  cg::wait(cta);
   __syncthreads();
 
   float* state_row = state_sh + static_cast<int64_t>(local_v_idx) * kHeadSize;
+  const float4* state_row_vec4 = reinterpret_cast<const float4*>(state_row);
 
   for (int64_t token_idx = seq_start; token_idx < seq_end; ++token_idx) {
     const int64_t q_base = ((token_idx * kNumQHeads + q_head) * kHeadSize);
@@ -214,9 +215,16 @@ __global__ void gdn_prefill_baseline_kernel(const __nv_bfloat16* __restrict__ q,
     const int64_t v_base = ((token_idx * kNumVHeads + hv_idx) * kHeadSize);
     const int64_t output_base = ((token_idx * kNumVHeads + hv_idx) * kHeadSize);
 
-    for (int idx = local_v_idx; idx < kHeadSize; idx += blockDim.x) {
-      q_sh[idx] = load_bf16(q, q_base + idx);
-      k_sh[idx] = load_bf16(k, k_base + idx);
+    const __nv_bfloat162* q_vec2 = reinterpret_cast<const __nv_bfloat162*>(q + q_base);
+    const __nv_bfloat162* k_vec2 = reinterpret_cast<const __nv_bfloat162*>(k + k_base);
+    for (int idx = local_v_idx; idx < kHeadSize / 2; idx += blockDim.x) {
+      float2 q_vals = __bfloat1622float2(q_vec2[idx]);
+      float2 k_vals = __bfloat1622float2(k_vec2[idx]);
+      const int dst = idx * 2;
+      q_sh[dst] = q_vals.x;
+      q_sh[dst + 1] = q_vals.y;
+      k_sh[dst] = k_vals.x;
+      k_sh[dst + 1] = k_vals.y;
     }
     if (local_v_idx == 0) {
       const int64_t gate_base = token_idx * kNumVHeads + hv_idx;
@@ -226,12 +234,19 @@ __global__ void gdn_prefill_baseline_kernel(const __nv_bfloat16* __restrict__ q,
     }
     __syncthreads();
 
+    const float4* q_vec4 = reinterpret_cast<const float4*>(q_sh);
+    const float4* k_vec4 = reinterpret_cast<const float4*>(k_sh);
     float old_v = 0.0f;
     float out = 0.0f;
-    for (int k_idx = 0; k_idx < kHeadSize; ++k_idx) {
-      const float state_val = state_row[k_idx];
-      old_v += k_sh[k_idx] * state_val;
-      out += q_sh[k_idx] * state_val;
+    #pragma unroll
+    for (int k_idx = 0; k_idx < kHeadSize / 4; ++k_idx) {
+      const float4 state_vals = state_row_vec4[k_idx];
+      const float4 q_vals = q_vec4[k_idx];
+      const float4 k_vals = k_vec4[k_idx];
+      old_v += k_vals.x * state_vals.x + k_vals.y * state_vals.y + k_vals.z * state_vals.z +
+               k_vals.w * state_vals.w;
+      out += q_vals.x * state_vals.x + q_vals.y * state_vals.y + q_vals.z * state_vals.z +
+             q_vals.w * state_vals.w;
     }
     old_v *= g_gate_sh;
     out *= g_gate_sh;
@@ -240,9 +255,20 @@ __global__ void gdn_prefill_baseline_kernel(const __nv_bfloat16* __restrict__ q,
     const float new_v = beta_sh * v_value + (1.0f - beta_sh) * old_v;
     const float delta = new_v - old_v;
 
-    for (int k_idx = 0; k_idx < kHeadSize; ++k_idx) {
-      state_row[k_idx] = g_gate_sh * state_row[k_idx] + k_sh[k_idx] * delta;
-      out += q_sh[k_idx] * k_sh[k_idx] * delta;
+    float4* state_row_out_vec4 = reinterpret_cast<float4*>(state_row);
+    #pragma unroll
+    for (int k_idx = 0; k_idx < kHeadSize / 4; ++k_idx) {
+      const float4 state_vals = state_row_vec4[k_idx];
+      const float4 q_vals = q_vec4[k_idx];
+      const float4 k_vals = k_vec4[k_idx];
+      float4 new_state_vals = make_float4(
+          g_gate_sh * state_vals.x + k_vals.x * delta,
+          g_gate_sh * state_vals.y + k_vals.y * delta,
+          g_gate_sh * state_vals.z + k_vals.z * delta,
+          g_gate_sh * state_vals.w + k_vals.w * delta);
+      state_row_out_vec4[k_idx] = new_state_vals;
+      out += q_vals.x * k_vals.x * delta + q_vals.y * k_vals.y * delta +
+             q_vals.z * k_vals.z * delta + q_vals.w * k_vals.w * delta;
     }
     store_bf16(output, output_base + v_idx, scale * out);
     __syncthreads();
@@ -456,7 +482,7 @@ void gdn_prefill_qk4_v8_d128_k_last(TensorView q, TensorView k, TensorView v, Te
   auto stream = static_cast<cudaStream_t>(
       TVMFFIEnvGetStream(q.device().device_type, device_id));
 
-  gdn_prefill_baseline_kernel<<<blocks, threads, shared_mem_bytes, stream>>>(
+  gdn_prefill_optimized_kernel<<<blocks, threads, shared_mem_bytes, stream>>>(
       static_cast<const __nv_bfloat16*>(q.data_ptr()),
       static_cast<const __nv_bfloat16*>(k.data_ptr()),
       static_cast<const __nv_bfloat16*>(v.data_ptr()),
