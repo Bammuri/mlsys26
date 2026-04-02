@@ -40,6 +40,24 @@ __device__ __forceinline__ float load_bf16(const __nv_bfloat16* ptr) {
     return __bfloat162float(*ptr);
 }
 
+__device__ __forceinline__ float4 load_global_v4(const float* ptr) {
+    float4 value;
+    asm volatile(
+        "ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+        : "=f"(value.x), "=f"(value.y), "=f"(value.z), "=f"(value.w)
+        : "l"(ptr)
+    );
+    return value;
+}
+
+__device__ __forceinline__ void store_global_v4(float* ptr, const float4& value) {
+    asm volatile(
+        "st.global.v4.f32 [%0], {%1, %2, %3, %4};"
+        :
+        : "l"(ptr), "f"(value.x), "f"(value.y), "f"(value.z), "f"(value.w)
+    );
+}
+
 __device__ __forceinline__ float warp_sum(float value) {
     for (int offset = 16; offset > 0; offset /= 2) {
         value += __shfl_down_sync(0xffffffff, value, offset);
@@ -114,10 +132,12 @@ __global__ void gdn_decode_kernel(
     float old_v = 0.0f;
     float q_old = 0.0f;
     #pragma unroll 8
-    for (int k_idx = 0; k_idx < kHeadSize; ++k_idx) {
-        const float state_val = state_row_ptr[k_idx];
-        old_v += sh_k[k_idx] * state_val;
-        q_old += sh_q[k_idx] * state_val;
+    for (int k_idx = 0; k_idx < kHeadSize; k_idx += 4) {
+        const float4 state_vec = load_global_v4(state_row_ptr + k_idx);
+        const float4 q_vec = *reinterpret_cast<const float4*>(&sh_q[k_idx]);
+        const float4 k_vec = *reinterpret_cast<const float4*>(&sh_k[k_idx]);
+        old_v += k_vec.x * state_vec.x + k_vec.y * state_vec.y + k_vec.z * state_vec.z + k_vec.w * state_vec.w;
+        q_old += q_vec.x * state_vec.x + q_vec.y * state_vec.y + q_vec.z * state_vec.z + q_vec.w * state_vec.w;
     }
     old_v *= sh_g;
     q_old *= sh_g;
@@ -126,8 +146,15 @@ __global__ void gdn_decode_kernel(
     const float delta = sh_beta * (v_val - old_v);
 
     #pragma unroll 8
-    for (int k_idx = 0; k_idx < kHeadSize; ++k_idx) {
-        new_state_row_ptr[k_idx] = sh_g * state_row_ptr[k_idx] + sh_k[k_idx] * delta;
+    for (int k_idx = 0; k_idx < kHeadSize; k_idx += 4) {
+        const float4 state_vec = load_global_v4(state_row_ptr + k_idx);
+        const float4 k_vec = *reinterpret_cast<const float4*>(&sh_k[k_idx]);
+        float4 updated;
+        updated.x = sh_g * state_vec.x + k_vec.x * delta;
+        updated.y = sh_g * state_vec.y + k_vec.y * delta;
+        updated.z = sh_g * state_vec.z + k_vec.z * delta;
+        updated.w = sh_g * state_vec.w + k_vec.w * delta;
+        store_global_v4(new_state_row_ptr + k_idx, updated);
     }
 
     const float out_val = scale * (q_old + sh_qk * delta);
