@@ -3,7 +3,7 @@
 ## Setup
 - Branch: `gdn-decode-opt`
 - Baseline commit: `db64e0b`
-- Decode config: `definition = "gdn_decode_qk4_v8_d128_k_last"`, `entry_point = "kernel.cu::gdn_decode"`
+- Decode config: `definition = "gdn_decode_qk4_v8_d128_k_last"`, `entry_point = "kernel.cu::gdn_decode_qk4_v8_d128_k_last"`
 - Primary large-batch benchmark: workload `eaf0a285-447c-4432-8e68-d287acc3cb08` (`batch_size = 64`)
 - Primary small-batch benchmark: workload `901e5104-dccb-4c3f-ae13-ef4d31a4d456` (`batch_size = 1`)
 - Benchmark command:
@@ -25,6 +25,7 @@ docker exec mlsys26-dev bash -lc '
 | C2 | `530b728` | C1 + PTX vector IO | PTX / memory | `0.058 ms`, `1285.33x`, `abs=4.77e-07`, `rel=2.63e-02` | N/R | Passed | Added inline PTX `ld/st.global.v4.f32` helpers and vectorized state-row update path. | This is the cleanest large-batch step-up in the campaign. |
 | C3 | `e84c6da` | C2 + paired-head small-batch path | B200-specific | N/R | `0.032 ms`, `38.29x`, `abs=5.96e-08`, `rel=2.85e-03` | Passed | Added SM100-aware small-batch dispatch: one CTA handles two `v_head`s sharing the same `q/k` head when `batch_size <= 8`. | B200-focused path optimized for launch-limited decode. |
 | C4 | `6ca96c0` | C2 + C3 + launch/FMA tuning | full stack combo | `0.053 ms`, `1374.06x`, `abs=4.77e-07`, `rel=3.04e-02` | `0.035 ms`, `43.31x`, `abs=5.96e-08`, `rel=2.85e-03` | Passed | Added launch bounds, FMA-based accumulation/update, and current-stream launch path on top of all earlier optimizations. | Best measured large-batch variant; slightly slower than C3 on the representative small-batch workload. |
+| C5 | `1484111` | PR7 TVM FFI port | PR reference / TVM FFI | `0.040 ms`, `1939.81x`, `abs=3.81e-06`, `rel=2.67e-02` | N/R | Passed | Replaced the torch-path decode kernel with the PR-provided TVM FFI decode kernel using shared-memory state tiles and async copies. | Faster than C4 on the representative batch-64 workload, but did not reproduce the reported `0.013 ms` in this environment. |
 
 ## Combination Readout
 
@@ -34,6 +35,7 @@ docker exec mlsys26-dev bash -lc '
 | `kernelize + PTX vector IO` | `530b728` | Best standalone large-batch uplift before B200 specialization. |
 | `kernelize + PTX vector IO + B200 small-batch` | `e84c6da` | Best small-batch result in this campaign. |
 | `full stack` | `6ca96c0` | Best measured large-batch result and final recommended decode variant. |
+| `PR7 TVM FFI port` | `1484111` | Best measured batch-64 result so far in this repo: `0.040 ms` on workload `eaf0a285...`. |
 
 ## B200 / PTX Next Items
 
