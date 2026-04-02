@@ -1,12 +1,11 @@
 [solution]
 name = "gdn-cuda-reference"                   # Solution name
-definition = "gdn_decode_qk4_v8_d128_k_last" # Switch to gdn_prefill_qk4_v8_d128_k_last for prefill
-#definition = "gdn_prefill_qk4_v8_d128_k_last" # Switch to gdn_prefill_qk4_v8_d128_k_last for prefill
+#definition = "gdn_decode_qk4_v8_d128_k_last" # Switch to gdn_prefill_qk4_v8_d128_k_last for prefill
+definition = "gdn_prefill_qk4_v8_d128_k_last" # Switch to gdn_prefill_qk4_v8_d128_k_last for prefill
 author = "team-name"                         # Team/author name
 
 [build]
 language = "cuda"                 # triton | cuda
-# entry_point = "kernel.cu::gdn_prefill" # Switch to kernel.cu::gdn_prefill for prefill
-entry_point = "kernel.cu::gdn_decode_qk4_v8_d128_k_last" # TVM FFI decode entrypoint
+entry_point = "kernel.cu::gdn_prefill_qk4_v8_d128_k_last" # TVM FFI prefill entrypoint
 binding = "tvm-ffi"
 destination_passing_style = true
