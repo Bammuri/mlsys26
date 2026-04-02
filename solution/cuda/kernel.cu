@@ -65,7 +65,7 @@ __device__ __forceinline__ float warp_sum(float value) {
     return value;
 }
 
-__global__ void gdn_decode_kernel(
+__global__ __launch_bounds__(128, 8) void gdn_decode_kernel(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
@@ -137,8 +137,14 @@ __global__ void gdn_decode_kernel(
         const float4 state_vec = load_global_v4(state_row_ptr + k_idx);
         const float4 q_vec = *reinterpret_cast<const float4*>(&sh_q[k_idx]);
         const float4 k_vec = *reinterpret_cast<const float4*>(&sh_k[k_idx]);
-        old_v += k_vec.x * state_vec.x + k_vec.y * state_vec.y + k_vec.z * state_vec.z + k_vec.w * state_vec.w;
-        q_old += q_vec.x * state_vec.x + q_vec.y * state_vec.y + q_vec.z * state_vec.z + q_vec.w * state_vec.w;
+        old_v = fmaf(k_vec.x, state_vec.x, old_v);
+        old_v = fmaf(k_vec.y, state_vec.y, old_v);
+        old_v = fmaf(k_vec.z, state_vec.z, old_v);
+        old_v = fmaf(k_vec.w, state_vec.w, old_v);
+        q_old = fmaf(q_vec.x, state_vec.x, q_old);
+        q_old = fmaf(q_vec.y, state_vec.y, q_old);
+        q_old = fmaf(q_vec.z, state_vec.z, q_old);
+        q_old = fmaf(q_vec.w, state_vec.w, q_old);
     }
     old_v *= sh_g;
     q_old *= sh_g;
@@ -151,10 +157,10 @@ __global__ void gdn_decode_kernel(
         const float4 state_vec = load_global_v4(state_row_ptr + k_idx);
         const float4 k_vec = *reinterpret_cast<const float4*>(&sh_k[k_idx]);
         float4 updated;
-        updated.x = sh_g * state_vec.x + k_vec.x * delta;
-        updated.y = sh_g * state_vec.y + k_vec.y * delta;
-        updated.z = sh_g * state_vec.z + k_vec.z * delta;
-        updated.w = sh_g * state_vec.w + k_vec.w * delta;
+        updated.x = fmaf(k_vec.x, delta, sh_g * state_vec.x);
+        updated.y = fmaf(k_vec.y, delta, sh_g * state_vec.y);
+        updated.z = fmaf(k_vec.z, delta, sh_g * state_vec.z);
+        updated.w = fmaf(k_vec.w, delta, sh_g * state_vec.w);
         store_global_v4(new_state_row_ptr + k_idx, updated);
     }
 
@@ -162,7 +168,7 @@ __global__ void gdn_decode_kernel(
     output[output_base] = __float2bfloat16(out_val);
 }
 
-__global__ void gdn_decode_paired_heads_kernel(
+__global__ __launch_bounds__(256, 4) void gdn_decode_paired_heads_kernel(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
@@ -240,8 +246,14 @@ __global__ void gdn_decode_paired_heads_kernel(
         const float4 state_vec = load_global_v4(state_row_ptr + k_idx);
         const float4 q_vec = *reinterpret_cast<const float4*>(&sh_q[k_idx]);
         const float4 k_vec = *reinterpret_cast<const float4*>(&sh_k[k_idx]);
-        old_v += k_vec.x * state_vec.x + k_vec.y * state_vec.y + k_vec.z * state_vec.z + k_vec.w * state_vec.w;
-        q_old += q_vec.x * state_vec.x + q_vec.y * state_vec.y + q_vec.z * state_vec.z + q_vec.w * state_vec.w;
+        old_v = fmaf(k_vec.x, state_vec.x, old_v);
+        old_v = fmaf(k_vec.y, state_vec.y, old_v);
+        old_v = fmaf(k_vec.z, state_vec.z, old_v);
+        old_v = fmaf(k_vec.w, state_vec.w, old_v);
+        q_old = fmaf(q_vec.x, state_vec.x, q_old);
+        q_old = fmaf(q_vec.y, state_vec.y, q_old);
+        q_old = fmaf(q_vec.z, state_vec.z, q_old);
+        q_old = fmaf(q_vec.w, state_vec.w, q_old);
     }
     old_v *= sh_g[group_idx];
     q_old *= sh_g[group_idx];
@@ -254,10 +266,10 @@ __global__ void gdn_decode_paired_heads_kernel(
         const float4 state_vec = load_global_v4(state_row_ptr + k_idx);
         const float4 k_vec = *reinterpret_cast<const float4*>(&sh_k[k_idx]);
         float4 updated;
-        updated.x = sh_g[group_idx] * state_vec.x + k_vec.x * delta;
-        updated.y = sh_g[group_idx] * state_vec.y + k_vec.y * delta;
-        updated.z = sh_g[group_idx] * state_vec.z + k_vec.z * delta;
-        updated.w = sh_g[group_idx] * state_vec.w + k_vec.w * delta;
+        updated.x = fmaf(k_vec.x, delta, sh_g[group_idx] * state_vec.x);
+        updated.y = fmaf(k_vec.y, delta, sh_g[group_idx] * state_vec.y);
+        updated.z = fmaf(k_vec.z, delta, sh_g[group_idx] * state_vec.z);
+        updated.w = fmaf(k_vec.w, delta, sh_g[group_idx] * state_vec.w);
         store_global_v4(new_state_row_ptr + k_idx, updated);
     }
 
@@ -386,7 +398,7 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_decode(
                                torch::TensorOptions().device(device).dtype(torch::kBFloat16));
     auto new_state = torch::empty_like(state_cuda);
 
-    auto stream = at::cuda::getDefaultCUDAStream();
+    auto stream = at::cuda::getCurrentCUDAStream();
     if (use_b200_small_batch_path(batch_size)) {
         const dim3 grid(batch_size, kNumQHeads);
         const dim3 block(256);
