@@ -72,3 +72,24 @@ The agent should be aware of the current codebase state to avoid regressing perf
 1.  **Do not reinvent the wheel:** Start by analyzing the 0.013ms GDN Decode PR to understand the winning memory access patterns before attempting to optimize the Prefill kernel.
 2.  **Focus on Memory Tiering:** Map out the data flow from DDR5 (Host) -> PCIe -> HBM3e (Device) -> L2 Cache -> Shared Memory -> Registers. Eliminate any unnecessary round-trips.
 3.  **Precision Exploitation:** Automatically insert PTX instructions for NVFP4/FP8 Tensor Core MMA (Matrix Multiply-Accumulate) operations where applicable.
+
+upsteam base line
+
+gdn_prefill_qk4_v8_d128_k_last:
+    workloads: 100
+    status counts: PASSED=100
+    avg latency: 0.317 ms
+    avg speedup: 576.79x
+    worst abs error: 9.09e-03
+    worst rel error: 3.29e+03
+  end-to-endLocal entrypoint finished in 1496.64s
+
+gdn_decode_qk4_v8_d128_k_last
+  - workloads: 54
+  - status counts: PASSED=54
+  - avg latency: 0.034 ms
+  - avg speedup: 843.12x
+  - worst abs error: 3.05e-05
+  - worst rel error: 3.48e-01
+  - remote benchmark: 241.76s
+  - end-to-end: 247.82s
