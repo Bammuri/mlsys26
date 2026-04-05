@@ -95,6 +95,9 @@ __global__ void gdn_prefill_kernel(
   int64_t seq_end = cu_seqlens[seq_idx + 1];
   int q_head_idx = head_idx / (kNumVHeads / kNumQHeads);
   int k_head_idx = head_idx / (kNumVHeads / kNumKHeads);
+  float a_log_exp = expf(A_log[head_idx]);
+  float dt_bias_val = dt_bias[head_idx];
+  float scale_f = static_cast<float>(scale);
 
   for (int64_t t = seq_start; t < seq_end; ++t) {
     int64_t k_base = (t * kNumKHeads + k_head_idx) * kHeadSize;
@@ -108,8 +111,8 @@ __global__ void gdn_prefill_kernel(
     if (v_idx == 0) {
       float a_val = bf16_to_float(a + t * kNumVHeads + head_idx);
       float b_val = bf16_to_float(b + t * kNumVHeads + head_idx);
-      float x = a_val + dt_bias[head_idx];
-      gate_sh = expf(-expf(A_log[head_idx]) * softplusf_stable(x));
+      float x = a_val + dt_bias_val;
+      gate_sh = expf(-a_log_exp * softplusf_stable(x));
       beta_sh = 1.0f / (1.0f + expf(-b_val));
     }
     __syncthreads();
@@ -142,7 +145,7 @@ __global__ void gdn_prefill_kernel(
     for (int i = 0; i < kHeadSize / 4; ++i) {
       out += dot_float4(q4[i], row4[i]);
     }
-    float_to_bf16(static_cast<float>(scale) * out, output + v_base + v_idx);
+    float_to_bf16(scale_f * out, output + v_base + v_idx);
     __syncthreads();
   }
 
