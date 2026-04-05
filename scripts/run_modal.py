@@ -232,13 +232,26 @@ def main(
     summary_only: bool = False,
     max_workloads: int = 0,
     quick: bool = False,
+    decision_gate: bool = False,
 ):
     """Load the solution and run benchmark on Modal."""
     started_at = time.perf_counter()
     solution = load_solution(Path(solution_path) if solution_path else None)
 
     config = None
-    if quick:
+    if decision_gate:
+        config = BenchmarkConfig(
+            warmup_runs=1,
+            iterations=5,
+            num_trials=2,
+            use_isolated_runner=False,
+            timeout_seconds=300,
+        )
+        log_event(
+            "Decision-gate mode enabled: warmup_runs=1, iterations=5, num_trials=2, "
+            "use_isolated_runner=False"
+        )
+    elif quick:
         config = BenchmarkConfig(
             warmup_runs=1,
             iterations=1,
