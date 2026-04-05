@@ -43,16 +43,37 @@ __device__ inline float dot_float4(const float4& a, const float4& b) {
   return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
 
+__global__ void compute_gate_beta_kernel(
+    const float* __restrict__ A_log,
+    const c10::BFloat16* __restrict__ a,
+    const float* __restrict__ dt_bias,
+    const c10::BFloat16* __restrict__ b,
+    float* __restrict__ gate,
+    float* __restrict__ beta,
+    int total_seq_len) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = total_seq_len * kNumVHeads;
+  if (idx >= total) {
+    return;
+  }
+
+  int head_idx = idx % kNumVHeads;
+  float a_val = bf16_to_float(a + idx);
+  float b_val = bf16_to_float(b + idx);
+  float x = a_val + dt_bias[head_idx];
+  float a_log_exp = expf(A_log[head_idx]);
+  gate[idx] = expf(-a_log_exp * softplusf_stable(x));
+  beta[idx] = 1.0f / (1.0f + expf(-b_val));
+}
+
 __global__ void gdn_prefill_kernel(
     const c10::BFloat16* __restrict__ q,
     const c10::BFloat16* __restrict__ k,
     const c10::BFloat16* __restrict__ v,
     const float* __restrict__ state_in,
     float* __restrict__ state_out,
-    const float* __restrict__ A_log,
-    const c10::BFloat16* __restrict__ a,
-    const float* __restrict__ dt_bias,
-    const c10::BFloat16* __restrict__ b,
+    const float* __restrict__ gate,
+    const float* __restrict__ beta,
     const int64_t* __restrict__ cu_seqlens,
     c10::BFloat16* __restrict__ output,
     int64_t num_seqs,
@@ -95,8 +116,6 @@ __global__ void gdn_prefill_kernel(
   int64_t seq_end = cu_seqlens[seq_idx + 1];
   int q_head_idx = head_idx / (kNumVHeads / kNumQHeads);
   int k_head_idx = head_idx / (kNumVHeads / kNumKHeads);
-  float a_log_exp = expf(A_log[head_idx]);
-  float dt_bias_val = dt_bias[head_idx];
   float scale_f = static_cast<float>(scale);
 
   for (int64_t t = seq_start; t < seq_end; ++t) {
@@ -109,11 +128,9 @@ __global__ void gdn_prefill_kernel(
     __syncthreads();
 
     if (v_idx == 0) {
-      float a_val = bf16_to_float(a + t * kNumVHeads + head_idx);
-      float b_val = bf16_to_float(b + t * kNumVHeads + head_idx);
-      float x = a_val + dt_bias_val;
-      gate_sh = expf(-a_log_exp * softplusf_stable(x));
-      beta_sh = 1.0f / (1.0f + expf(-b_val));
+      int64_t gate_idx = t * kNumVHeads + head_idx;
+      gate_sh = gate[gate_idx];
+      beta_sh = beta[gate_idx];
     }
     __syncthreads();
 
@@ -238,6 +255,12 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
   auto new_state = torch::empty(
       {num_seqs, kNumVHeads, kHeadSize, kHeadSize},
       torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+  auto gate = torch::empty(
+      {q.size(0), kNumVHeads},
+      torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+  auto beta = torch::empty(
+      {q.size(0), kNumVHeads},
+      torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
 
   if (has_state) {
     TORCH_CHECK(state_in.sizes() == new_state.sizes(), "state must have shape [num_seqs, 8, 128, 128]");
@@ -254,16 +277,26 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
       static_cast<int>(shared_bytes));
 
   auto stream = c10::cuda::getDefaultCUDAStream();
+  int total_gate_elems = static_cast<int>(q.size(0) * kNumVHeads);
+  int pre_threads = 256;
+  int pre_blocks = (total_gate_elems + pre_threads - 1) / pre_threads;
+  compute_gate_beta_kernel<<<pre_blocks, pre_threads, 0, stream.stream()>>>(
+      A_log.data_ptr<float>(),
+      a.data_ptr<c10::BFloat16>(),
+      dt_bias.data_ptr<float>(),
+      b.data_ptr<c10::BFloat16>(),
+      gate.data_ptr<float>(),
+      beta.data_ptr<float>(),
+      static_cast<int>(q.size(0)));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   gdn_prefill_kernel<<<grid, block, shared_bytes, stream.stream()>>>(
       q.data_ptr<c10::BFloat16>(),
       k.data_ptr<c10::BFloat16>(),
       v.data_ptr<c10::BFloat16>(),
       has_state ? state_in.data_ptr<float>() : nullptr,
       new_state.data_ptr<float>(),
-      A_log.data_ptr<float>(),
-      a.data_ptr<c10::BFloat16>(),
-      dt_bias.data_ptr<float>(),
-      b.data_ptr<c10::BFloat16>(),
+      gate.data_ptr<float>(),
+      beta.data_ptr<float>(),
       cu_seqlens.data_ptr<int64_t>(),
       output.data_ptr<c10::BFloat16>(),
       num_seqs,
