@@ -34,7 +34,7 @@ TRACE_SET_PATH = "/data/data/mlsys26-contest"
 
 image = (
     modal.Image.from_registry("nvidia/cuda:13.0.2-devel-ubuntu24.04", add_python="3.12")
-    .env({"CUDA_HOME": "/usr/local/cuda"})
+    .env({"CUDA_HOME": "/usr/local/cuda", "TORCH_CUDA_ARCH_LIST": "10.0a"})
     .pip_install("flashinfer-bench", "flashinfer-python", "torch", "triton", "numpy")
 )
 
@@ -243,12 +243,12 @@ def main(
         config = BenchmarkConfig(
             warmup_runs=1,
             iterations=5,
-            num_trials=2,
+            num_trials=1,
             use_isolated_runner=False,
             timeout_seconds=300,
         )
         log_event(
-            "Decision-gate mode enabled: warmup_runs=1, iterations=5, num_trials=2, "
+            "Decision-gate mode enabled: warmup_runs=1, iterations=5, num_trials=1, "
             "use_isolated_runner=False"
         )
     elif quick:

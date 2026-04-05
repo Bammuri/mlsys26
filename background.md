@@ -8,6 +8,7 @@ The target execution environment is a high-performance bare-metal server. Code g
 * **NUMA Topology:** 2 NUMA nodes
 * **System Memory:** 2 TiB DDR5 RAM
 * **GPU Configuration:** 8x NVIDIA B200 (Blackwell architecture)
+* **Evaluation codegen target:** Treat the evaluation target as **`sm_100a`** rather than generic `sm_100` whenever the toolchain allows architecture-specific code generation.
 * **GPU Interconnect:** NVLink
 * **Host-to-Device Interconnect:** PCIe Gen5 x16
 
@@ -57,6 +58,7 @@ To extract maximum performance, the agent must leverage Blackwell-specific hardw
 * **NVFP4 & Low-Precision Inference:** Evaluate the feasibility of using NVFP4 (NVIDIA's 4-bit floating-point format) to double the Tensor Core throughput and reduce memory bandwidth requirements, assuming the contest precision rules allow it.
 * **Blackwell Decompression Engine:** Utilize `nvCOMP` to offload data decompression to the dedicated hardware decompression engine, reducing host CPU load and PCIe transfer times if data is streamed in compressed formats.
 * **CUDA 13.x Features:** The agent must utilize CUDA Toolkit 13.0/13.1 features. Specifically, leverage **NVIDIA CUDA Tile** for advanced thread-block level data routing and synchronization, bypassing older, less efficient Shared Memory patterns.
+* **`sm_100a`-Specific Codegen:** Prefer explicit `sm_100a` code generation and architecture-specialized fast paths when the compiler/runtime stack supports them. Avoid leaving performance on the table by compiling only for generic `sm_100` if the evaluation hardware is known to support `sm_100a`.
 
 ## 3. Current Project Status & Baselines
 The agent should be aware of the current codebase state to avoid regressing performance and to understand the target baseline.
@@ -72,6 +74,7 @@ The agent should be aware of the current codebase state to avoid regressing perf
 1.  **Do not reinvent the wheel:** Start by analyzing the 0.013ms GDN Decode PR to understand the winning memory access patterns before attempting to optimize the Prefill kernel.
 2.  **Focus on Memory Tiering:** Map out the data flow from DDR5 (Host) -> PCIe -> HBM3e (Device) -> L2 Cache -> Shared Memory -> Registers. Eliminate any unnecessary round-trips.
 3.  **Precision Exploitation:** Automatically insert PTX instructions for NVFP4/FP8 Tensor Core MMA (Matrix Multiply-Accumulate) operations where applicable.
+4.  **Exploit `sm_100a` directly:** When a native CUDA path is already correct, prefer the next optimization loops that can benefit from architecture-specific Blackwell codegen (`sm_100a`) before attempting riskier algorithmic refactors.
 
 upsteam base line
 
