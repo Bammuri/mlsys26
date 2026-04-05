@@ -39,6 +39,10 @@ __device__ inline float softplusf_stable(float x) {
   return log1pf(expf(x));
 }
 
+__device__ inline float dot_float4(const float4& a, const float4& b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+}
+
 __global__ void gdn_prefill_kernel(
     const c10::BFloat16* __restrict__ q,
     const c10::BFloat16* __restrict__ k,
@@ -70,10 +74,20 @@ __global__ void gdn_prefill_kernel(
   __shared__ float beta_sh;
 
   float* row = state_sh + v_idx * kHeadSize;
+  float4* row4 = reinterpret_cast<float4*>(row);
   int64_t state_base = ((static_cast<int64_t>(seq_idx) * kNumVHeads + head_idx) * kHeadSize + v_idx) * kHeadSize;
 
-  for (int kk = 0; kk < kHeadSize; ++kk) {
-    row[kk] = has_state ? state_in[state_base + kk] : 0.0f;
+  if (has_state) {
+    const float4* state_in4 = reinterpret_cast<const float4*>(state_in + state_base);
+#pragma unroll
+    for (int i = 0; i < kHeadSize / 4; ++i) {
+      row4[i] = state_in4[i];
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < kHeadSize / 4; ++i) {
+      row4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
   }
   __syncthreads();
 
@@ -101,10 +115,10 @@ __global__ void gdn_prefill_kernel(
     __syncthreads();
 
     float old_v = 0.0f;
+    const float4* k4 = reinterpret_cast<const float4*>(k_sh);
 #pragma unroll
-    for (int kk = 0; kk < kHeadSize; ++kk) {
-      float k_val = k_sh[kk];
-      old_v += k_val * row[kk];
+    for (int i = 0; i < kHeadSize / 4; ++i) {
+      old_v += dot_float4(k4[i], row4[i]);
     }
     old_v *= gate_sh;
 
@@ -112,23 +126,30 @@ __global__ void gdn_prefill_kernel(
     float diff = beta_sh * (v_val - old_v);
 
 #pragma unroll
-    for (int kk = 0; kk < kHeadSize; ++kk) {
-      float k_val = k_sh[kk];
-      row[kk] = gate_sh * row[kk] + k_val * diff;
+    for (int i = 0; i < kHeadSize / 4; ++i) {
+      float4 k_vec = k4[i];
+      float4 r_vec = row4[i];
+      r_vec.x = gate_sh * r_vec.x + k_vec.x * diff;
+      r_vec.y = gate_sh * r_vec.y + k_vec.y * diff;
+      r_vec.z = gate_sh * r_vec.z + k_vec.z * diff;
+      r_vec.w = gate_sh * r_vec.w + k_vec.w * diff;
+      row4[i] = r_vec;
     }
 
     float out = 0.0f;
+    const float4* q4 = reinterpret_cast<const float4*>(q_sh);
 #pragma unroll
-    for (int kk = 0; kk < kHeadSize; ++kk) {
-      float q_val = q_sh[kk];
-      out += q_val * row[kk];
+    for (int i = 0; i < kHeadSize / 4; ++i) {
+      out += dot_float4(q4[i], row4[i]);
     }
     float_to_bf16(static_cast<float>(scale) * out, output + v_base + v_idx);
     __syncthreads();
   }
 
-  for (int kk = 0; kk < kHeadSize; ++kk) {
-    state_out[state_base + kk] = row[kk];
+  float4* state_out4 = reinterpret_cast<float4*>(state_out + state_base);
+#pragma unroll
+  for (int i = 0; i < kHeadSize / 4; ++i) {
+    state_out4[i] = row4[i];
   }
 }
 
