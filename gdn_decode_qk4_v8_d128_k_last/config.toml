@@ -1,0 +1,9 @@
+[solution]
+name = "gdn-decode-v1"
+definition = "gdn_decode_qk4_v8_d128_k_last"
+author = "KimJangMaengShin"
+
+[build]
+language = "cuda"
+entry_point = "kernel"
+destination_passing_style = true
