@@ -64,6 +64,8 @@ __global__ void gdn_prefill_kernel(
 
   extern __shared__ float shared_mem[];
   float* state_sh = shared_mem;  // [128, 128]
+  float* q_sh = state_sh + kHeadSize * kHeadSize;
+  float* k_sh = q_sh + kHeadSize;
   __shared__ float gate_sh;
   __shared__ float beta_sh;
 
@@ -81,6 +83,14 @@ __global__ void gdn_prefill_kernel(
   int k_head_idx = head_idx / (kNumVHeads / kNumKHeads);
 
   for (int64_t t = seq_start; t < seq_end; ++t) {
+    int64_t k_base = (t * kNumKHeads + k_head_idx) * kHeadSize;
+    int64_t q_base = (t * kNumQHeads + q_head_idx) * kHeadSize;
+    int64_t v_base = (t * kNumVHeads + head_idx) * kHeadSize;
+
+    q_sh[v_idx] = bf16_to_float(q + q_base + v_idx);
+    k_sh[v_idx] = bf16_to_float(k + k_base + v_idx);
+    __syncthreads();
+
     if (v_idx == 0) {
       float a_val = bf16_to_float(a + t * kNumVHeads + head_idx);
       float b_val = bf16_to_float(b + t * kNumVHeads + head_idx);
@@ -91,12 +101,9 @@ __global__ void gdn_prefill_kernel(
     __syncthreads();
 
     float old_v = 0.0f;
-    int64_t k_base = (t * kNumKHeads + k_head_idx) * kHeadSize;
-    int64_t q_base = (t * kNumQHeads + q_head_idx) * kHeadSize;
-    int64_t v_base = (t * kNumVHeads + head_idx) * kHeadSize;
-
+#pragma unroll
     for (int kk = 0; kk < kHeadSize; ++kk) {
-      float k_val = bf16_to_float(k + k_base + kk);
+      float k_val = k_sh[kk];
       old_v += k_val * row[kk];
     }
     old_v *= gate_sh;
@@ -104,14 +111,16 @@ __global__ void gdn_prefill_kernel(
     float v_val = bf16_to_float(v + v_base + v_idx);
     float diff = beta_sh * (v_val - old_v);
 
+#pragma unroll
     for (int kk = 0; kk < kHeadSize; ++kk) {
-      float k_val = bf16_to_float(k + k_base + kk);
+      float k_val = k_sh[kk];
       row[kk] = gate_sh * row[kk] + k_val * diff;
     }
 
     float out = 0.0f;
+#pragma unroll
     for (int kk = 0; kk < kHeadSize; ++kk) {
-      float q_val = bf16_to_float(q + q_base + kk);
+      float q_val = q_sh[kk];
       out += q_val * row[kk];
     }
     float_to_bf16(static_cast<float>(scale) * out, output + v_base + v_idx);
@@ -212,7 +221,8 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
 
   dim3 grid(kNumVHeads, static_cast<unsigned int>(num_seqs), 1);
   dim3 block(kThreads, 1, 1);
-  size_t shared_bytes = static_cast<size_t>(kHeadSize) * kHeadSize * sizeof(float);
+  size_t shared_bytes =
+      static_cast<size_t>(kHeadSize * kHeadSize + kHeadSize + kHeadSize) * sizeof(float);
 
   cudaFuncSetAttribute(
       gdn_prefill_kernel,
