@@ -40,10 +40,15 @@ __device__ inline float softplusf_stable(float x) {
 }
 
 __device__ inline float dot_float4(const float4& a, const float4& b) {
-  return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+  float acc = 0.0f;
+  acc = fmaf(a.x, b.x, acc);
+  acc = fmaf(a.y, b.y, acc);
+  acc = fmaf(a.z, b.z, acc);
+  acc = fmaf(a.w, b.w, acc);
+  return acc;
 }
 
-__global__ void compute_gate_beta_kernel(
+__global__ __launch_bounds__(256, 2) void compute_gate_beta_kernel(
     const float* __restrict__ A_log,
     const c10::BFloat16* __restrict__ a,
     const float* __restrict__ dt_bias,
@@ -66,7 +71,7 @@ __global__ void compute_gate_beta_kernel(
   beta[idx] = 1.0f / (1.0f + expf(-b_val));
 }
 
-__global__ void gdn_prefill_kernel(
+__global__ __launch_bounds__(128, 2) void gdn_prefill_kernel(
     const c10::BFloat16* __restrict__ q,
     const c10::BFloat16* __restrict__ k,
     const c10::BFloat16* __restrict__ v,
@@ -149,10 +154,10 @@ __global__ void gdn_prefill_kernel(
     for (int i = 0; i < kHeadSize / 4; ++i) {
       float4 k_vec = k4[i];
       float4 r_vec = row4[i];
-      r_vec.x = gate_sh * r_vec.x + k_vec.x * diff;
-      r_vec.y = gate_sh * r_vec.y + k_vec.y * diff;
-      r_vec.z = gate_sh * r_vec.z + k_vec.z * diff;
-      r_vec.w = gate_sh * r_vec.w + k_vec.w * diff;
+      r_vec.x = fmaf(k_vec.x, diff, gate_sh * r_vec.x);
+      r_vec.y = fmaf(k_vec.y, diff, gate_sh * r_vec.y);
+      r_vec.z = fmaf(k_vec.z, diff, gate_sh * r_vec.z);
+      r_vec.w = fmaf(k_vec.w, diff, gate_sh * r_vec.w);
       row4[i] = r_vec;
     }
 
