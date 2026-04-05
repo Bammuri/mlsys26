@@ -2,7 +2,12 @@
 Pack solution source files into solution.json.
 
 Reads configuration from config.toml and packs the appropriate source files
-(Triton or CUDA) into a Solution JSON file for submission.
+(Python, Triton, or CUDA) into a Solution JSON file for submission.
+
+Special case:
+- If config language is "cuda" but the entrypoint points to a Python file
+  (e.g. "binding.py::run"), we still pack from solution/cuda/ but emit a
+  Python runnable spec so flashinfer-bench can execute the Python wrapper.
 """
 
 import sys
@@ -41,8 +46,15 @@ def pack_solution(output_path: Path = None) -> Path:
     language = build_config["language"]
     entry_point = build_config["entry_point"]
 
+    dependencies = build_config.get("dependencies", [])
+    binding = build_config.get("binding")
+    entry_file = entry_point.split("::", 1)[0]
+    runtime_language = "python" if language == "cuda" and entry_file.endswith(".py") else language
+
     # Determine source directory based on language
-    if language == "triton":
+    if language == "python":
+        source_dir = PROJECT_ROOT / "solution" / "python"
+    elif language == "triton":
         source_dir = PROJECT_ROOT / "solution" / "triton"
     elif language == "cuda":
         source_dir = PROJECT_ROOT / "solution" / "cuda"
@@ -55,10 +67,12 @@ def pack_solution(output_path: Path = None) -> Path:
     # Create build spec
     dps = build_config.get("destination_passing_style", True)
     spec = BuildSpec(
-        language=language,
+        language=runtime_language,
         target_hardware=["cuda"],
         entry_point=entry_point,
+        dependencies=dependencies,
         destination_passing_style=dps,
+        binding=None if runtime_language == "python" else binding,
     )
 
     # Pack the solution
@@ -79,7 +93,8 @@ def pack_solution(output_path: Path = None) -> Path:
     print(f"  Name: {solution.name}")
     print(f"  Definition: {solution.definition}")
     print(f"  Author: {solution.author}")
-    print(f"  Language: {language}")
+    print(f"  Config language: {language}")
+    print(f"  Runtime language: {runtime_language}")
 
     return output_path
 
