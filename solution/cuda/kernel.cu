@@ -15,7 +15,12 @@ constexpr int kHeadSize = 128;
 constexpr int kNumQHeads = 4;
 constexpr int kNumKHeads = 4;
 constexpr int kNumVHeads = 8;
-constexpr int kThreads = 128;
+constexpr int kWarpSize = 32;
+constexpr int kVecSize = 4;
+constexpr int kWarpsPerBlock = 4;
+constexpr int kRowsPerBlock = kWarpsPerBlock;
+constexpr int kThreads = kWarpsPerBlock * kWarpSize;
+constexpr int kRowTilesPerHead = kHeadSize / kRowsPerBlock;
 
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
@@ -48,6 +53,25 @@ __device__ inline float dot_float4(const float4& a, const float4& b) {
   return acc;
 }
 
+__device__ inline float warp_sum(float value) {
+#pragma unroll
+  for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+    value += __shfl_xor_sync(0xffffffff, value, offset);
+  }
+  return value;
+}
+
+__device__ inline float4 load_bf16x4(const c10::BFloat16* ptr) {
+  const uint2 raw = *reinterpret_cast<const uint2*>(ptr);
+  const __nv_bfloat162 lo = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
+  const __nv_bfloat162 hi = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
+  return make_float4(
+      __bfloat162float(lo.x),
+      __bfloat162float(lo.y),
+      __bfloat162float(hi.x),
+      __bfloat162float(hi.y));
+}
+
 __global__ __launch_bounds__(256, 2) void compute_gate_beta_kernel(
     const float* __restrict__ A_log,
     const c10::BFloat16* __restrict__ a,
@@ -71,7 +95,7 @@ __global__ __launch_bounds__(256, 2) void compute_gate_beta_kernel(
   beta[idx] = 1.0f / (1.0f + expf(-b_val));
 }
 
-__global__ __launch_bounds__(128, 2) void gdn_prefill_kernel(
+__global__ __launch_bounds__(kThreads) void gdn_prefill_kernel(
     const c10::BFloat16* __restrict__ q,
     const c10::BFloat16* __restrict__ k,
     const c10::BFloat16* __restrict__ v,
@@ -85,97 +109,73 @@ __global__ __launch_bounds__(128, 2) void gdn_prefill_kernel(
     double scale,
     bool has_state) {
   int seq_idx = blockIdx.y;
-  int head_idx = blockIdx.x;
-  int v_idx = threadIdx.x;
+  int head_idx = blockIdx.x / kRowTilesPerHead;
+  int tile_idx = blockIdx.x % kRowTilesPerHead;
+  int lane = threadIdx.x % kWarpSize;
+  int warp_id = threadIdx.x / kWarpSize;
+  int row_idx = tile_idx * kRowsPerBlock + warp_id;
 
-  if (seq_idx >= num_seqs || head_idx >= kNumVHeads || v_idx >= kHeadSize) {
+  if (seq_idx >= num_seqs || head_idx >= kNumVHeads || warp_id >= kWarpsPerBlock || row_idx >= kHeadSize) {
     return;
   }
-
-  extern __shared__ float shared_mem[];
-  float* state_sh = shared_mem;  // [128, 128]
-  float* q_sh = state_sh + kHeadSize * kHeadSize;
-  float* k_sh = q_sh + kHeadSize;
-  __shared__ float gate_sh;
-  __shared__ float beta_sh;
-
-  float* row = state_sh + v_idx * kHeadSize;
-  float4* row4 = reinterpret_cast<float4*>(row);
-  int64_t state_base = ((static_cast<int64_t>(seq_idx) * kNumVHeads + head_idx) * kHeadSize + v_idx) * kHeadSize;
-
-  if (has_state) {
-    const float4* state_in4 = reinterpret_cast<const float4*>(state_in + state_base);
-#pragma unroll
-    for (int i = 0; i < kHeadSize / 4; ++i) {
-      row4[i] = state_in4[i];
-    }
-  } else {
-#pragma unroll
-    for (int i = 0; i < kHeadSize / 4; ++i) {
-      row4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
-    }
-  }
-  __syncthreads();
 
   int64_t seq_start = cu_seqlens[seq_idx];
   int64_t seq_end = cu_seqlens[seq_idx + 1];
   int q_head_idx = head_idx / (kNumVHeads / kNumQHeads);
   int k_head_idx = head_idx / (kNumVHeads / kNumKHeads);
   float scale_f = static_cast<float>(scale);
+  int64_t state_base =
+      ((static_cast<int64_t>(seq_idx) * kNumVHeads + head_idx) * kHeadSize + row_idx) * kHeadSize;
+
+  float4 row_frag;
+  if (has_state) {
+    const float4* state_in4 = reinterpret_cast<const float4*>(state_in + state_base);
+    row_frag = state_in4[lane];
+  } else {
+    row_frag = make_float4(0.f, 0.f, 0.f, 0.f);
+  }
 
   for (int64_t t = seq_start; t < seq_end; ++t) {
     int64_t k_base = (t * kNumKHeads + k_head_idx) * kHeadSize;
     int64_t q_base = (t * kNumQHeads + q_head_idx) * kHeadSize;
     int64_t v_base = (t * kNumVHeads + head_idx) * kHeadSize;
 
-    q_sh[v_idx] = bf16_to_float(q + q_base + v_idx);
-    k_sh[v_idx] = bf16_to_float(k + k_base + v_idx);
-    __syncthreads();
+    float4 q_frag = load_bf16x4(q + q_base + lane * kVecSize);
+    float4 k_frag = load_bf16x4(k + k_base + lane * kVecSize);
 
-    if (v_idx == 0) {
+    float gate_val = 0.0f;
+    float beta_val = 0.0f;
+    if (lane == 0) {
       int64_t gate_idx = t * kNumVHeads + head_idx;
-      gate_sh = gate[gate_idx];
-      beta_sh = beta[gate_idx];
+      gate_val = gate[gate_idx];
+      beta_val = beta[gate_idx];
     }
-    __syncthreads();
+    gate_val = __shfl_sync(0xffffffff, gate_val, 0);
+    beta_val = __shfl_sync(0xffffffff, beta_val, 0);
 
-    float old_v = 0.0f;
-    const float4* k4 = reinterpret_cast<const float4*>(k_sh);
-#pragma unroll
-    for (int i = 0; i < kHeadSize / 4; ++i) {
-      old_v += dot_float4(k4[i], row4[i]);
+    float old_v = warp_sum(dot_float4(row_frag, k_frag));
+    old_v *= gate_val;
+
+    float v_val = 0.0f;
+    if (lane == 0) {
+      v_val = bf16_to_float(v + v_base + row_idx);
     }
-    old_v *= gate_sh;
+    v_val = __shfl_sync(0xffffffff, v_val, 0);
 
-    float v_val = bf16_to_float(v + v_base + v_idx);
-    float diff = beta_sh * (v_val - old_v);
+    float diff = beta_val * (v_val - old_v);
+    row_frag.x = fmaf(k_frag.x, diff, gate_val * row_frag.x);
+    row_frag.y = fmaf(k_frag.y, diff, gate_val * row_frag.y);
+    row_frag.z = fmaf(k_frag.z, diff, gate_val * row_frag.z);
+    row_frag.w = fmaf(k_frag.w, diff, gate_val * row_frag.w);
 
-#pragma unroll
-    for (int i = 0; i < kHeadSize / 4; ++i) {
-      float4 k_vec = k4[i];
-      float4 r_vec = row4[i];
-      r_vec.x = fmaf(k_vec.x, diff, gate_sh * r_vec.x);
-      r_vec.y = fmaf(k_vec.y, diff, gate_sh * r_vec.y);
-      r_vec.z = fmaf(k_vec.z, diff, gate_sh * r_vec.z);
-      r_vec.w = fmaf(k_vec.w, diff, gate_sh * r_vec.w);
-      row4[i] = r_vec;
+    float out = warp_sum(dot_float4(q_frag, row_frag));
+    if (lane == 0) {
+      float_to_bf16(scale_f * out, output + v_base + row_idx);
     }
-
-    float out = 0.0f;
-    const float4* q4 = reinterpret_cast<const float4*>(q_sh);
-#pragma unroll
-    for (int i = 0; i < kHeadSize / 4; ++i) {
-      out += dot_float4(q4[i], row4[i]);
-    }
-    float_to_bf16(scale_f * out, output + v_base + v_idx);
-    __syncthreads();
   }
 
   float4* state_out4 = reinterpret_cast<float4*>(state_out + state_base);
-#pragma unroll
-  for (int i = 0; i < kHeadSize / 4; ++i) {
-    state_out4[i] = row4[i];
-  }
+  state_out4[lane] = row_frag;
 }
 
 }  // namespace
@@ -271,15 +271,8 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
     TORCH_CHECK(state_in.sizes() == new_state.sizes(), "state must have shape [num_seqs, 8, 128, 128]");
   }
 
-  dim3 grid(kNumVHeads, static_cast<unsigned int>(num_seqs), 1);
+  dim3 grid(kNumVHeads * kRowTilesPerHead, static_cast<unsigned int>(num_seqs), 1);
   dim3 block(kThreads, 1, 1);
-  size_t shared_bytes =
-      static_cast<size_t>(kHeadSize * kHeadSize + kHeadSize + kHeadSize) * sizeof(float);
-
-  cudaFuncSetAttribute(
-      gdn_prefill_kernel,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(shared_bytes));
 
   auto stream = c10::cuda::getDefaultCUDAStream();
   int total_gate_elems = static_cast<int>(q.size(0) * kNumVHeads);
@@ -294,7 +287,7 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
       beta.data_ptr<float>(),
       static_cast<int>(q.size(0)));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  gdn_prefill_kernel<<<grid, block, shared_bytes, stream.stream()>>>(
+  gdn_prefill_kernel<<<grid, block, 0, stream.stream()>>>(
       q.data_ptr<c10::BFloat16>(),
       k.data_ptr<c10::BFloat16>(),
       v.data_ptr<c10::BFloat16>(),
