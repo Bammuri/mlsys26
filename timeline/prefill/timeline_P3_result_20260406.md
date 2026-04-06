@@ -1,0 +1,405 @@
+# Prefill Timeline — P3 Result — 2026-04-06
+
+## Optimization summary
+
+이번 P3 iteration에서는 P1의 row-per-warp SRTP를 유지하면서,
+**block당 warp 수를 줄여 CTA 공급량을 더 늘리는 variant**를 시험했다.
+
+### Applied optimization
+
+1. `kWarpsPerBlock = 4` → `2`
+2. row-per-warp ownership 유지
+3. block size `128` → `64`
+4. `grid.x`를 더 키워 더 많은 CTA를 만들도록 변경
+5. no-shared / no-spill / gate-beta precompute 구조는 유지
+
+핵심 의도:
+
+> P2가 보여준 교훈(더 많은 per-warp work보다 더 많은 CTA 공급이 중요함)을 반영해,
+> row-per-warp의 단순성을 유지하면서 scheduler가 볼 block 수를 더 늘리기
+
+---
+
+## Expected result before testing
+
+baseline (current keep baseline, full 100, `warmup_runs=1, iterations=5, num_trials=2`):
+
+- avg latency: `0.517 ms`
+
+예상:
+
+1. quick 5 PASS 유지
+2. full 100 PASS 유지
+3. tiny/long-tail에서 positive gain 가능
+4. throughput-heavy에서는 no-op 또는 slight regression 가능
+
+---
+
+## Verification
+
+### 1. pack
+
+```bash
+python scripts/pack_solution.py
+```
+
+결과:
+
+- 성공
+
+### 2. quick gate
+
+```bash
+modal run scripts/run_modal.py --quick --max-workloads 5
+```
+
+결과:
+
+- `PASSED=5/5`
+- avg latency: `0.048 ms`
+- worst abs error: `1.91e-06`
+- worst rel error: `1.93e-02`
+
+### 3. full decision gate
+
+```bash
+modal run scripts/run_modal.py --decision-gate --max-workloads 100
+```
+
+결과:
+
+- `PASSED=100/100`
+- avg latency: `0.511 ms`
+- avg speedup: `344.89x`
+- worst abs error: `1.22e-04`
+- worst rel error: `2.97e-01`
+
+판단 기준은 사용자 지시대로 **quick이 아니라 full 100 arithmetic-mean latency**다.
+
+---
+
+## Comparison against baseline
+
+### Baseline → P3
+
+- avg latency: `0.517 ms` → `0.511 ms`
+- 절대 개선: `0.006 ms`
+- 상대 개선: 약 **1.16%**
+
+개선 폭은 작지만,
+사용자 규칙 기준에서는 **improvement**다.
+
+---
+
+## Representative workload comparison
+
+몇 개 대표 workload를 보면 방향성은 일관되게 positive다.
+
+- `77daf91d`: `0.039 ms` → `0.035 ms`
+- `ba08a83e`: `0.093 ms` → `0.092 ms`
+- `5835a2bc`: `2.209 ms` → `2.169 ms`
+- `07aa7922`: `2.674 ms` → `2.651 ms`
+
+즉 이번 변화는 dramatic하지는 않지만,
+full workload mix에서 여러 구간에 걸쳐 **작은 개선이 누적된 형태**다.
+
+---
+
+## Detailed analysis: why it likely improved
+
+### 1. P3 kept the most important property from P1: one row per warp
+
+P2의 실패 원인은 warp 하나가 row 2개를 순차 처리하면서,
+q/k 재사용 이득보다 scheduler-level concurrency 손해가 더 컸던 것이다.
+
+P3는 이 교훈을 반영해:
+
+- row-per-warp 유지
+- no-shared 유지
+- no-spill 유지
+
+를 그대로 보존했다.
+
+즉,
+
+> P3는 P1이 잘하던 dataflow를 깨지 않고,
+> launch granularity만 더 세밀하게 조정한 실험이었다.
+
+### 2. More, smaller CTAs helped the arithmetic mean a little
+
+block size를 줄이면 block당 해야 할 row 수가 줄고,
+동시에 total block 수는 늘어난다.
+
+이 효과는 특히 다음 조건에서 유리할 수 있다.
+
+1. tiny / small single-seq 처럼 절대 block 수가 부족한 경우
+2. long-tail처럼 token loop는 길지만 `num_seqs`는 적은 경우
+3. full workload average처럼 서로 다른 shape가 섞여 있을 때
+
+이번 결과에서:
+
+- `77daf91d` 개선
+- `07aa7922` 개선
+- `5835a2bc`도 소폭 개선
+
+이 모두 동시에 나온 것은,
+
+> finer-grained CTA 공급이 전체 분포에서 약한 but real 이득을 준다는 신호다.
+
+### 3. Why the gain is modest, not large
+
+이번 P3가 structural family를 바꾸지는 않았기 때문이다.
+
+P1에서 이미:
+
+- shared-state 제거
+- spill 제거
+- warp-local row ownership
+
+이라는 큰 구조 변경이 끝났다.
+
+그 이후 P3는:
+
+- 같은 family 안에서 launch granularity만 조정
+
+한 것이므로,
+개선 폭이 **1% 수준**인 것은 자연스럽다.
+
+즉,
+
+> 이번 loop는 “새 병목 제거”라기보다,
+> 이미 좋아진 kernel을 workload mix에 더 맞게 다듬은 tuning pass에 가깝다.
+
+### 4. Why this succeeded where P2 failed
+
+P2와 P3의 차이는 분명하다.
+
+- P2: warp당 work를 늘림
+- P3: warp당 work는 유지하고 block 수만 늘림
+
+P2는 full 기준으로 `0.782 ms`까지 악화됐다.
+반면 P3는 `0.511 ms`로 baseline보다 소폭 좋아졌다.
+
+이 비교는 다음 사실을 강하게 지지한다.
+
+> 현재 prefill kernel에서는 q/k reuse를 위해 warp당 serial work를 늘리는 것보다,
+> 더 많은 independent warp/CTA를 공급하는 것이 훨씬 안전하고 유효하다.
+
+### 5. Why this does not change the bigger roadmap
+
+비록 P3는 keep이지만,
+이 결과만으로 “문제가 완전히 풀렸다”는 뜻은 아니다.
+
+background upstream baseline은 여전히:
+
+- `0.317 ms`
+
+현재 keep baseline은:
+
+- `0.511 ms`
+
+즉 아직도 큰 차이가 남아 있다.
+
+따라서 P3의 해석은 이렇게 보는 게 맞다.
+
+> P3는 옳은 방향의 미세 launch-shape tuning이었지만,
+> 앞으로는 다시 더 큰 구조적/algorithmic step을 봐야 한다.
+
+예를 들어:
+
+- q/k path의 further vector cleanup
+- row tile granularity의 더 정교한 설계
+- long-tail workload 중심 variant 분기
+
+등이 다음 후보가 된다.
+
+---
+
+## Judgement
+
+이번 iteration은 **keep** 한다.
+
+### Why this is a keep
+
+1. `PASSED=100/100`
+2. full avg latency가 `0.517 ms` → `0.511 ms`로 개선
+3. representative workloads에서도 전반적으로 small positive trend
+4. P2 실패 이후, “more CTAs / less per-warp serial work” 방향이 더 낫다는 점을 다시 확인했다
+
+---
+
+## Decision under workflow rule
+
+- keep/revert 기준: **full workload avg latency arithmetic mean**
+- 결과: **KEEP**
+
+다음 단계:
+
+1. commit
+2. 다시 background + timeline 기반으로 다음 plan 생성
+
+---
+
+## Full pref log
+
+full pref log is saved in:
+
+- `timeline/prefill/perf_P3_2604062351.txt`
+
+아래는 동일 로그 전문이다.
+
+```text
+✓ Initialized. View run at 
+https://modal.com/apps/shjj1504/main/ap-9eMVt2Z1BSaR4MfNJUHWAn
+✓ Created objects.
+├── 🔨 Created mount /home/hyu/flashinfer/mlsys26/scripts/run_modal.py
+└── 🔨 Created function run_benchmark.
+[2026-04-06T23:51:45] Packing solution from source files...
+Solution packed: /home/hyu/flashinfer/mlsys26/solution.json
+  Name: my-team-solution-v1
+  Definition: gdn_prefill_qk4_v8_d128_k_last
+  Author: team-name
+  Config language: cuda
+  Runtime language: cuda
+[2026-04-06T23:51:45] Validating solution JSON...
+[2026-04-06T23:51:45] Loaded solution my-team-solution-v1 (gdn_prefill_qk4_v8_d128_k_last) in 0.01s
+[2026-04-06T23:51:45] Decision-gate mode enabled: warmup_runs=1, iterations=5, num_trials=2, use_isolated_runner=False
+[2026-04-06T23:51:45] Dispatching benchmark to Modal B200...
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.0.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[2026-04-06T14:51:50] Remote benchmark start: solution=my-team-solution-v1, definition=gdn_prefill_qk4_v8_d128_k_last
+[2026-04-06T14:51:50] BenchmarkConfig(warmup_runs=1, iterations=5, num_trials=2)
+[2026-04-06T14:51:50] Loading trace set from /data/data/mlsys26-contest
+[2026-04-06T14:51:50] Loaded trace set in 0.14s
+[2026-04-06T14:51:50] Running benchmark across 100 workloads
+[2026-04-06T14:59:23] Benchmark completed in 452.74s
+[2026-04-06T23:59:24] Received benchmark results in 458.87s
+
+gdn_prefill_qk4_v8_d128_k_last:
+  workloads: 100
+  status counts: PASSED=100
+  avg latency: 0.511 ms
+  avg speedup: 344.89x
+  worst abs error: 1.22e-04
+  worst rel error: 2.97e-01
+  Workload 77daf91d...: PASSED | 0.035 ms | 34.93x speedup | abs_err=4.47e-08, rel_err=9.53e-03
+  Workload ba08a83e...: PASSED | 0.092 ms | 233.94x speedup | abs_err=7.63e-06, rel_err=7.50e-03
+  Workload c7846f96...: PASSED | 0.090 ms | 239.02x speedup | abs_err=3.81e-06, rel_err=6.89e-03
+  Workload d0ce7b5d...: PASSED | 1.513 ms | 862.59x speedup | abs_err=6.10e-05, rel_err=1.21e-01
+  Workload 5b8a0e4b...: PASSED | 2.260 ms | 582.60x speedup | abs_err=1.53e-05, rel_err=4.03e-02
+  Workload 5d3fc66a...: PASSED | 2.235 ms | 630.03x speedup | abs_err=6.10e-05, rel_err=1.59e-01
+  Workload 4b6143dd...: PASSED | 0.626 ms | 1084.60x speedup | abs_err=7.63e-06, rel_err=2.79e-02
+  Workload 5835a2bc...: PASSED | 2.169 ms | 657.68x speedup | abs_err=1.53e-05, rel_err=1.73e-02
+  Workload cc310f94...: PASSED | 2.025 ms | 704.66x speedup | abs_err=1.22e-04, rel_err=1.33e-01
+  Workload d49df0b2...: PASSED | 1.656 ms | 858.37x speedup | abs_err=1.53e-05, rel_err=6.77e-02
+  Workload e9e1e445...: PASSED | 1.724 ms | 817.88x speedup | abs_err=1.22e-04, rel_err=3.40e-02
+  Workload b8c8dc3c...: PASSED | 1.716 ms | 827.07x speedup | abs_err=6.10e-05, rel_err=1.56e-01
+  Workload a9540651...: PASSED | 2.121 ms | 611.83x speedup | abs_err=1.53e-05, rel_err=4.84e-02
+  Workload 06f21bb1...: PASSED | 1.149 ms | 1129.89x speedup | abs_err=3.05e-05, rel_err=2.05e-02
+  Workload c2931c92...: PASSED | 1.898 ms | 684.19x speedup | abs_err=1.22e-04, rel_err=1.25e-01
+  Workload 618df04a...: PASSED | 1.652 ms | 784.51x speedup | abs_err=1.53e-05, rel_err=1.14e-01
+  Workload 26244fb4...: PASSED | 2.026 ms | 637.84x speedup | abs_err=7.63e-06, rel_err=1.88e-01
+  Workload a2629e02...: PASSED | 2.036 ms | 634.86x speedup | abs_err=6.10e-05, rel_err=2.97e-01
+  Workload 9a5d694b...: PASSED | 1.394 ms | 930.32x speedup | abs_err=6.10e-05, rel_err=5.64e-02
+  Workload 410794d4...: PASSED | 1.610 ms | 807.38x speedup | abs_err=1.53e-05, rel_err=1.67e-02
+  Workload 7ba9d519...: PASSED | 1.405 ms | 450.56x speedup | abs_err=6.10e-05, rel_err=5.87e-02
+  Workload 043e74e4...: PASSED | 0.036 ms | 151.75x speedup | abs_err=1.19e-07, rel_err=7.32e-03
+  Workload ef9515b6...: PASSED | 0.036 ms | 76.04x speedup | abs_err=2.98e-08, rel_err=1.82e-03
+  Workload f622a11d...: PASSED | 0.033 ms | 83.46x speedup | abs_err=5.96e-07, rel_err=1.16e-02
+  Workload 1cf8e175...: PASSED | 0.036 ms | 184.68x speedup | abs_err=1.19e-07, rel_err=4.49e-03
+  Workload 9343fd82...: PASSED | 0.052 ms | 154.49x speedup | abs_err=1.91e-06, rel_err=8.95e-03
+  Workload f4926229...: PASSED | 0.666 ms | 327.55x speedup | abs_err=6.10e-05, rel_err=4.59e-02
+  Workload 109addb1...: PASSED | 1.254 ms | 412.39x speedup | abs_err=6.10e-05, rel_err=1.80e-02
+  Workload c5257f65...: PASSED | 0.479 ms | 324.62x speedup | abs_err=1.91e-06, rel_err=4.43e-02
+  Workload f5619793...: PASSED | 0.456 ms | 341.71x speedup | abs_err=6.10e-05, rel_err=4.84e-02
+  Workload fdf5f1f4...: PASSED | 0.040 ms | 190.77x speedup | abs_err=1.19e-07, rel_err=7.16e-03
+  Workload 87bff084...: PASSED | 0.072 ms | 451.39x speedup | abs_err=1.91e-06, rel_err=6.62e-03
+  Workload e92dafeb...: PASSED | 0.078 ms | 488.97x speedup | abs_err=1.91e-06, rel_err=2.63e-02
+  Workload 1d0cc342...: PASSED | 0.133 ms | 349.96x speedup | abs_err=3.81e-06, rel_err=5.64e-02
+  Workload 1b441950...: PASSED | 0.063 ms | 234.63x speedup | abs_err=1.19e-07, rel_err=1.07e-02
+  Workload 19c6ab20...: PASSED | 0.064 ms | 228.57x speedup | abs_err=1.07e-06, rel_err=1.32e-02
+  Workload 25d9c14d...: PASSED | 0.064 ms | 328.98x speedup | abs_err=4.77e-07, rel_err=1.41e-02
+  Workload 3215fe5f...: PASSED | 0.171 ms | 315.72x speedup | abs_err=1.91e-06, rel_err=7.40e-03
+  Workload 6f1ad833...: PASSED | 1.000 ms | 332.99x speedup | abs_err=6.10e-05, rel_err=4.11e-02
+  Workload e44ba4d3...: PASSED | 0.559 ms | 451.81x speedup | abs_err=7.63e-06, rel_err=2.16e-02
+  Workload fc7a2bcb...: PASSED | 0.077 ms | 289.31x speedup | abs_err=9.54e-07, rel_err=3.57e-02
+  Workload 5d26ac5b...: PASSED | 0.073 ms | 307.48x speedup | abs_err=3.81e-06, rel_err=2.44e-02
+  Workload ed66c791...: PASSED | 0.082 ms | 226.23x speedup | abs_err=1.91e-06, rel_err=3.70e-02
+  Workload ba95d412...: PASSED | 0.100 ms | 294.28x speedup | abs_err=4.77e-07, rel_err=1.36e-02
+  Workload 078a41ea...: PASSED | 0.054 ms | 243.73x speedup | abs_err=9.54e-07, rel_err=1.04e-02
+  Workload d2b5a221...: PASSED | 0.043 ms | 310.10x speedup | abs_err=9.54e-07, rel_err=1.25e-02
+  Workload aaa378be...: PASSED | 0.749 ms | 380.47x speedup | abs_err=3.81e-06, rel_err=1.22e-02
+  Workload c2bb4f66...: PASSED | 0.751 ms | 388.71x speedup | abs_err=3.05e-05, rel_err=8.00e-02
+  Workload f2f01c2c...: PASSED | 0.039 ms | 150.47x speedup | abs_err=5.96e-08, rel_err=4.96e-03
+  Workload 15856e8c...: PASSED | 1.298 ms | 368.90x speedup | abs_err=7.63e-06, rel_err=1.94e-02
+  Workload a39aa135...: PASSED | 0.054 ms | 185.58x speedup | abs_err=2.98e-07, rel_err=1.93e-02
+  Workload 339a7ff4...: PASSED | 0.035 ms | 79.19x speedup | abs_err=1.19e-07, rel_err=4.82e-03
+  Workload d8f4a9ae...: PASSED | 0.043 ms | 136.61x speedup | abs_err=2.24e-08, rel_err=6.33e-03
+  Workload d3dc3577...: PASSED | 0.043 ms | 136.38x speedup | abs_err=3.58e-07, rel_err=1.52e-02
+  Workload ce832e76...: PASSED | 0.233 ms | 312.60x speedup | abs_err=3.81e-06, rel_err=9.66e-03
+  Workload 6fbc155c...: PASSED | 0.352 ms | 375.62x speedup | abs_err=3.81e-06, rel_err=7.63e-03
+  Workload a87ded8a...: PASSED | 0.766 ms | 590.39x speedup | abs_err=1.22e-04, rel_err=4.99e-02
+  Workload 62447caf...: PASSED | 0.041 ms | 124.14x speedup | abs_err=1.19e-07, rel_err=2.48e-02
+  Workload fd072ba6...: PASSED | 0.060 ms | 306.46x speedup | abs_err=1.91e-06, rel_err=9.11e-03
+  Workload 35ea9bbe...: PASSED | 0.061 ms | 300.61x speedup | abs_err=1.91e-06, rel_err=2.41e-02
+  Workload 1aa8cf18...: PASSED | 0.034 ms | 174.61x speedup | abs_err=5.96e-08, rel_err=7.61e-03
+  Workload d5f5c00c...: PASSED | 0.041 ms | 124.42x speedup | abs_err=1.49e-08, rel_err=1.71e-03
+  Workload d5aa60dc...: PASSED | 0.121 ms | 335.15x speedup | abs_err=1.91e-06, rel_err=3.37e-02
+  Workload 28b70283...: PASSED | 0.037 ms | 109.56x speedup | abs_err=9.54e-07, rel_err=7.52e-03
+  Workload 73b8cc85...: PASSED | 0.072 ms | 216.04x speedup | abs_err=1.91e-06, rel_err=6.50e-03
+  Workload 2683c087...: PASSED | 0.073 ms | 214.84x speedup | abs_err=7.63e-06, rel_err=1.17e-02
+  Workload 4b94d568...: PASSED | 0.244 ms | 375.81x speedup | abs_err=7.63e-06, rel_err=1.64e-02
+  Workload a0eb2dc2...: PASSED | 0.070 ms | 213.13x speedup | abs_err=3.81e-06, rel_err=6.16e-03
+  Workload f3d30cb9...: PASSED | 0.060 ms | 230.66x speedup | abs_err=2.98e-07, rel_err=6.35e-03
+  Workload 7a7deca8...: PASSED | 0.066 ms | 194.49x speedup | abs_err=3.81e-06, rel_err=7.69e-03
+  Workload 977d19f8...: PASSED | 0.042 ms | 118.74x speedup | abs_err=1.19e-07, rel_err=5.71e-03
+  Workload 02c1e5f0...: PASSED | 0.040 ms | 127.10x speedup | abs_err=4.77e-07, rel_err=5.65e-03
+  Workload 5a91aa02...: PASSED | 0.160 ms | 398.99x speedup | abs_err=1.91e-06, rel_err=1.13e-02
+  Workload 8e7ef744...: PASSED | 0.036 ms | 59.63x speedup | abs_err=2.98e-08, rel_err=3.73e-03
+  Workload 85d7becb...: PASSED | 0.035 ms | 89.64x speedup | abs_err=3.58e-07, rel_err=5.67e-03
+  Workload e286a4f4...: PASSED | 0.584 ms | 486.38x speedup | abs_err=7.63e-06, rel_err=2.26e-02
+  Workload 08d4f2c4...: PASSED | 0.451 ms | 341.50x speedup | abs_err=3.81e-06, rel_err=1.11e-02
+  Workload 9c1ef562...: PASSED | 0.450 ms | 356.63x speedup | abs_err=3.05e-05, rel_err=4.97e-02
+  Workload bfd8f7b6...: PASSED | 0.138 ms | 286.66x speedup | abs_err=3.81e-06, rel_err=7.58e-03
+  Workload c358edcd...: PASSED | 0.944 ms | 344.63x speedup | abs_err=1.53e-05, rel_err=7.67e-03
+  Workload f203fdcd...: PASSED | 0.049 ms | 161.29x speedup | abs_err=2.38e-07, rel_err=9.32e-03
+  Workload 33a38713...: PASSED | 0.061 ms | 309.23x speedup | abs_err=1.91e-06, rel_err=3.08e-02
+  Workload 3a77dfec...: PASSED | 0.057 ms | 217.09x speedup | abs_err=5.96e-08, rel_err=7.50e-03
+  Workload ea27be17...: PASSED | 0.055 ms | 225.22x speedup | abs_err=7.15e-07, rel_err=8.32e-03
+  Workload 49ef89d2...: PASSED | 0.058 ms | 185.85x speedup | abs_err=1.91e-06, rel_err=3.87e-02
+  Workload 056224b8...: PASSED | 0.061 ms | 181.65x speedup | abs_err=4.77e-07, rel_err=6.69e-03
+  Workload 685d26ff...: PASSED | 0.034 ms | 67.19x speedup | abs_err=1.19e-07, rel_err=5.69e-03
+  Workload 352c9ace...: PASSED | 0.272 ms | 305.47x speedup | abs_err=3.05e-05, rel_err=2.33e-02
+  Workload 2c9693b4...: PASSED | 0.048 ms | 165.03x speedup | abs_err=2.98e-08, rel_err=5.83e-03
+  Workload 27f44fd6...: PASSED | 0.051 ms | 157.98x speedup | abs_err=1.91e-06, rel_err=1.05e-02
+  Workload 07aa7922...: PASSED | 2.651 ms | 343.04x speedup | abs_err=3.05e-05, rel_err=7.11e-02
+  Workload eaa0fd47...: PASSED | 0.038 ms | 66.45x speedup | abs_err=9.54e-07, rel_err=6.45e-03
+  Workload f105eda8...: PASSED | 0.226 ms | 465.34x speedup | abs_err=6.10e-05, rel_err=1.49e-02
+  Workload cd979341...: PASSED | 0.054 ms | 230.80x speedup | abs_err=3.81e-06, rel_err=6.88e-03
+  Workload 43bf9699...: PASSED | 0.449 ms | 341.27x speedup | abs_err=1.91e-06, rel_err=7.69e-03
+  Workload 54856fec...: PASSED | 0.450 ms | 337.16x speedup | abs_err=3.05e-05, rel_err=1.01e-01
+  Workload 2ba465c0...: PASSED | 0.032 ms | 148.71x speedup | abs_err=2.38e-07, rel_err=7.69e-03
+  Workload 1efaf2a9...: PASSED | 0.039 ms | 179.78x speedup | abs_err=2.98e-08, rel_err=8.85e-03
+  Workload a01a3f93...: PASSED | 1.013 ms | 357.45x speedup | abs_err=1.22e-04, rel_err=4.51e-02
+  Workload cc241d2e...: PASSED | 0.039 ms | 101.61x speedup | abs_err=1.49e-07, rel_err=6.82e-03
+[2026-04-06T23:59:24] Local entrypoint finished in 458.88s
+[2026-04-06T14:59:23] Remote benchmark finished in 452.88s
+Stopping app - local entrypoint completed.
+Runner terminated.
+✓ App completed. View run at 
+https://modal.com/apps/shjj1504/main/ap-9eMVt2Z1BSaR4MfNJUHWAn
+
+```
