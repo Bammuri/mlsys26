@@ -16,8 +16,8 @@
  * Optimizations:
  *   - Register-tiled state: 128x128 state in registers (each thread holds 128 floats)
  *   - Two-phase inner loop: Phase 1 does all state updates, Phase 2 computes all outputs
- *   - Batched VB=8 vi values per syncthreads (1 sync per batch per phase)
- *   - Deferred output reduction: 34 syncs/timestep (1 v-load + 16 phase1 + 1 barrier + 16 phase2)
+ *   - Batched VB=16 vi values per syncthreads (1 sync per batch per phase)
+ *   - Deferred output reduction: 18 syncs/timestep (1 v-load + 8 phase1 + 1 barrier + 8 phase2)
  */
 
 #include <cuda_runtime.h>
@@ -34,7 +34,7 @@ constexpr int NUM_K_HEADS = 4;
 constexpr int NUM_V_HEADS = 8;
 constexpr int HEAD_DIM = 128;
 constexpr int V_PER_Q = NUM_V_HEADS / NUM_Q_HEADS;  // 2
-constexpr int VB = 8;  // vi batch size
+constexpr int VB = 16;  // vi batch size
 constexpr int NUM_WARPS = HEAD_DIM / 32;  // 4
 
 __device__ __forceinline__ float softplus(float x) {
@@ -167,15 +167,12 @@ __global__ void gdn_prefill_kernel(
             }
             __syncthreads();  // One sync for VB output reductions
 
-            // Thread 0 writes VB output values
-            if (tid == 0) {
-                #pragma unroll
-                for (int vb = 0; vb < VB; vb++) {
-                    float sum = s_reduce[0 * VB + vb] + s_reduce[1 * VB + vb]
-                              + s_reduce[2 * VB + vb] + s_reduce[3 * VB + vb];
-                    output[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi_base + vb] =
-                        __float2bfloat16(scale * sum);
-                }
+            // Distributed output writes — first VB threads each write one value
+            if (tid < VB) {
+                float sum = s_reduce[0 * VB + tid] + s_reduce[1 * VB + tid]
+                          + s_reduce[2 * VB + tid] + s_reduce[3 * VB + tid];
+                output[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi_base + tid] =
+                    __float2bfloat16(scale * sum);
             }
         }
         __syncthreads();  // Ensure s_v/s_reduce safe before next timestep

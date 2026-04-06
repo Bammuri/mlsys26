@@ -21,3 +21,11 @@ Tracking all optimization iterations for the prefill kernel.
 - **Correctness**: max_atol=1.22e-04, max_rtol=0.295, matched_ratio=1.0. Note: rtol is very close to 0.3 limit (1.7% headroom).
 - **Status**: accepted
 - **Learnings**: Sync reduction was the primary speedup driver. Phase separation also improved ILP in Phase 1 (no q_val or output write instructions). VB=8 did not cause register spilling — 128 state + 8 temp + 8 partial = 144 registers, within limits. Max speedup near 100x on favorable workloads. Caution: rtol headroom is tight; further numerical changes risk correctness failure.
+
+## 2026-04-07 - VB=16 + Distributed Output Writes
+- **Idea**: Double vi batch size from VB=8 to VB=16, cutting syncs/timestep from 35→19 (46% fewer). Also distribute Phase 2 output writes across first VB threads instead of serializing on thread 0.
+- **Result**: 24.75x → 26.44x mean speedup (+6.8%), latency 10.02ms → 8.26ms (-17.6%)
+- **Min/Max speedup**: 14.92x/99.67x → 15.60x/99.17x
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.295, matched_ratio=1.0. rtol headroom unchanged (1.7%).
+- **Status**: accepted
+- **Learnings**: VB=16 register pressure is safe (~168 registers). Improvement was more modest than VB=4→8 jump (+6.8% vs +17.6%), suggesting diminishing returns from sync reduction alone. VB=32 could be tried but carries spill risk (~200 registers). Distributed writes had negligible measured impact (output writes are not on critical path). Cross-warp sync is fundamentally unavoidable with 128 threads; further gains likely need algorithmic changes (chunked parallelism) rather than micro-optimizations.
