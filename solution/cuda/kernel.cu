@@ -15,7 +15,12 @@ constexpr int kHeadSize = 128;
 constexpr int kNumQHeads = 4;
 constexpr int kNumKHeads = 4;
 constexpr int kNumVHeads = 8;
-constexpr int kThreads = 128;
+constexpr int kWarpSize = 32;
+constexpr int kVecSize = 4;
+constexpr int kWarpsPerBlock = 2;
+constexpr int kRowsPerBlock = kWarpsPerBlock;
+constexpr int kThreads = kWarpsPerBlock * kWarpSize;
+constexpr int kRowTilesPerHead = kHeadSize / kRowsPerBlock;
 
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")

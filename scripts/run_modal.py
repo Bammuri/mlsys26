@@ -243,12 +243,12 @@ def main(
         config = BenchmarkConfig(
             warmup_runs=1,
             iterations=5,
-            num_trials=1,
+            num_trials=2,
             use_isolated_runner=False,
             timeout_seconds=300,
         )
         log_event(
-            "Decision-gate mode enabled: warmup_runs=1, iterations=5, num_trials=1, "
+            "Decision-gate mode enabled: warmup_runs=1, iterations=5, num_trials=2, "
             "use_isolated_runner=False"
         )
     elif quick:
