@@ -77,8 +77,7 @@ __global__ __launch_bounds__(256, 2) void compute_gate_beta_kernel(
     const c10::BFloat16* __restrict__ a,
     const float* __restrict__ dt_bias,
     const c10::BFloat16* __restrict__ b,
-    float* __restrict__ gate,
-    float* __restrict__ beta,
+    float2* __restrict__ gate_beta,
     int total_seq_len) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int total = total_seq_len * kNumVHeads;
@@ -91,8 +90,9 @@ __global__ __launch_bounds__(256, 2) void compute_gate_beta_kernel(
   float b_val = bf16_to_float(b + idx);
   float x = a_val + dt_bias[head_idx];
   float a_log_exp = expf(A_log[head_idx]);
-  gate[idx] = expf(-a_log_exp * softplusf_stable(x));
-  beta[idx] = 1.0f / (1.0f + expf(-b_val));
+  gate_beta[idx] = make_float2(
+      expf(-a_log_exp * softplusf_stable(x)),
+      1.0f / (1.0f + expf(-b_val)));
 }
 
 __global__ __launch_bounds__(kThreads) void gdn_prefill_kernel(
@@ -101,8 +101,7 @@ __global__ __launch_bounds__(kThreads) void gdn_prefill_kernel(
     const c10::BFloat16* __restrict__ v,
     const float* __restrict__ state_in,
     float* __restrict__ state_out,
-    const float* __restrict__ gate,
-    const float* __restrict__ beta,
+    const float2* __restrict__ gate_beta,
     const int64_t* __restrict__ cu_seqlens,
     c10::BFloat16* __restrict__ output,
     int64_t num_seqs,
@@ -147,8 +146,9 @@ __global__ __launch_bounds__(kThreads) void gdn_prefill_kernel(
     float beta_val = 0.0f;
     if (lane == 0) {
       int64_t gate_idx = t * kNumVHeads + head_idx;
-      gate_val = gate[gate_idx];
-      beta_val = beta[gate_idx];
+      float2 gate_beta_vec = gate_beta[gate_idx];
+      gate_val = gate_beta_vec.x;
+      beta_val = gate_beta_vec.y;
     }
     gate_val = __shfl_sync(0xffffffff, gate_val, 0);
     beta_val = __shfl_sync(0xffffffff, beta_val, 0);
@@ -260,11 +260,8 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
   auto new_state = torch::empty(
       {num_seqs, kNumVHeads, kHeadSize, kHeadSize},
       torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
-  auto gate = torch::empty(
-      {q.size(0), kNumVHeads},
-      torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
-  auto beta = torch::empty(
-      {q.size(0), kNumVHeads},
+  auto gate_beta = torch::empty(
+      {q.size(0), kNumVHeads, 2},
       torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
 
   if (has_state) {
@@ -283,8 +280,7 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
       a.data_ptr<c10::BFloat16>(),
       dt_bias.data_ptr<float>(),
       b.data_ptr<c10::BFloat16>(),
-      gate.data_ptr<float>(),
-      beta.data_ptr<float>(),
+      reinterpret_cast<float2*>(gate_beta.data_ptr<float>()),
       static_cast<int>(q.size(0)));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   gdn_prefill_kernel<<<grid, block, 0, stream.stream()>>>(
@@ -293,8 +289,7 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
       v.data_ptr<c10::BFloat16>(),
       has_state ? state_in.data_ptr<float>() : nullptr,
       new_state.data_ptr<float>(),
-      gate.data_ptr<float>(),
-      beta.data_ptr<float>(),
+      reinterpret_cast<const float2*>(gate_beta.data_ptr<float>()),
       cu_seqlens.data_ptr<int64_t>(),
       output.data_ptr<c10::BFloat16>(),
       num_seqs,
