@@ -59,7 +59,7 @@ Spawn the **`evaluator`** agent (subagent_type=evaluator) with:
 
 ### Step 6: Evaluate & Decide
 Compare the evaluator's results with previous benchmarks:
-- If improved: commit the change, update optimization log
+- If improved: update optimization log (Step 7), then commit using `/conventional-commit`
 - If regressed or no change: analyze why, consider reverting or adjusting
 - If correctness fails: revert and try the next-ranked idea from Step 2
 
