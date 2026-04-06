@@ -1,0 +1,22 @@
+{
+  "directives": [
+    {
+      "directive": "If execution pauses or a loop iteration finishes without an explicit user stop/cancel, automatically continue to the next optimization loop instead of waiting for confirmation.",
+      "priority": "high",
+      "context": "Looping optimization workflow for mlsys26 GDN kernels",
+      "timestamp": "2026-04-05T14:29:33.653Z"
+    },
+    {
+      "directive": "For the mlsys26 optimization workflow, continue loop iterations automatically without waiting for confirmation until the user explicitly stops/cancels or there have been 10 consecutive non-meaningful iterations that were reverted. Use the full 100-workload decision gate as the final keep/revert criterion.",
+      "priority": "high",
+      "context": "Autonomous iterative optimization loop policy",
+      "timestamp": "2026-04-05T14:52:24.096Z"
+    },
+    {
+      "directive": "For optimization loop keep/revert decisions, use the full 100-workload arithmetic-mean latency as the primary criterion. Quick runs are only working gates. The current full decision-gate config is warmup_runs=1, iterations=5, num_trials=1.",
+      "priority": "high",
+      "context": "Updated loop rule per user: full average latency decides keep vs revert",
+      "timestamp": "2026-04-05T15:05:24.465Z"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "session_id": "omx-1775386553932-2kz086",
+  "started_at": "2026-04-05T10:56:01.979Z",
+  "cwd": "/home/hyu/flashinfer/mlsys26",
+  "pid": 4099,
+  "platform": "linux",
+  "pid_start_ticks": 1626977,
+  "pid_cmdline": "node /root/.nvm/versions/node/v20.20.2/bin/omx"
+}

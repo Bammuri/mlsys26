@@ -1,0 +1,15 @@
+{"timestamp":"2026-04-05T10:57:21.049Z","type":"auto_nudge_skipped","reason":"unmanaged_session"}
+{"timestamp":"2026-04-05T11:07:26.916Z","type":"auto_nudge_skipped","reason":"unmanaged_session"}
+{"timestamp":"2026-04-05T11:16:14.045Z","type":"auto_nudge_skipped","reason":"unmanaged_session"}
+{"timestamp":"2026-04-05T11:32:24.008Z","type":"auto_nudge_skipped","reason":"unmanaged_session"}
+{"timestamp":"2026-04-05T11:37:32.817Z","type":"auto_nudge_skipped","reason":"unmanaged_session"}
+{"timestamp":"2026-04-05T11:46:22.300Z","type":"auto_nudge_skipped","reason":"unmanaged_session"}
+{"timestamp":"2026-04-05T12:05:25.473Z","type":"auto_nudge_skipped","reason":"unmanaged_session"}
+{"timestamp":"2026-04-05T12:17:48.077Z","type":"tmux_hook","mode":null,"reason":"mode_not_allowed","turn_id":"019d5d93-ad39-7d71-956f-581c655ed488","thread_id":"019d5d49-3fd3-7fe1-9219-ac7ca63b71af","target":{"type":"pane","value":"%2"},"dry_run":false,"sent":false,"event":"injection_skipped"}
+{"timestamp":"2026-04-05T12:17:48.163Z","type":"auto_nudge_skipped","reason":"unmanaged_session"}
+{"timestamp":"2026-04-05T12:20:52.777Z","type":"tmux_hook","mode":null,"reason":"mode_not_allowed","turn_id":"019d5d96-2c05-7f82-9b9e-bbdb7aeb847e","thread_id":"019d5d49-3fd3-7fe1-9219-ac7ca63b71af","target":{"type":"pane","value":"%2"},"dry_run":false,"sent":false,"event":"injection_skipped"}
+{"timestamp":"2026-04-05T12:20:52.847Z","type":"auto_nudge_skipped","reason":"unmanaged_session"}
+{"timestamp":"2026-04-05T12:50:40.205Z","type":"tmux_hook","mode":null,"reason":"mode_not_allowed","turn_id":"019d5db1-a66d-7852-8954-dc4e634174da","thread_id":"019d5d49-3fd3-7fe1-9219-ac7ca63b71af","target":{"type":"pane","value":"%2"},"dry_run":false,"sent":false,"event":"injection_skipped"}
+{"timestamp":"2026-04-05T12:50:40.316Z","type":"auto_nudge_skipped","reason":"unmanaged_session"}
+{"timestamp":"2026-04-05T12:58:48.743Z","type":"tmux_hook","mode":null,"reason":"mode_not_allowed","turn_id":"019d5db3-3b88-75c1-a3aa-42c263e35689","thread_id":"019d5d49-3fd3-7fe1-9219-ac7ca63b71af","target":{"type":"pane","value":"%2"},"dry_run":false,"sent":false,"event":"injection_skipped"}
+{"timestamp":"2026-04-05T12:58:48.820Z","type":"auto_nudge_skipped","reason":"unmanaged_session"}

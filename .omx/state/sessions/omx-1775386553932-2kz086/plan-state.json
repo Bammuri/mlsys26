@@ -1,0 +1,111 @@
+{
+  "active": false,
+  "started_at": "2026-04-05T12:00:00Z",
+  "current_phase": "completed",
+  "task_description": "Implement and validate the first SRTP prefill kernel prototype",
+  "completed_at": "2026-04-06T15:35:00Z",
+  "active_plan": "plan/00_p0_restart.md",
+  "baseline": "timeline/prefill/timeline_P14_result_2604060628.md (4.725 ms)",
+  "changed_files": [
+    "plan/05_active_continuation_after_P14.md",
+    "plan/README.md",
+    "plan/00_overall_plan.md",
+    ".omx/plans/prefill-optimization-roadmap-2026-04-06.md"
+  ],
+  "active_timeline": "timeline/prefill/timeline_P0_restart_20260406.md",
+  "removed_historical_docs": true,
+  "new_algorithm": "Streaming Register-Tiled Prefill (SRTP)",
+  "profiles_dir": "profiles/ncu",
+  "files": [
+    "profiles/ncu/README.md",
+    "profiles/ncu/00_reference_analysis.md",
+    "profiles/ncu/01_prefill_capture_plan.md"
+  ],
+  "local_ncu_available": false,
+  "modal_ncu_supported": false,
+  "implemented_script": "scripts/profile_ncu_prefill.py",
+  "verified": [
+    "python -m py_compile scripts/profile_ncu_prefill.py",
+    "python scripts/profile_ncu_prefill.py --help",
+    "python scripts/profile_ncu_prefill.py --list-workloads --list-limit 3"
+  ],
+  "blocked_by": [
+    "local ncu unavailable",
+    "Modal NCU unsupported",
+    "local CUDA/PyTorch runtime unsuitable for actual GPU execution/profiling"
+  ],
+  "primary_ncu_workloads": [
+    "77daf91d-0660-4c4b-8c32-336a69281cd9",
+    "ba08a83e-e151-4e16-bc70-abee6851604c",
+    "5835a2bc-8d60-43fc-b1ed-d4729ea62693",
+    "07aa7922-1848-48a9-830a-54216b5553b3"
+  ],
+  "support_workloads": [
+    "4b6143dd-0e5f-499f-93cb-076d9635bcd0",
+    "9a5d694b-7d4c-4ee6-8315-a13053ab6f92"
+  ],
+  "artifact": "profiles/ncu/02_workload_selection.md",
+  "templates": [
+    "profiles/ncu/10_baseline_capture.md",
+    "profiles/ncu/11_metric_summary.md"
+  ],
+  "workspace_readme_updated": true,
+  "baseline_doc": "profiles/ncu/10_baseline_capture.md",
+  "summary_doc": "profiles/ncu/11_metric_summary.md",
+  "first_attempt_workload": "77daf91d-0660-4c4b-8c32-336a69281cd9",
+  "result": "blocked_before_capture",
+  "blockers": [
+    "ncu not installed",
+    "CUDA_HOME unset",
+    "local MX150 sm_61 incompatible with installed torch CUDA arch support"
+  ],
+  "modal_ncu_probe_app": "ap-aMPQKAQt499ZGBZHCrUDSN",
+  "tiny_main_capture_app": "ap-GLsj6uzr759uBuM1lMLxdH",
+  "tiny_precompute_capture_app": "ap-1C7ByVBcXiCB1tBMGCKY6c",
+  "tiny_workload_uuid": "77daf91d-0660-4c4b-8c32-336a69281cd9",
+  "main_kernel_metrics": {
+    "duration_us": 78.24,
+    "regs_per_thread": 255,
+    "achieved_occupancy_pct": 6.26,
+    "dynamic_smem_kb": 66.56,
+    "waves_per_sm": 0.03,
+    "spill_requests": 7552
+  },
+  "precompute_kernel_metrics": {
+    "duration_us": 5.63,
+    "regs_per_thread": 16,
+    "achieved_occupancy_pct": 6.97
+  },
+  "captured_workloads": [
+    "77daf91d-0660-4c4b-8c32-336a69281cd9",
+    "ba08a83e-e151-4e16-bc70-abee6851604c",
+    "5835a2bc-8d60-43fc-b1ed-d4729ea62693",
+    "07aa7922-1848-48a9-830a-54216b5553b3"
+  ],
+  "dominant_findings": [
+    "precompute kernel cost stays small (~5.6-6.8 us)",
+    "main kernel limited by shared-state footprint and register pressure",
+    "tiny and long-tail cases show strong grid underfill",
+    "throughput-heavy improves coverage but still remains structurally constrained"
+  ],
+  "implementation_files": [
+    "solution/cuda/kernel.cu",
+    "timeline/prefill/timeline_P1_plan_20260406.md",
+    "timeline/prefill/timeline_P1_result_20260406.md"
+  ],
+  "quick_gate": {
+    "passed": true,
+    "avg_latency_ms": 0.058
+  },
+  "decision_gate": {
+    "passed": true,
+    "avg_latency_ms": 0.525,
+    "avg_speedup_x": 390.63
+  },
+  "tiny_ncu_after": {
+    "duration_us": 11.81,
+    "regs_per_thread": 32,
+    "dynamic_smem_bytes": 0,
+    "spill_requests": 0
+  }
+}
