@@ -5,13 +5,15 @@
  * State layout: [B, H=8, V=128, K=128] float32 (k-last)
  * GVA: q_heads=4, k_heads=4, v_heads=8 (2 v_heads per q/k head)
  *
- * Simplified formula (per head):
- *   g = exp(-exp(A_log) * softplus(a + dt_bias))
- *   beta = sigmoid(b)
- *   temp = g * state
- *   residual = beta * (v - k @ temp)
- *   state_new = temp + k^T @ residual
- *   output = scale * (q @ state_new)
+ * Optimization: Warp-parallel V-rows with loop fusion and float4 vectorized loads.
+ * Each warp independently handles 32 vi rows. Simultaneous ks/qs reductions
+ * avoid a second global memory read of state. Algebraic reformulation:
+ *   qk_dot   = sum_k(q[k] * k[k])
+ *   ks_sum   = sum_k(k[k] * state[vi,k])
+ *   qs_sum   = sum_k(q[k] * state[vi,k])
+ *   residual = beta * (v[vi] - g * ks_sum)
+ *   output[vi]          = scale * (g * qs_sum + qk_dot * residual)
+ *   new_state[vi,k]     = g * state[vi,k] + k[k] * residual
  */
 
 #include <cuda_runtime.h>
@@ -33,10 +35,16 @@ __device__ __forceinline__ float softplus(float x) {
     return log1pf(expf(x));
 }
 
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    return val;
+}
+
 /*
  * One block per (batch, v_head) pair.
  * Grid: (B * NUM_V_HEADS,)
- * Block: (128,) — one thread per K dimension
+ * Block: (128,) = 4 warps, each warp handles 32 vi rows
  */
 __global__ void gdn_decode_kernel(
     const bf16* __restrict__ q,         // [B, 1, 4, 128]
@@ -56,73 +64,104 @@ __global__ void gdn_decode_kernel(
     const int batch = idx / NUM_V_HEADS;
     const int vh = idx % NUM_V_HEADS;
     const int qkh = vh / V_PER_Q;
-    const int tid = threadIdx.x;    // k index
+    const int tid = threadIdx.x;
 
-    // Compute gates
+    const int warp_id = tid / 32;     // 0..3
+    const int lane = tid % 32;        // 0..31
+
+    // Compute gates (uniform across all threads in block)
     float a_val = __bfloat162float(a[batch * NUM_V_HEADS + vh]);
     float dt_val = dt_bias[vh];
     float A_val = A_log[vh];
     float g = expf(-expf(A_val) * softplus(a_val + dt_val));
     float beta = 1.0f / (1.0f + expf(-__bfloat162float(b_gate[batch * NUM_V_HEADS + vh])));
 
-    // Load k and q vectors
-    float k_val = __bfloat162float(k[batch * NUM_K_HEADS * HEAD_DIM + qkh * HEAD_DIM + tid]);
-    float q_val = __bfloat162float(q[batch * NUM_Q_HEADS * HEAD_DIM + qkh * HEAD_DIM + tid]);
+    // Each thread loads 4 contiguous k values via float4: k[lane*4 .. lane*4+3]
+    const int k_base_offset = batch * NUM_K_HEADS * HEAD_DIM + qkh * HEAD_DIM;
+    float k_vals[4];
+    {
+        // bf16 loads: 4 consecutive elements per thread
+        int k_start = lane * 4;
+        k_vals[0] = __bfloat162float(k[k_base_offset + k_start + 0]);
+        k_vals[1] = __bfloat162float(k[k_base_offset + k_start + 1]);
+        k_vals[2] = __bfloat162float(k[k_base_offset + k_start + 2]);
+        k_vals[3] = __bfloat162float(k[k_base_offset + k_start + 3]);
+    }
 
-    // Load v vector into shared memory
+    // Each thread loads 4 contiguous q values
+    const int q_base_offset = batch * NUM_Q_HEADS * HEAD_DIM + qkh * HEAD_DIM;
+    float q_vals[4];
+    {
+        int q_start = lane * 4;
+        q_vals[0] = __bfloat162float(q[q_base_offset + q_start + 0]);
+        q_vals[1] = __bfloat162float(q[q_base_offset + q_start + 1]);
+        q_vals[2] = __bfloat162float(q[q_base_offset + q_start + 2]);
+        q_vals[3] = __bfloat162float(q[q_base_offset + q_start + 3]);
+    }
+
+    // Precompute qk_dot = sum_k(q[k] * k[k]) via warp reduction
+    float qk_local = q_vals[0] * k_vals[0] + q_vals[1] * k_vals[1]
+                   + q_vals[2] * k_vals[2] + q_vals[3] * k_vals[3];
+    float qk_dot = warp_reduce_sum(qk_local);
+    // Broadcast from lane 0 to all lanes in the warp
+    qk_dot = __shfl_sync(0xffffffff, qk_dot, 0);
+
+    // Load v vector into shared memory (all warps cooperate)
     __shared__ float s_v[HEAD_DIM];
-    float v_val = __bfloat162float(v[batch * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + tid]);
-    s_v[tid] = v_val;
+    {
+        // tid maps 1:1 to v indices (128 threads, 128 elements)
+        s_v[tid] = __bfloat162float(v[batch * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + tid]);
+    }
     __syncthreads();
 
     // State base pointers
     const float* state_base = state + (batch * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
     float* new_state_base = new_state + (batch * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
 
-    __shared__ float s_reduce[4];  // 128/32 = 4 warps
-    __shared__ float s_kdot[HEAD_DIM];
+    // Output base pointer
+    bf16* out_base = output + batch * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM;
 
-    // Step 1: k @ temp for each vi
-    for (int vi = 0; vi < HEAD_DIM; vi++) {
-        float state_val = state_base[vi * HEAD_DIM + tid];
-        float temp_val = g * state_val;
-        float partial = k_val * temp_val;
+    // Each warp handles 32 vi rows: warp 0 -> vi 0..31, warp 1 -> vi 32..63, etc.
+    const int vi_start = warp_id * 32;
 
-        for (int offset = 16; offset > 0; offset >>= 1)
-            partial += __shfl_down_sync(0xffffffff, partial, offset);
+    for (int vi_off = 0; vi_off < 32; vi_off++) {
+        const int vi = vi_start + vi_off;
 
-        if (tid % 32 == 0)
-            s_reduce[tid / 32] = partial;
-        __syncthreads();
+        // Load 4 state values via float4: state[vi, lane*4 .. lane*4+3]
+        const float* state_row = state_base + vi * HEAD_DIM + lane * 4;
+        float4 st4 = *reinterpret_cast<const float4*>(state_row);
+        float state_vals[4] = { st4.x, st4.y, st4.z, st4.w };
 
-        if (tid == 0) {
-            s_kdot[vi] = s_reduce[0] + s_reduce[1] + s_reduce[2] + s_reduce[3];
+        // Simultaneous reductions: ks_sum and qs_sum
+        float ks_local = k_vals[0] * state_vals[0] + k_vals[1] * state_vals[1]
+                       + k_vals[2] * state_vals[2] + k_vals[3] * state_vals[3];
+        float qs_local = q_vals[0] * state_vals[0] + q_vals[1] * state_vals[1]
+                       + q_vals[2] * state_vals[2] + q_vals[3] * state_vals[3];
+
+        float ks_sum = warp_reduce_sum(ks_local);
+        float qs_sum = warp_reduce_sum(qs_local);
+
+        // Broadcast ks_sum from lane 0 to all lanes
+        ks_sum = __shfl_sync(0xffffffff, ks_sum, 0);
+
+        // Compute residual
+        float residual = beta * (s_v[vi] - g * ks_sum);
+
+        // Write new state: new_state[vi, lane*4+i] = g * state_vals[i] + k_vals[i] * residual
+        float4 new_st4;
+        new_st4.x = g * state_vals[0] + k_vals[0] * residual;
+        new_st4.y = g * state_vals[1] + k_vals[1] * residual;
+        new_st4.z = g * state_vals[2] + k_vals[2] * residual;
+        new_st4.w = g * state_vals[3] + k_vals[3] * residual;
+
+        float* new_state_row = new_state_base + vi * HEAD_DIM + lane * 4;
+        *reinterpret_cast<float4*>(new_state_row) = new_st4;
+
+        // Lane 0 writes output
+        if (lane == 0) {
+            float out_val = scale * (g * qs_sum + qk_dot * residual);
+            out_base[vi] = __float2bfloat16(out_val);
         }
-        __syncthreads();
-    }
-
-    // Steps 2-4: update state and compute output
-    for (int vi = 0; vi < HEAD_DIM; vi++) {
-        float residual = beta * (s_v[vi] - s_kdot[vi]);
-        float state_val = state_base[vi * HEAD_DIM + tid];
-        float new_s = g * state_val + k_val * residual;
-
-        new_state_base[vi * HEAD_DIM + tid] = new_s;
-
-        float partial = q_val * new_s;
-        for (int offset = 16; offset > 0; offset >>= 1)
-            partial += __shfl_down_sync(0xffffffff, partial, offset);
-
-        if (tid % 32 == 0)
-            s_reduce[tid / 32] = partial;
-        __syncthreads();
-
-        if (tid == 0) {
-            float sum = s_reduce[0] + s_reduce[1] + s_reduce[2] + s_reduce[3];
-            output[batch * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi] =
-                __float2bfloat16(scale * sum);
-        }
-        __syncthreads();
     }
 }
 

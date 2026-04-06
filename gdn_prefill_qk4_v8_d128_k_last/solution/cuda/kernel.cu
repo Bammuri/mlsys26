@@ -15,8 +15,9 @@
  *
  * Optimizations:
  *   - Register-tiled state: 128x128 state in registers (each thread holds 128 floats)
- *   - Fused inner loop: kdot + state update + output in one pass
- *   - Batched VB=4 vi values per syncthreads pair (2 syncs per batch instead of 2 per vi)
+ *   - Two-phase inner loop: Phase 1 does all state updates, Phase 2 computes all outputs
+ *   - Batched VB=8 vi values per syncthreads (1 sync per batch per phase)
+ *   - Deferred output reduction: 34 syncs/timestep (1 v-load + 16 phase1 + 1 barrier + 16 phase2)
  */
 
 #include <cuda_runtime.h>
@@ -33,7 +34,7 @@ constexpr int NUM_K_HEADS = 4;
 constexpr int NUM_V_HEADS = 8;
 constexpr int HEAD_DIM = 128;
 constexpr int V_PER_Q = NUM_V_HEADS / NUM_Q_HEADS;  // 2
-constexpr int VB = 4;  // vi batch size
+constexpr int VB = 8;  // vi batch size
 constexpr int NUM_WARPS = HEAD_DIM / 32;  // 4
 
 __device__ __forceinline__ float softplus(float x) {
@@ -89,7 +90,7 @@ __global__ void gdn_prefill_kernel(
 
     // Shared memory layout (tiny):
     // s_v[128] — v values for current timestep (512 bytes)
-    // s_reduce[NUM_WARPS * VB] = [16] — cross-warp reduction buffer (64 bytes)
+    // s_reduce[NUM_WARPS * VB] = [32] — cross-warp reduction buffer (128 bytes)
     extern __shared__ float smem[];
     float* s_v = smem;
     float* s_reduce = smem + HEAD_DIM;
@@ -110,13 +111,12 @@ __global__ void gdn_prefill_kernel(
         s_v[tid] = v_val;
         __syncthreads();
 
-        // Fused loop: process VB vi values per batch
+        // Phase 1: State update only — loop over vi in batches of VB=8
         for (int vi_base = 0; vi_base < HEAD_DIM; vi_base += VB) {
             float temp[VB];
             float partial_k[VB];
-            float partial_q[VB];
 
-            // Phase A: compute VB kdot values via warp reduction
+            // Compute temp and partial kdot products
             #pragma unroll
             for (int vb = 0; vb < VB; vb++) {
                 temp[vb] = g * reg_state[vi_base + vb];
@@ -132,7 +132,7 @@ __global__ void gdn_prefill_kernel(
                 if (lane_id == 0)
                     s_reduce[warp_id * VB + vb] = partial_k[vb];
             }
-            __syncthreads();  // One sync for all VB kdot reductions
+            __syncthreads();  // One sync for VB kdot reductions
 
             // All threads read VB kdot sums and update state
             #pragma unroll
@@ -142,18 +142,30 @@ __global__ void gdn_prefill_kernel(
                 float residual = beta * (s_v[vi_base + vb] - kdot);
                 reg_state[vi_base + vb] = temp[vb] + k_val * residual;
             }
+        }
 
-            // Phase B: compute VB output values via warp reduction
+        __syncthreads();  // Barrier between phases: ensure all Phase 1 s_reduce reads complete
+
+        // Phase 2: Output only — loop over vi in batches of VB=8
+        for (int vi_base = 0; vi_base < HEAD_DIM; vi_base += VB) {
+            float partial_q[VB];
+
+            // Compute partial qdot products
             #pragma unroll
             for (int vb = 0; vb < VB; vb++) {
                 partial_q[vb] = q_val * reg_state[vi_base + vb];
+            }
+
+            // Warp-level reduction for all VB partial_q values
+            #pragma unroll
+            for (int vb = 0; vb < VB; vb++) {
                 #pragma unroll
                 for (int offset = 16; offset > 0; offset >>= 1)
                     partial_q[vb] += __shfl_down_sync(0xffffffff, partial_q[vb], offset);
                 if (lane_id == 0)
                     s_reduce[warp_id * VB + vb] = partial_q[vb];
             }
-            __syncthreads();  // One sync for all VB output reductions
+            __syncthreads();  // One sync for VB output reductions
 
             // Thread 0 writes VB output values
             if (tid == 0) {
@@ -199,7 +211,7 @@ void gdn_prefill(
     dim3 grid(num_seqs * NUM_V_HEADS);
     dim3 block(HEAD_DIM);
 
-    // Dynamic shared memory: s_v[128] + s_reduce[NUM_WARPS * VB = 16]
+    // Dynamic shared memory: s_v[128] + s_reduce[NUM_WARPS * VB = 32]
     const int smem_bytes = (HEAD_DIM + NUM_WARPS * VB) * sizeof(float);
     cudaFuncSetAttribute(gdn_prefill_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
