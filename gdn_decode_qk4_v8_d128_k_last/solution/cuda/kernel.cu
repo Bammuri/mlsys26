@@ -8,19 +8,21 @@
  * Simplified formula (per head):
  *   g = exp(-exp(A_log) * softplus(a + dt_bias))
  *   beta = sigmoid(b)
- *   temp = g * state                     (elementwise, state in [K,V] internally)
- *   residual = beta * (v - k @ temp)     (GEMV + elementwise)
- *   state_new = temp + k^T @ residual    (rank-1 update)
- *   output = scale * (q @ state_new)     (GEMV)
+ *   temp = g * state
+ *   residual = beta * (v - k @ temp)
+ *   state_new = temp + k^T @ residual
+ *   output = scale * (q @ state_new)
  */
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <math.h>
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/function.h>
+#include <tvm/ffi/extra/c_env_api.h>
 
 using bf16 = __nv_bfloat16;
 
-// Constants
 constexpr int NUM_Q_HEADS = 4;
 constexpr int NUM_K_HEADS = 4;
 constexpr int NUM_V_HEADS = 8;
@@ -35,10 +37,6 @@ __device__ __forceinline__ float softplus(float x) {
  * One block per (batch, v_head) pair.
  * Grid: (B * NUM_V_HEADS,)
  * Block: (128,) — one thread per K dimension
- *
- * Each thread owns one row of state[k, :] (V=128 values).
- * But 128 threads * 128 floats = 64KB registers — too much.
- * Instead: iterate over V in tiles, using shared memory for state.
  */
 __global__ void gdn_decode_kernel(
     const bf16* __restrict__ q,         // [B, 1, 4, 128]
@@ -51,13 +49,14 @@ __global__ void gdn_decode_kernel(
     const bf16* __restrict__ b_gate,    // [B, 1, 8]
     const float scale,
     bf16* __restrict__ output,          // [B, 1, 8, 128]
-    float* __restrict__ new_state       // [B, 8, 128, 128]
+    float* __restrict__ new_state,      // [B, 8, 128, 128]
+    int batch_size
 ) {
     const int idx = blockIdx.x;
     const int batch = idx / NUM_V_HEADS;
     const int vh = idx % NUM_V_HEADS;
-    const int qkh = vh / V_PER_Q;  // which q/k head this v_head maps to
-    const int tid = threadIdx.x;    // thread id = k index
+    const int qkh = vh / V_PER_Q;
+    const int tid = threadIdx.x;    // k index
 
     // Compute gates
     float a_val = __bfloat162float(a[batch * NUM_V_HEADS + vh]);
@@ -66,7 +65,7 @@ __global__ void gdn_decode_kernel(
     float g = expf(-expf(A_val) * softplus(a_val + dt_val));
     float beta = 1.0f / (1.0f + expf(-__bfloat162float(b_gate[batch * NUM_V_HEADS + vh])));
 
-    // Load k and q vectors for this head (128 elements, one per thread)
+    // Load k and q vectors
     float k_val = __bfloat162float(k[batch * NUM_K_HEADS * HEAD_DIM + qkh * HEAD_DIM + tid]);
     float q_val = __bfloat162float(q[batch * NUM_Q_HEADS * HEAD_DIM + qkh * HEAD_DIM + tid]);
 
@@ -76,72 +75,41 @@ __global__ void gdn_decode_kernel(
     s_v[tid] = v_val;
     __syncthreads();
 
-    // State base pointer for this (batch, v_head): [V, K] layout
-    // state[batch][vh][vi][ki] = state[(batch * 8 + vh) * 128 * 128 + vi * 128 + ki]
+    // State base pointers
     const float* state_base = state + (batch * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
     float* new_state_base = new_state + (batch * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
 
-    // Step 1: Compute k @ temp (GEMV over K dimension)
-    // temp[vi][ki] = g * state[vi][ki]
-    // k @ temp = sum_ki(k[ki] * temp[vi][ki]) for each vi
-    // Each thread handles one ki, so we need reduction across threads for each vi
+    __shared__ float s_reduce[4];  // 128/32 = 4 warps
+    __shared__ float s_kdot[HEAD_DIM];
 
-    // We iterate over V dimension. For each vi:
-    //   partial = k_val * g * state[vi][tid]
-    //   reduce across threads -> dot product for vi
-
-    // Use shared memory for reduction
-    __shared__ float s_reduce[HEAD_DIM];  // for warp reduction results
-    __shared__ float s_kdot[HEAD_DIM];    // k @ temp results (one per vi)
-
-    // Compute k @ temp for each vi (128 iterations, each needs 128-wide reduction)
+    // Step 1: k @ temp for each vi
     for (int vi = 0; vi < HEAD_DIM; vi++) {
-        float state_val = state_base[vi * HEAD_DIM + tid];  // state[vi][tid=ki]
+        float state_val = state_base[vi * HEAD_DIM + tid];
         float temp_val = g * state_val;
         float partial = k_val * temp_val;
 
-        // Warp reduction
         for (int offset = 16; offset > 0; offset >>= 1)
             partial += __shfl_down_sync(0xffffffff, partial, offset);
 
-        // Write warp results to shared memory
         if (tid % 32 == 0)
             s_reduce[tid / 32] = partial;
         __syncthreads();
 
-        // Thread 0 sums across warps (4 warps)
         if (tid == 0) {
-            float sum = 0.0f;
-            for (int w = 0; w < HEAD_DIM / 32; w++)
-                sum += s_reduce[w];
-            s_kdot[vi] = sum;  // k @ temp[vi]
+            s_kdot[vi] = s_reduce[0] + s_reduce[1] + s_reduce[2] + s_reduce[3];
         }
         __syncthreads();
     }
 
-    // Step 2: residual[vi] = beta * (v[vi] - kdot[vi])
-    // Step 3: state_new[vi][ki] = g * state[vi][ki] + k[ki] * residual[vi]
-    // Step 4: output[vi] = scale * sum_ki(q[ki] * state_new[vi][ki])
-
-    // Process each vi: compute new state and output simultaneously
-    __shared__ float s_output_partial[HEAD_DIM];  // partial output per vi (need reduction later)
-
-    float output_accum = 0.0f;  // each thread accumulates q_val * state_new contribution
-
+    // Steps 2-4: update state and compute output
     for (int vi = 0; vi < HEAD_DIM; vi++) {
         float residual = beta * (s_v[vi] - s_kdot[vi]);
         float state_val = state_base[vi * HEAD_DIM + tid];
         float new_s = g * state_val + k_val * residual;
 
-        // Write new state
         new_state_base[vi * HEAD_DIM + tid] = new_s;
 
-        // Accumulate output: q @ state_new
-        // output[vi] = scale * sum_ki(q[ki] * state_new[vi][ki])
-        // Each thread has q[tid] * state_new[vi][tid]
         float partial = q_val * new_s;
-
-        // Warp reduction
         for (int offset = 16; offset > 0; offset >>= 1)
             partial += __shfl_down_sync(0xffffffff, partial, offset);
 
@@ -150,10 +118,7 @@ __global__ void gdn_decode_kernel(
         __syncthreads();
 
         if (tid == 0) {
-            float sum = 0.0f;
-            for (int w = 0; w < HEAD_DIM / 32; w++)
-                sum += s_reduce[w];
-            // Write output for this vi
+            float sum = s_reduce[0] + s_reduce[1] + s_reduce[2] + s_reduce[3];
             output[batch * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi] =
                 __float2bfloat16(scale * sum);
         }
@@ -161,16 +126,43 @@ __global__ void gdn_decode_kernel(
     }
 }
 
-extern "C" void launch_gdn_decode(
-    const bf16* q, const bf16* k, const bf16* v,
-    const float* state, const float* A_log, const bf16* a,
-    const float* dt_bias, const bf16* b_gate, float scale,
-    bf16* output, float* new_state, int batch_size
+// TVM FFI entry point (DPS style)
+void gdn_decode(
+    tvm::ffi::TensorView q,         // [B, 1, 4, 128] bf16
+    tvm::ffi::TensorView k,         // [B, 1, 4, 128] bf16
+    tvm::ffi::TensorView v,         // [B, 1, 8, 128] bf16
+    tvm::ffi::TensorView state,     // [B, 8, 128, 128] f32
+    tvm::ffi::TensorView A_log,     // [8] f32
+    tvm::ffi::TensorView a,         // [B, 1, 8] bf16
+    tvm::ffi::TensorView dt_bias,   // [8] f32
+    tvm::ffi::TensorView b_gate,    // [B, 1, 8] bf16
+    double scale,
+    tvm::ffi::TensorView output,    // [B, 1, 8, 128] bf16
+    tvm::ffi::TensorView new_state  // [B, 8, 128, 128] f32
 ) {
+    int batch_size = q.size(0);
+
+    DLDevice dev = q.device();
+    cudaStream_t stream = static_cast<cudaStream_t>(
+        TVMFFIEnvGetStream(dev.device_type, dev.device_id));
+
     dim3 grid(batch_size * NUM_V_HEADS);
-    dim3 block(HEAD_DIM);  // 128 threads
-    gdn_decode_kernel<<<grid, block>>>(
-        q, k, v, state, A_log, a, dt_bias, b_gate, scale,
-        output, new_state
+    dim3 block(HEAD_DIM);
+
+    gdn_decode_kernel<<<grid, block, 0, stream>>>(
+        static_cast<const bf16*>(q.data_ptr()),
+        static_cast<const bf16*>(k.data_ptr()),
+        static_cast<const bf16*>(v.data_ptr()),
+        static_cast<const float*>(state.data_ptr()),
+        static_cast<const float*>(A_log.data_ptr()),
+        static_cast<const bf16*>(a.data_ptr()),
+        static_cast<const float*>(dt_bias.data_ptr()),
+        static_cast<const bf16*>(b_gate.data_ptr()),
+        static_cast<float>(scale),
+        static_cast<bf16*>(output.data_ptr()),
+        static_cast<float*>(new_state.data_ptr()),
+        batch_size
     );
 }
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(kernel, gdn_decode);
