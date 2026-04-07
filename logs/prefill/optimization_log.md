@@ -45,3 +45,11 @@ Tracking all optimization iterations for the prefill kernel.
 - **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. rtol slightly increased but all workloads pass.
 - **Status**: accepted
 - **Learnings**: Cross-warp synchronization was the dominant bottleneck. The old kernel had 5-19 `__syncthreads` per timestep; the new kernel has zero. float4 state loads also improved memory coalescing. The algebraic fusion failed as a standalone change (+41% latency due to doubled smem traffic) but succeeds here because warp-parallel eliminates smem entirely. The 2.34x mean speedup improvement is the largest single-iteration gain. This approach mirrors the decode kernel's proven inner loop structure.
+
+## 2026-04-07 - 4-Row Vi Unrolling + __launch_bounds__ Occupancy Tuning
+- **Idea**: Process 4 vi rows per loop iteration instead of 2, interleaving 8 warp reductions for better ILP. For SPLIT_FACTOR=8 (RPW=4), the vi loop becomes a single fully-unrolled iteration. Added `__launch_bounds__(128, MIN_BLOCKS)` with per-SPLIT_FACTOR min blocks (8/6/4/2) to guide compiler register allocation and occupancy.
+- **Result**: 252.98x → 254.16x mean speedup (+0.5%), latency 2.114ms → 1.375ms (-35%)
+- **Min/Max speedup**: 85.03x/626.56x → 87.96x/603.22x
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: accepted
+- **Learnings**: Mean speedup was essentially flat (+0.5%, within noise), but mean latency dropped 35%. The divergence suggests `__launch_bounds__` improved occupancy/scheduling on shorter workloads where launch overhead matters more. The 4-row unrolling benefit is modest because the compiler was already unrolling the `#pragma unroll` loop effectively. For SPLIT=8, the loop was already just 2 iterations; now it's 1. Diminishing returns on ILP improvements — the kernel is approaching the compute-bound limit for the sequential recurrence.
