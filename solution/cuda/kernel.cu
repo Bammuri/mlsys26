@@ -16,6 +16,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <mutex>
 #include <tuple>
 
 namespace {
@@ -150,6 +151,17 @@ __global__ void gdn_decode_kernel(
     }
 
     float_to_bf16(output, out_base, scale * out_acc);
+}
+
+inline void configure_decode_kernel_launch() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        const auto err = cudaFuncSetCacheConfig(gdn_decode_kernel, cudaFuncCachePreferL1);
+        TORCH_CHECK(
+            err == cudaSuccess,
+            "gdn_decode cache config setup failed: ",
+            cudaGetErrorString(err));
+    });
 }
 
 __global__ void gdn_prefill_kernel(
@@ -297,6 +309,8 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_decode(
     auto new_state = torch::empty(
         {batch_size, kNumVHeads, kHeadSize, kHeadSize},
         torch::TensorOptions().device(q_c.device()).dtype(torch::kFloat32));
+
+    configure_decode_kernel_launch();
 
     const dim3 grid(batch_size * kNumVHeads);
     const dim3 block(kThreads);
