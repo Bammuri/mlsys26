@@ -47,3 +47,21 @@ Tracking all optimization iterations for the decode kernel.
 - **Result**: 1340.12x → 1579.97x mean speedup (**+17.9%**), min 87.54x → 84.71x (-3.2%), max 3155.02x → 3982.39x (+26.2%), latency 0.018ms → 0.0174ms
 - **Status**: accepted
 - **Learnings**: Doubling pipeline depth from 2 to 4 rows gave a surprisingly large gain (+17.9%), especially for large batches (max +26.2%). The 8 interleaved independent shuffle reductions provide excellent ILP, keeping the warp scheduler busy while waiting on memory. Small-batch (B=1) min speedup slightly regressed (-3.2%) due to overhead of 4-stage pipeline with fewer iterations. Register pressure remains low (~50 regs/thread). Remaining opportunities: L2 persistent access policy for cross-invocation caching, __launch_bounds__(128,2) for occupancy hints, or warp specialization.
+
+## 2026-04-07 - L2 Persistence (cudaAccessPolicyWindow) [REVERTED]
+- **Idea**: Pin state tensor in L2 via `cudaAccessPolicyWindow` with `cudaAccessPropertyPersisting`. Set 96MB L2 persisting cache size. Host-side only change, no kernel modifications.
+- **Result**: 1579.97x → 1492.00x mean speedup (**-5.6%**), 54/54 → 53/54 workloads (1 RUNTIME_ERROR)
+- **Status**: reverted
+- **Learnings**: `cudaStreamSetAttribute` caused a runtime error on one workload and overall regression. The TVM FFI stream management may not be compatible with stream attribute modifications, or the attribute setting itself added per-launch overhead. The passive `.wb` writeback caching from optimization #5 already provides sufficient L2 residency without explicit pinning.
+
+## 2026-04-07 - Split Factor Tuning for Medium Batches [REVERTED]
+- **Idea**: Extend split_factor coverage: split=4 for B≤8 (was B≤4), split=2 for B≤32 (was B≤16). Targets B=8 (128→256 blocks) and B=17-32 (256→512 blocks) for better SM utilization.
+- **Result**: 1579.97x → 1511.06x mean speedup (**-4.4%**), max 3982x → 3582x (-10.1%)
+- **Status**: reverted
+- **Learnings**: Wider splitting hurt large-batch workloads more than it helped medium ones. More blocks means more per-block overhead (gate computation, v load, barrier) and less work per warp (fewer loop iterations = less amortization of pipeline setup). The original thresholds (B≤4 split=4, B≤16 split=2) are already well-tuned.
+
+## 2026-04-07 - Register V Broadcast (eliminate shared memory) [REVERTED]
+- **Idea**: Replace shared memory v load + `__syncthreads` with per-warp register loads + `__shfl_sync` broadcast. Each lane holds one v value, broadcast to all lanes via shuffle when needed. Eliminates all shared memory and barriers.
+- **Result**: 1579.97x → 1430.33x mean speedup (**-9.5%**), min 84.71x → 75.49x, max 3982x → 3610x
+- **Status**: reverted
+- **Learnings**: Shared memory v access is faster than shuffle broadcasts despite the `__syncthreads` cost. Shared memory provides uniform ~28-cycle latency for random access, while shuffle requires an instruction per broadcast. With 4 shuffles per iteration (v_a..v_d) vs one shared memory index per residual, the shuffle overhead exceeded the barrier savings. The kernel is deeply memory-bound on state traffic — v access optimization is not on the critical path.
