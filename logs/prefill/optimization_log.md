@@ -29,3 +29,11 @@ Tracking all optimization iterations for the prefill kernel.
 - **Correctness**: max_atol=1.22e-04, max_rtol=0.295, matched_ratio=1.0. rtol headroom unchanged (1.7%).
 - **Status**: accepted
 - **Learnings**: VB=16 register pressure is safe (~168 registers). Improvement was more modest than VB=4→8 jump (+6.8% vs +17.6%), suggesting diminishing returns from sync reduction alone. VB=32 could be tried but carries spill risk (~200 registers). Distributed writes had negligible measured impact (output writes are not on critical path). Cross-warp sync is fundamentally unavoidable with 128 threads; further gains likely need algorithmic changes (chunked parallelism) rather than micro-optimizations.
+
+## 2026-04-07 - V-Split Blocks for SM Utilization
+- **Idea**: Split the vi dimension across multiple blocks using a template SPLIT_FACTOR (1/2/4/8). Each block handles ROWS_PER_BLOCK=128/SPLIT_FACTOR vi rows. Adaptive thresholds: split=8 for num_seqs≤2, split=4 for ≤6, split=2 for ≤16, split=1 otherwise. Each vi row is independent (no inter-block communication needed). Also reduces syncs/timestep proportionally (18→5 for split=8).
+- **Result**: 26.44x → 108.12x mean speedup (+309%), latency 8.26ms → 5.21ms (-37%)
+- **Min/Max speedup**: 15.60x/99.17x → 32.67x/219.90x
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.295, matched_ratio=1.0. rtol unchanged (1.7% headroom).
+- **Status**: accepted
+- **Learnings**: SM utilization was the dominant bottleneck for low-N workloads. With N=1 (8 blocks → 64 blocks via split=8), speedup improved dramatically. Register pressure drops from 168 to ~40 registers with split=8, enabling higher occupancy. The reduced syncs/timestep (18→5 for split=8) provided additional benefit. Min speedup doubled (15.6→32.7x), suggesting even the hardest workloads benefited. The 4.09x mean speedup jump dwarfs all prior micro-optimizations combined.

@@ -18,6 +18,7 @@
  *   - Two-phase inner loop: Phase 1 does all state updates, Phase 2 computes all outputs
  *   - Batched VB=16 vi values per syncthreads (1 sync per batch per phase)
  *   - Deferred output reduction: 18 syncs/timestep (1 v-load + 8 phase1 + 1 barrier + 8 phase2)
+ *   - V-split: SPLIT_FACTOR splits vi dimension across blocks for better SM utilization
  */
 
 #include <cuda_runtime.h>
@@ -42,13 +43,15 @@ __device__ __forceinline__ float softplus(float x) {
 }
 
 /*
- * One block per (seq_idx, v_head) pair.
- * Grid: (num_seqs * NUM_V_HEADS,)
+ * One block per (seq_idx, v_head, split_id) triple.
+ * Grid: (num_seqs * NUM_V_HEADS * SPLIT_FACTOR,)
  * Block: (128,) — one thread per K dimension
  *
- * State is register-tiled: each thread holds reg_state[128] where
- * reg_state[vi] = state[vi][tid]. No shared memory needed for state.
+ * SPLIT_FACTOR splits the vi dimension: each block handles ROWS_PER_BLOCK = 128/SPLIT_FACTOR rows.
+ * State is register-tiled: each thread holds reg_state[ROWS_PER_BLOCK] where
+ * reg_state[vi] = state[vi_start + vi][tid]. No shared memory needed for state.
  */
+template <int SPLIT_FACTOR>
 __global__ void gdn_prefill_kernel(
     const bf16* __restrict__ q,         // [T, 4, 128]
     const bf16* __restrict__ k,         // [T, 4, 128]
@@ -64,9 +67,15 @@ __global__ void gdn_prefill_kernel(
     float* __restrict__ new_state,      // [N, 8, 128, 128]
     int num_seqs
 ) {
+    constexpr int ROWS_PER_BLOCK = HEAD_DIM / SPLIT_FACTOR;
+    constexpr int HEADS_X_SPLIT = NUM_V_HEADS * SPLIT_FACTOR;
+
     const int idx = blockIdx.x;
-    const int seq = idx / NUM_V_HEADS;
-    const int vh = idx % NUM_V_HEADS;
+    const int seq = idx / HEADS_X_SPLIT;
+    const int remainder = idx % HEADS_X_SPLIT;
+    const int vh = remainder / SPLIT_FACTOR;
+    const int split_id = remainder % SPLIT_FACTOR;
+    const int vi_start = split_id * ROWS_PER_BLOCK;
     const int qkh = vh / V_PER_Q;
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
@@ -82,15 +91,15 @@ __global__ void gdn_prefill_kernel(
     const float* state_base = state + (seq * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
     float* new_state_base = new_state + (seq * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
 
-    // Register-tiled state: each thread holds one column (k-index = tid)
-    float reg_state[HEAD_DIM];
-    for (int vi = 0; vi < HEAD_DIM; vi++) {
-        reg_state[vi] = state_base[vi * HEAD_DIM + tid];
+    // Register-tiled state: each thread holds one column (k-index = tid), ROWS_PER_BLOCK rows
+    float reg_state[ROWS_PER_BLOCK];
+    for (int vi = 0; vi < ROWS_PER_BLOCK; vi++) {
+        reg_state[vi] = state_base[(vi_start + vi) * HEAD_DIM + tid];
     }
 
     // Shared memory layout (tiny):
     // s_v[128] — v values for current timestep (512 bytes)
-    // s_reduce[NUM_WARPS * VB] = [32] — cross-warp reduction buffer (128 bytes)
+    // s_reduce[NUM_WARPS * VB] = [64] — cross-warp reduction buffer (256 bytes)
     extern __shared__ float smem[];
     float* s_v = smem;
     float* s_reduce = smem + HEAD_DIM;
@@ -111,8 +120,8 @@ __global__ void gdn_prefill_kernel(
         s_v[tid] = v_val;
         __syncthreads();
 
-        // Phase 1: State update only — loop over vi in batches of VB=8
-        for (int vi_base = 0; vi_base < HEAD_DIM; vi_base += VB) {
+        // Phase 1: State update only — loop over vi in batches of VB
+        for (int vi_base = 0; vi_base < ROWS_PER_BLOCK; vi_base += VB) {
             float temp[VB];
             float partial_k[VB];
 
@@ -139,15 +148,15 @@ __global__ void gdn_prefill_kernel(
             for (int vb = 0; vb < VB; vb++) {
                 float kdot = s_reduce[0 * VB + vb] + s_reduce[1 * VB + vb]
                            + s_reduce[2 * VB + vb] + s_reduce[3 * VB + vb];
-                float residual = beta * (s_v[vi_base + vb] - kdot);
+                float residual = beta * (s_v[vi_start + vi_base + vb] - kdot);
                 reg_state[vi_base + vb] = temp[vb] + k_val * residual;
             }
         }
 
         __syncthreads();  // Barrier between phases: ensure all Phase 1 s_reduce reads complete
 
-        // Phase 2: Output only — loop over vi in batches of VB=8
-        for (int vi_base = 0; vi_base < HEAD_DIM; vi_base += VB) {
+        // Phase 2: Output only — loop over vi in batches of VB
+        for (int vi_base = 0; vi_base < ROWS_PER_BLOCK; vi_base += VB) {
             float partial_q[VB];
 
             // Compute partial qdot products
@@ -171,16 +180,16 @@ __global__ void gdn_prefill_kernel(
             if (tid < VB) {
                 float sum = s_reduce[0 * VB + tid] + s_reduce[1 * VB + tid]
                           + s_reduce[2 * VB + tid] + s_reduce[3 * VB + tid];
-                output[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi_base + tid] =
+                output[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi_start + vi_base + tid] =
                     __float2bfloat16(scale * sum);
             }
         }
         __syncthreads();  // Ensure s_v/s_reduce safe before next timestep
     }
 
-    // Write final state back
-    for (int vi = 0; vi < HEAD_DIM; vi++) {
-        new_state_base[vi * HEAD_DIM + tid] = reg_state[vi];
+    // Write final state back — only ROWS_PER_BLOCK rows
+    for (int vi = 0; vi < ROWS_PER_BLOCK; vi++) {
+        new_state_base[(vi_start + vi) * HEAD_DIM + tid] = reg_state[vi];
     }
 }
 
@@ -205,29 +214,48 @@ void gdn_prefill(
     cudaStream_t stream = static_cast<cudaStream_t>(
         TVMFFIEnvGetStream(dev.device_type, dev.device_id));
 
-    dim3 grid(num_seqs * NUM_V_HEADS);
+    // Choose split factor based on batch size for SM utilization
+    int split_factor;
+    if (num_seqs <= 2)       split_factor = 8;
+    else if (num_seqs <= 6)  split_factor = 4;
+    else if (num_seqs <= 16) split_factor = 2;
+    else                     split_factor = 1;
+
+    dim3 grid(num_seqs * NUM_V_HEADS * split_factor);
     dim3 block(HEAD_DIM);
 
-    // Dynamic shared memory: s_v[128] + s_reduce[NUM_WARPS * VB = 32]
+    // Dynamic shared memory: s_v[128] + s_reduce[NUM_WARPS * VB]
     const int smem_bytes = (HEAD_DIM + NUM_WARPS * VB) * sizeof(float);
-    cudaFuncSetAttribute(gdn_prefill_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
 
-    gdn_prefill_kernel<<<grid, block, smem_bytes, stream>>>(
-        static_cast<const bf16*>(q.data_ptr()),
-        static_cast<const bf16*>(k.data_ptr()),
-        static_cast<const bf16*>(v.data_ptr()),
-        static_cast<const float*>(state.data_ptr()),
-        static_cast<const float*>(A_log.data_ptr()),
-        static_cast<const bf16*>(a.data_ptr()),
-        static_cast<const float*>(dt_bias.data_ptr()),
-        static_cast<const bf16*>(b_gate.data_ptr()),
-        static_cast<const int64_t*>(cu_seqlens.data_ptr()),
-        static_cast<float>(scale),
-        static_cast<bf16*>(output.data_ptr()),
-        static_cast<float*>(new_state.data_ptr()),
-        num_seqs
-    );
+    const bf16* q_ptr = static_cast<const bf16*>(q.data_ptr());
+    const bf16* k_ptr = static_cast<const bf16*>(k.data_ptr());
+    const bf16* v_ptr = static_cast<const bf16*>(v.data_ptr());
+    const float* state_ptr = static_cast<const float*>(state.data_ptr());
+    const float* A_log_ptr = static_cast<const float*>(A_log.data_ptr());
+    const bf16* a_ptr = static_cast<const bf16*>(a.data_ptr());
+    const float* dt_bias_ptr = static_cast<const float*>(dt_bias.data_ptr());
+    const bf16* b_gate_ptr = static_cast<const bf16*>(b_gate.data_ptr());
+    const int64_t* cu_seqlens_ptr = static_cast<const int64_t*>(cu_seqlens.data_ptr());
+    float scale_f = static_cast<float>(scale);
+    bf16* output_ptr = static_cast<bf16*>(output.data_ptr());
+    float* new_state_ptr = static_cast<float*>(new_state.data_ptr());
+
+    auto launch = [&](auto kernel_fn) {
+        cudaFuncSetAttribute(kernel_fn,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        kernel_fn<<<grid, block, smem_bytes, stream>>>(
+            q_ptr, k_ptr, v_ptr, state_ptr, A_log_ptr, a_ptr,
+            dt_bias_ptr, b_gate_ptr, cu_seqlens_ptr, scale_f,
+            output_ptr, new_state_ptr, num_seqs
+        );
+    };
+
+    switch (split_factor) {
+        case 8:  launch(gdn_prefill_kernel<8>); break;
+        case 4:  launch(gdn_prefill_kernel<4>); break;
+        case 2:  launch(gdn_prefill_kernel<2>); break;
+        default: launch(gdn_prefill_kernel<1>); break;
+    }
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(kernel, gdn_prefill);
