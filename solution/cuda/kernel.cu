@@ -7,7 +7,6 @@
 
 #include <cmath>
 #include <cstdint>
-#include <tuple>
 
 namespace {
 
@@ -138,14 +137,9 @@ __global__ __launch_bounds__(128, 2) void gdn_prefill_kernel(
 
     if (v_idx == 0) {
       int64_t gate_idx = t * kNumVHeads + head_idx;
-<<<<<<< HEAD
-      gate_sh = gate[gate_idx];
-      beta_sh = beta[gate_idx];
-=======
       float2 gate_beta_vec = gate_beta[gate_idx];
-      gate_val = gate_beta_vec.x;
-      beta_val = gate_beta_vec.y;
->>>>>>> 2b96f1e (Reduce scalar side-data traffic without destabilizing SRTP)
+      gate_sh = gate_beta_vec.x;
+      beta_sh = gate_beta_vec.y;
     }
     __syncthreads();
 
@@ -190,7 +184,7 @@ __global__ __launch_bounds__(128, 2) void gdn_prefill_kernel(
 
 }  // namespace
 
-std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
+void gdn_prefill_cuda(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
@@ -200,7 +194,9 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
     torch::Tensor dt_bias,
     torch::Tensor b,
     torch::Tensor cu_seqlens,
-    double scale) {
+    double scale,
+    torch::Tensor output,
+    torch::Tensor new_state) {
   CHECK_CUDA(q);
   CHECK_CUDA(k);
   CHECK_CUDA(v);
@@ -209,6 +205,8 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
   CHECK_CUDA(dt_bias);
   CHECK_CUDA(b);
   CHECK_CUDA(cu_seqlens);
+  CHECK_CUDA(output);
+  CHECK_CUDA(new_state);
 
   CHECK_CONTIGUOUS(q);
   CHECK_CONTIGUOUS(k);
@@ -218,14 +216,18 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
   CHECK_CONTIGUOUS(dt_bias);
   CHECK_CONTIGUOUS(b);
   CHECK_CONTIGUOUS(cu_seqlens);
+  CHECK_CONTIGUOUS(output);
+  CHECK_CONTIGUOUS(new_state);
 
   CHECK_BF16(q);
   CHECK_BF16(k);
   CHECK_BF16(v);
   CHECK_BF16(a);
   CHECK_BF16(b);
+  CHECK_BF16(output);
   CHECK_F32(A_log);
   CHECK_F32(dt_bias);
+  CHECK_F32(new_state);
   CHECK_I64(cu_seqlens);
 
   TORCH_CHECK(q.dim() == 3, "q must have shape [total_seq_len, 4, 128]");
@@ -247,36 +249,35 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
     scale = 1.0 / std::sqrt(static_cast<double>(kHeadSize));
   }
 
-  q = q.contiguous();
-  k = k.contiguous();
-  v = v.contiguous();
-  A_log = A_log.contiguous();
-  a = a.contiguous();
-  dt_bias = dt_bias.contiguous();
-  b = b.contiguous();
-  cu_seqlens = cu_seqlens.contiguous();
-
   bool has_state = state.has_value() && state.value().defined();
   torch::Tensor state_in;
   if (has_state) {
-    state_in = state.value().contiguous();
+    state_in = state.value();
     CHECK_CUDA(state_in);
     CHECK_CONTIGUOUS(state_in);
     CHECK_F32(state_in);
   }
 
   int64_t num_seqs = cu_seqlens.numel() - 1;
-  auto output = torch::empty({q.size(0), kNumVHeads, kHeadSize}, q.options());
-  auto new_state = torch::empty(
-      {num_seqs, kNumVHeads, kHeadSize, kHeadSize},
-      torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
   auto gate_beta = torch::empty(
       {q.size(0), kNumVHeads, 2},
       torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
 
   if (has_state) {
-    TORCH_CHECK(state_in.sizes() == new_state.sizes(), "state must have shape [num_seqs, 8, 128, 128]");
+    TORCH_CHECK(
+        state_in.sizes() == new_state.sizes(),
+        "state must have shape [num_seqs, 8, 128, 128]");
   }
+  TORCH_CHECK(
+      output.dim() == 3 && output.size(0) == q.size(0) && output.size(1) == kNumVHeads &&
+          output.size(2) == kHeadSize,
+      "output must have shape [total_seq_len, 8, 128]");
+  TORCH_CHECK(
+      new_state.dim() == 4 && new_state.size(0) == num_seqs && new_state.size(1) == kNumVHeads &&
+          new_state.size(2) == kHeadSize && new_state.size(3) == kHeadSize,
+      "new_state must have shape [num_seqs, 8, 128, 128]");
+  TORCH_CHECK(output.device() == q.device(), "output must be on the same device as q");
+  TORCH_CHECK(new_state.device() == q.device(), "new_state must be on the same device as q");
 
   dim3 grid(kNumVHeads, static_cast<unsigned int>(num_seqs), 1);
   dim3 block(kThreads, 1, 1);
@@ -314,5 +315,4 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
       has_state);
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return std::make_tuple(output, new_state);
 }

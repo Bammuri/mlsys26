@@ -111,6 +111,8 @@ def run(
     b: torch.Tensor,
     cu_seqlens: torch.Tensor,
     scale: float | torch.Tensor | None,
+    output: torch.Tensor,
+    new_state: torch.Tensor,
 ):
     """Contest entrypoint for GDN prefill."""
     scale_val = _normalize_scale(scale, q.shape[-1])
@@ -119,13 +121,17 @@ def run(
     v = v.contiguous()
     state = None if state is None else state.contiguous()
     cu_seqlens = cu_seqlens.to(torch.int64).contiguous()
+    if not output.is_contiguous():
+        raise ValueError("output must be contiguous")
+    if not new_state.is_contiguous():
+        raise ValueError("new_state must be contiguous")
 
     if chunk_gated_delta_rule is not None:
         x = a.float() + dt_bias.float()
         g = -torch.exp(A_log.float()) * F.softplus(x)
         beta = torch.sigmoid(b.float())
         try:
-            return chunk_gated_delta_rule(
+            fast_output, fast_new_state = chunk_gated_delta_rule(
                 q=q,
                 k=k,
                 v=v,
@@ -137,10 +143,13 @@ def run(
                 cu_seqlens=cu_seqlens,
                 use_qk_l2norm_in_kernel=False,
             )
+            output.copy_(fast_output)
+            new_state.copy_(fast_new_state)
+            return
         except Exception:
             pass
 
-    return _reference_gdn_prefill(
+    ref_output, ref_new_state = _reference_gdn_prefill(
         q=q,
         k=k,
         v=v,
@@ -152,3 +161,5 @@ def run(
         cu_seqlens=cu_seqlens,
         scale_val=scale_val,
     )
+    output.copy_(ref_output)
+    new_state.copy_(ref_new_state)
