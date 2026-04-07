@@ -42,9 +42,9 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 }
 
 /*
- * One block per (batch, v_head) pair.
- * Grid: (B * NUM_V_HEADS,)
- * Block: (128,) = 4 warps, each warp handles 32 vi rows
+ * V-split blocks: each (batch, v_head) can be split across multiple blocks.
+ * Grid: (B * NUM_V_HEADS * split_factor,)
+ * Block: (128,) = 4 warps, each warp handles rows_per_warp vi rows
  */
 __global__ void gdn_decode_kernel(
     const bf16* __restrict__ q,         // [B, 1, 4, 128]
@@ -58,16 +58,23 @@ __global__ void gdn_decode_kernel(
     const float scale,
     bf16* __restrict__ output,          // [B, 1, 8, 128]
     float* __restrict__ new_state,      // [B, 8, 128, 128]
-    int batch_size
+    int batch_size,
+    int split_factor
 ) {
     const int idx = blockIdx.x;
-    const int batch = idx / NUM_V_HEADS;
-    const int vh = idx % NUM_V_HEADS;
+    const int heads_x_split = NUM_V_HEADS * split_factor;
+    const int batch = idx / heads_x_split;
+    const int remainder = idx % heads_x_split;
+    const int vh = remainder / split_factor;
+    const int split_id = remainder % split_factor;
     const int qkh = vh / V_PER_Q;
     const int tid = threadIdx.x;
 
     const int warp_id = tid / 32;     // 0..3
     const int lane = tid % 32;        // 0..31
+
+    const int rows_per_block = HEAD_DIM / split_factor;  // 128/split
+    const int rows_per_warp = rows_per_block / 4;        // per warp
 
     // Compute gates (uniform across all threads in block)
     float a_val = __bfloat162float(a[batch * NUM_V_HEADS + vh]);
@@ -121,10 +128,10 @@ __global__ void gdn_decode_kernel(
     // Output base pointer
     bf16* out_base = output + batch * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM;
 
-    // Each warp handles 32 vi rows: warp 0 -> vi 0..31, warp 1 -> vi 32..63, etc.
-    const int vi_start = warp_id * 32;
+    // Each warp handles rows_per_warp vi rows within this block's split
+    const int vi_start = split_id * rows_per_block + warp_id * rows_per_warp;
 
-    for (int vi_off = 0; vi_off < 32; vi_off++) {
+    for (int vi_off = 0; vi_off < rows_per_warp; vi_off++) {
         const int vi = vi_start + vi_off;
 
         // Load 4 state values via float4: state[vi, lane*4 .. lane*4+3]
@@ -181,11 +188,21 @@ void gdn_decode(
 ) {
     int batch_size = q.size(0);
 
+    // Choose split factor to increase SM utilization at small batch sizes
+    int split_factor;
+    if (batch_size <= 4) {
+        split_factor = 4;   // 32 V-rows per block, 8 per warp
+    } else if (batch_size <= 16) {
+        split_factor = 2;   // 64 V-rows per block, 16 per warp
+    } else {
+        split_factor = 1;   // 128 V-rows per block, 32 per warp (original)
+    }
+
     DLDevice dev = q.device();
     cudaStream_t stream = static_cast<cudaStream_t>(
         TVMFFIEnvGetStream(dev.device_type, dev.device_id));
 
-    dim3 grid(batch_size * NUM_V_HEADS);
+    dim3 grid(batch_size * NUM_V_HEADS * split_factor);
     dim3 block(HEAD_DIM);
 
     gdn_decode_kernel<<<grid, block, 0, stream>>>(
@@ -200,7 +217,8 @@ void gdn_decode(
         static_cast<float>(scale),
         static_cast<bf16*>(output.data_ptr()),
         static_cast<float*>(new_state.data_ptr()),
-        batch_size
+        batch_size,
+        split_factor
     );
 }
 
