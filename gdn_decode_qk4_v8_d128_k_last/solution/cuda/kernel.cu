@@ -14,6 +14,9 @@
  *   residual = beta * (v[vi] - g * ks_sum)
  *   output[vi]          = scale * (g * qs_sum + qk_dot * residual)
  *   new_state[vi,k]     = g * state[vi,k] + k[k] * residual
+ *
+ * Cache streaming hints: state read/write use ld.global.cs/st.global.cs
+ * to avoid L2 cache pollution (data is accessed only once).
  */
 
 #include <cuda_runtime.h>
@@ -134,9 +137,12 @@ __global__ void gdn_decode_kernel(
     for (int vi_off = 0; vi_off < rows_per_warp; vi_off++) {
         const int vi = vi_start + vi_off;
 
-        // Load 4 state values via float4: state[vi, lane*4 .. lane*4+3]
+        // Load 4 state values via float4 with cache streaming hint (read-once data)
         const float* state_row = state_base + vi * HEAD_DIM + lane * 4;
-        float4 st4 = *reinterpret_cast<const float4*>(state_row);
+        float4 st4;
+        asm volatile("ld.global.cs.v4.f32 {%0,%1,%2,%3}, [%4];"
+            : "=f"(st4.x), "=f"(st4.y), "=f"(st4.z), "=f"(st4.w)
+            : "l"(state_row));
         float state_vals[4] = { st4.x, st4.y, st4.z, st4.w };
 
         // Simultaneous reductions: ks_sum and qs_sum
@@ -154,7 +160,7 @@ __global__ void gdn_decode_kernel(
         // Compute residual
         float residual = beta * (s_v[vi] - g * ks_sum);
 
-        // Write new state: new_state[vi, lane*4+i] = g * state_vals[i] + k_vals[i] * residual
+        // Write new state with cache streaming hint (write-once data)
         float4 new_st4;
         new_st4.x = g * state_vals[0] + k_vals[0] * residual;
         new_st4.y = g * state_vals[1] + k_vals[1] * residual;
@@ -162,7 +168,9 @@ __global__ void gdn_decode_kernel(
         new_st4.w = g * state_vals[3] + k_vals[3] * residual;
 
         float* new_state_row = new_state_base + vi * HEAD_DIM + lane * 4;
-        *reinterpret_cast<float4*>(new_state_row) = new_st4;
+        asm volatile("st.global.cs.v4.f32 [%0], {%1,%2,%3,%4};"
+            :: "l"(new_state_row),
+            "f"(new_st4.x), "f"(new_st4.y), "f"(new_st4.z), "f"(new_st4.w));
 
         // Lane 0 writes output
         if (lane == 0) {

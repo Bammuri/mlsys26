@@ -17,3 +17,9 @@ Tracking all optimization iterations for the decode kernel.
 - **Result**: 887.72x → 1046.46x mean speedup (**+17.9%**), min 51.64x → 88.22x (+70.8%), latency 0.028ms → 0.022ms
 - **Status**: accepted
 - **Learnings**: Small-batch workloads (B=1-4) saw the biggest gains (~70% min speedup improvement) confirming SM under-utilization was the bottleneck there. Large-batch workloads (B>16) unchanged as expected. Next bottleneck: memory latency hiding (software pipelining) or persistent kernel for further small-batch gains.
+
+## 2026-04-07 - Cache Streaming Hints (ld/st.global.cs)
+- **Idea**: Use inline PTX `ld.global.cs.v4.f32` and `st.global.cs.v4.f32` for state read/write. The `.cs` (cache streaming) hint tells the L2 cache that this data is accessed only once, enabling early eviction and reducing cache pollution. Frees L2 space for other accesses (q, k, v, output).
+- **Result**: 1046.46x → 1079.33x mean speedup (**+3.1%**), max 2318x → 2353x, latency 0.022ms → 0.021ms
+- **Status**: accepted
+- **Learnings**: State data (128KB per head read+write) was polluting L2 despite being read/written only once. Streaming hints improved large-batch throughput where multiple blocks compete for L2 space. Tried and rejected: aggressive split factors (B=1 split=16, no improvement), template compile-time unrolling (#pragma unroll caused register spills for 32-iteration loops). Kernel is near memory-bandwidth limit for large batches; small batches (B=1-2) remain launch-latency dominated.
