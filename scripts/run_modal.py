@@ -10,7 +10,11 @@ Setup (one-time):
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
 """
 
+import json
+import re
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Add project root to path for imports
@@ -92,6 +96,97 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     return results
 
 
+def get_git_commit_hash() -> str:
+    """Return the current short git hash, if available."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return "unknown"
+    return proc.stdout.strip() or "unknown"
+
+
+def sanitize_label(label: str) -> str:
+    """Convert a free-form label into a filesystem-safe token."""
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", label.strip()).strip("-")
+    return sanitized or "run"
+
+
+def summarize_results(results: dict) -> dict:
+    """Compute aggregate statistics from benchmark results."""
+    latencies = []
+    ref_latencies = []
+    speedups = []
+    passed = 0
+    total = 0
+
+    for traces in results.values():
+        for result in traces.values():
+            total += 1
+            if result.get("status") == "PASSED":
+                passed += 1
+            if result.get("latency_ms") is not None:
+                latencies.append(float(result["latency_ms"]))
+            if result.get("reference_latency_ms") is not None:
+                ref_latencies.append(float(result["reference_latency_ms"]))
+            if result.get("speedup_factor") is not None:
+                speedups.append(float(result["speedup_factor"]))
+
+    def mean_or_none(values):
+        if not values:
+            return None
+        return sum(values) / float(len(values))
+
+    return {
+        "total_workloads": total,
+        "passed_workloads": passed,
+        "failed_workloads": total - passed,
+        "avg_latency_ms": mean_or_none(latencies),
+        "avg_reference_latency_ms": mean_or_none(ref_latencies),
+        "avg_speedup_factor": mean_or_none(speedups),
+    }
+
+
+def save_results_artifact(
+    *,
+    results: dict,
+    solution: Solution,
+    config: BenchmarkConfig,
+    label: str,
+    entry_point: str,
+) -> Path:
+    """Persist raw benchmark results and aggregate summary."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    definition_dir = PROJECT_ROOT / ".omx" / "benchmarks" / solution.definition
+    definition_dir.mkdir(parents=True, exist_ok=True)
+
+    artifact_path = definition_dir / f"{timestamp}-{sanitize_label(label)}.json"
+    payload = {
+        "metadata": {
+            "timestamp_utc": timestamp,
+            "label": label,
+            "definition": solution.definition,
+            "solution_name": solution.name,
+            "entry_point": entry_point,
+            "git_commit": get_git_commit_hash(),
+            "benchmark_config": {
+                "warmup_runs": config.warmup_runs,
+                "iterations": config.iterations,
+                "num_trials": config.num_trials,
+            },
+        },
+        "summary": summarize_results(results),
+        "results": results,
+    }
+    artifact_path.write_text(json.dumps(payload, indent=2))
+    return artifact_path
+
+
 def summarize_log(log: str, max_lines: int = 20) -> str:
     """Return a compact multi-line log summary."""
     if not log:
@@ -133,6 +228,21 @@ def print_results(results: dict):
                     print()
                     shown_failure_log = True
 
+        summary = summarize_results({def_name: traces})
+        print(
+            "  Summary:",
+            f"passed={summary['passed_workloads']}/{summary['total_workloads']}",
+            f"avg_latency_ms={summary['avg_latency_ms']:.3f}"
+            if summary["avg_latency_ms"] is not None
+            else "avg_latency_ms=n/a",
+            f"avg_reference_latency_ms={summary['avg_reference_latency_ms']:.3f}"
+            if summary["avg_reference_latency_ms"] is not None
+            else "avg_reference_latency_ms=n/a",
+            f"avg_speedup_factor={summary['avg_speedup_factor']:.2f}"
+            if summary["avg_speedup_factor"] is not None
+            else "avg_speedup_factor=n/a",
+        )
+
 
 @app.local_entrypoint()
 def main(
@@ -145,6 +255,7 @@ def main(
     warmup_runs: int = 3,
     iterations: int = 100,
     num_trials: int = 5,
+    label: str = "",
 ):
     """Pack solution and run benchmark on Modal."""
     from scripts.pack_solution import pack_solution
@@ -194,3 +305,11 @@ def main(
         return
 
     print_results(results)
+    artifact_path = save_results_artifact(
+        results=results,
+        solution=solution,
+        config=config,
+        label=label or solution.definition,
+        entry_point=solution.spec.entry_point,
+    )
+    print(f"\nSaved results: {artifact_path}")
