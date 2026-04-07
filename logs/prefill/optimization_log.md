@@ -37,3 +37,11 @@ Tracking all optimization iterations for the prefill kernel.
 - **Correctness**: max_atol=1.22e-04, max_rtol=0.295, matched_ratio=1.0. rtol unchanged (1.7% headroom).
 - **Status**: accepted
 - **Learnings**: SM utilization was the dominant bottleneck for low-N workloads. With N=1 (8 blocks → 64 blocks via split=8), speedup improved dramatically. Register pressure drops from 168 to ~40 registers with split=8, enabling higher occupancy. The reduced syncs/timestep (18→5 for split=8) provided additional benefit. Min speedup doubled (15.6→32.7x), suggesting even the hardest workloads benefited. The 4.09x mean speedup jump dwarfs all prior micro-optimizations combined.
+
+## 2026-04-07 - Warp-Parallel Vi Rows + Algebraic Fusion
+- **Idea**: Restructure thread-to-data mapping: instead of 128 threads spanning K=128 with cross-warp reductions via shared memory, each warp (32 threads × 4 k-elements = 128) independently processes its own vi rows using only intra-warp shuffles. Combined with algebraic fusion: compute both k·state and q·state from OLD state in one pass, output via identity `output = scale * (g * qs_sum + qk_dot * residual)`. Eliminates ALL `__syncthreads` and shared memory from the inner loop.
+- **Result**: 108.12x → 252.98x mean speedup (+134%), latency 5.21ms → 2.11ms (-59.5%)
+- **Min/Max speedup**: 32.67x/219.90x → 85.03x/626.56x
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. rtol slightly increased but all workloads pass.
+- **Status**: accepted
+- **Learnings**: Cross-warp synchronization was the dominant bottleneck. The old kernel had 5-19 `__syncthreads` per timestep; the new kernel has zero. float4 state loads also improved memory coalescing. The algebraic fusion failed as a standalone change (+41% latency due to doubled smem traffic) but succeeds here because warp-parallel eliminates smem entirely. The 2.34x mean speedup improvement is the largest single-iteration gain. This approach mirrors the decode kernel's proven inner loop structure.
