@@ -101,8 +101,8 @@ __global__ void gdn_decode_kernel(
     const int64_t out_base =
         (((batch_idx * 1 + 0) * kNumVHeads + v_head_idx) * kHeadSize + row_idx);
 
-    __shared__ float s_q[kHeadSize];
-    __shared__ float s_k[kHeadSize];
+    __shared__ __align__(16) float s_q[kHeadSize];
+    __shared__ __align__(16) float s_k[kHeadSize];
     __shared__ float s_g;
     __shared__ float s_beta;
 
@@ -115,21 +115,38 @@ __global__ void gdn_decode_kernel(
     }
     __syncthreads();
 
+    const auto* state_vec = reinterpret_cast<const float4*>(state + state_row_base);
+    auto* new_state_vec = reinterpret_cast<float4*>(new_state + state_row_base);
+
     float old_v = 0.0f;
-    for (int64_t col_idx = 0; col_idx < kHeadSize; ++col_idx) {
-        const float state_val = has_state ? state[state_row_base + col_idx] : 0.0f;
-        old_v += s_k[col_idx] * (s_g * state_val);
+    #pragma unroll
+    for (int vec_idx = 0; vec_idx < kHeadSize / 4; ++vec_idx) {
+        const int base = vec_idx * 4;
+        const float4 prev = has_state ? state_vec[vec_idx] : make_float4(0.f, 0.f, 0.f, 0.f);
+        old_v += s_k[base + 0] * (s_g * prev.x);
+        old_v += s_k[base + 1] * (s_g * prev.y);
+        old_v += s_k[base + 2] * (s_g * prev.z);
+        old_v += s_k[base + 3] * (s_g * prev.w);
     }
 
     const float value_val = bf16_to_float(v, v_base + row_idx);
     const float delta = s_beta * (value_val - old_v);
 
     float out_acc = 0.0f;
-    for (int64_t col_idx = 0; col_idx < kHeadSize; ++col_idx) {
-        const float prev_state = has_state ? state[state_row_base + col_idx] : 0.0f;
-        const float updated = s_g * prev_state + s_k[col_idx] * delta;
-        new_state[state_row_base + col_idx] = updated;
-        out_acc += s_q[col_idx] * updated;
+    #pragma unroll
+    for (int vec_idx = 0; vec_idx < kHeadSize / 4; ++vec_idx) {
+        const int base = vec_idx * 4;
+        const float4 prev = has_state ? state_vec[vec_idx] : make_float4(0.f, 0.f, 0.f, 0.f);
+        float4 updated;
+        updated.x = s_g * prev.x + s_k[base + 0] * delta;
+        updated.y = s_g * prev.y + s_k[base + 1] * delta;
+        updated.z = s_g * prev.z + s_k[base + 2] * delta;
+        updated.w = s_g * prev.w + s_k[base + 3] * delta;
+        new_state_vec[vec_idx] = updated;
+        out_acc += s_q[base + 0] * updated.x;
+        out_acc += s_q[base + 1] * updated.y;
+        out_acc += s_q[base + 2] * updated.z;
+        out_acc += s_q[base + 3] * updated.w;
     }
 
     float_to_bf16(output, out_base, scale * out_acc);
