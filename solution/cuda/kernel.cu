@@ -25,7 +25,8 @@ constexpr int kNumQHeads = 4;
 constexpr int kNumKHeads = 4;
 constexpr int kNumVHeads = 8;
 constexpr int kHeadSize = 128;
-constexpr int kThreads = 128;
+constexpr int kDecodeThreads = 64;
+constexpr int kPrefillThreads = 128;
 
 inline void check_cuda_tensor(const torch::Tensor& tensor, const char* name) {
     TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
@@ -84,9 +85,9 @@ __global__ void gdn_decode_kernel(
     const int64_t batch_head = static_cast<int64_t>(blockIdx.x);
     const int64_t batch_idx = batch_head / kNumVHeads;
     const int64_t v_head_idx = batch_head % kNumVHeads;
-    const int64_t row_idx = static_cast<int64_t>(threadIdx.x);
+    const int64_t thread_idx = static_cast<int64_t>(threadIdx.x);
 
-    if (batch_idx >= batch_size || row_idx >= kHeadSize) {
+    if (batch_idx >= batch_size || thread_idx >= kDecodeThreads) {
         return;
     }
 
@@ -97,60 +98,91 @@ __global__ void gdn_decode_kernel(
     const int64_t k_base = (((batch_idx * 1 + 0) * kNumKHeads + k_head_idx) * kHeadSize);
     const int64_t v_base = (((batch_idx * 1 + 0) * kNumVHeads + v_head_idx) * kHeadSize);
     const int64_t gate_base = ((batch_idx * 1 + 0) * kNumVHeads + v_head_idx);
-    const int64_t state_row_base =
-        (((batch_idx * kNumVHeads + v_head_idx) * kHeadSize + row_idx) * kHeadSize);
-    const int64_t out_base =
-        (((batch_idx * 1 + 0) * kNumVHeads + v_head_idx) * kHeadSize + row_idx);
+    const int64_t row_idx0 = thread_idx;
+    const int64_t row_idx1 = thread_idx + kDecodeThreads;
+    const int64_t state_row_base0 =
+        (((batch_idx * kNumVHeads + v_head_idx) * kHeadSize + row_idx0) * kHeadSize);
+    const int64_t state_row_base1 =
+        (((batch_idx * kNumVHeads + v_head_idx) * kHeadSize + row_idx1) * kHeadSize);
+    const int64_t out_base0 =
+        (((batch_idx * 1 + 0) * kNumVHeads + v_head_idx) * kHeadSize + row_idx0);
+    const int64_t out_base1 =
+        (((batch_idx * 1 + 0) * kNumVHeads + v_head_idx) * kHeadSize + row_idx1);
 
     __shared__ __align__(16) float s_q[kHeadSize];
     __shared__ __align__(16) float s_k[kHeadSize];
     __shared__ float s_g;
     __shared__ float s_beta;
 
-    s_q[row_idx] = bf16_to_float(q, q_base + row_idx);
-    s_k[row_idx] = bf16_to_float(k, k_base + row_idx);
-    if (row_idx == 0) {
+    s_q[row_idx0] = bf16_to_float(q, q_base + row_idx0);
+    s_q[row_idx1] = bf16_to_float(q, q_base + row_idx1);
+    s_k[row_idx0] = bf16_to_float(k, k_base + row_idx0);
+    s_k[row_idx1] = bf16_to_float(k, k_base + row_idx1);
+    if (thread_idx == 0) {
         const float x = bf16_to_float(a, gate_base) + dt_bias[v_head_idx];
         s_g = expf(-expf(A_log[v_head_idx]) * softplusf_stable(x));
         s_beta = sigmoidf_stable(bf16_to_float(b, gate_base));
     }
     __syncthreads();
 
-    const auto* state_vec = reinterpret_cast<const float4*>(state + state_row_base);
-    auto* new_state_vec = reinterpret_cast<float4*>(new_state + state_row_base);
+    const auto* state_vec0 = reinterpret_cast<const float4*>(state + state_row_base0);
+    const auto* state_vec1 = reinterpret_cast<const float4*>(state + state_row_base1);
+    auto* new_state_vec0 = reinterpret_cast<float4*>(new_state + state_row_base0);
+    auto* new_state_vec1 = reinterpret_cast<float4*>(new_state + state_row_base1);
 
-    float old_v = 0.0f;
+    float old_v0 = 0.0f;
+    float old_v1 = 0.0f;
     #pragma unroll
     for (int vec_idx = 0; vec_idx < kHeadSize / 4; ++vec_idx) {
         const int base = vec_idx * 4;
-        const float4 prev = has_state ? state_vec[vec_idx] : make_float4(0.f, 0.f, 0.f, 0.f);
-        old_v += s_k[base + 0] * (s_g * prev.x);
-        old_v += s_k[base + 1] * (s_g * prev.y);
-        old_v += s_k[base + 2] * (s_g * prev.z);
-        old_v += s_k[base + 3] * (s_g * prev.w);
+        const float4 prev0 = has_state ? state_vec0[vec_idx] : make_float4(0.f, 0.f, 0.f, 0.f);
+        const float4 prev1 = has_state ? state_vec1[vec_idx] : make_float4(0.f, 0.f, 0.f, 0.f);
+        old_v0 += s_k[base + 0] * (s_g * prev0.x);
+        old_v0 += s_k[base + 1] * (s_g * prev0.y);
+        old_v0 += s_k[base + 2] * (s_g * prev0.z);
+        old_v0 += s_k[base + 3] * (s_g * prev0.w);
+        old_v1 += s_k[base + 0] * (s_g * prev1.x);
+        old_v1 += s_k[base + 1] * (s_g * prev1.y);
+        old_v1 += s_k[base + 2] * (s_g * prev1.z);
+        old_v1 += s_k[base + 3] * (s_g * prev1.w);
     }
 
-    const float value_val = bf16_to_float(v, v_base + row_idx);
-    const float delta = s_beta * (value_val - old_v);
+    const float value_val0 = bf16_to_float(v, v_base + row_idx0);
+    const float value_val1 = bf16_to_float(v, v_base + row_idx1);
+    const float delta0 = s_beta * (value_val0 - old_v0);
+    const float delta1 = s_beta * (value_val1 - old_v1);
 
-    float out_acc = 0.0f;
+    float out_acc0 = 0.0f;
+    float out_acc1 = 0.0f;
     #pragma unroll
     for (int vec_idx = 0; vec_idx < kHeadSize / 4; ++vec_idx) {
         const int base = vec_idx * 4;
-        const float4 prev = has_state ? state_vec[vec_idx] : make_float4(0.f, 0.f, 0.f, 0.f);
-        float4 updated;
-        updated.x = s_g * prev.x + s_k[base + 0] * delta;
-        updated.y = s_g * prev.y + s_k[base + 1] * delta;
-        updated.z = s_g * prev.z + s_k[base + 2] * delta;
-        updated.w = s_g * prev.w + s_k[base + 3] * delta;
-        new_state_vec[vec_idx] = updated;
-        out_acc += s_q[base + 0] * updated.x;
-        out_acc += s_q[base + 1] * updated.y;
-        out_acc += s_q[base + 2] * updated.z;
-        out_acc += s_q[base + 3] * updated.w;
+        const float4 prev0 = has_state ? state_vec0[vec_idx] : make_float4(0.f, 0.f, 0.f, 0.f);
+        const float4 prev1 = has_state ? state_vec1[vec_idx] : make_float4(0.f, 0.f, 0.f, 0.f);
+        float4 updated0;
+        float4 updated1;
+        updated0.x = s_g * prev0.x + s_k[base + 0] * delta0;
+        updated0.y = s_g * prev0.y + s_k[base + 1] * delta0;
+        updated0.z = s_g * prev0.z + s_k[base + 2] * delta0;
+        updated0.w = s_g * prev0.w + s_k[base + 3] * delta0;
+        updated1.x = s_g * prev1.x + s_k[base + 0] * delta1;
+        updated1.y = s_g * prev1.y + s_k[base + 1] * delta1;
+        updated1.z = s_g * prev1.z + s_k[base + 2] * delta1;
+        updated1.w = s_g * prev1.w + s_k[base + 3] * delta1;
+        new_state_vec0[vec_idx] = updated0;
+        new_state_vec1[vec_idx] = updated1;
+        out_acc0 += s_q[base + 0] * updated0.x;
+        out_acc0 += s_q[base + 1] * updated0.y;
+        out_acc0 += s_q[base + 2] * updated0.z;
+        out_acc0 += s_q[base + 3] * updated0.w;
+        out_acc1 += s_q[base + 0] * updated1.x;
+        out_acc1 += s_q[base + 1] * updated1.y;
+        out_acc1 += s_q[base + 2] * updated1.z;
+        out_acc1 += s_q[base + 3] * updated1.w;
     }
 
-    float_to_bf16(output, out_base, scale * out_acc);
+    float_to_bf16(output, out_base0, scale * out_acc0);
+    float_to_bf16(output, out_base1, scale * out_acc1);
 }
 
 inline void configure_decode_kernel_launch() {
@@ -313,7 +345,7 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_decode(
     configure_decode_kernel_launch();
 
     const dim3 grid(batch_size * kNumVHeads);
-    const dim3 block(kThreads);
+    const dim3 block(kDecodeThreads);
 
     gdn_decode_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         q_c.data_ptr<at::BFloat16>(),
@@ -412,7 +444,7 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill(
         torch::TensorOptions().device(q_c.device()).dtype(torch::kFloat32));
 
     const dim3 grid(num_seqs * kNumVHeads);
-    const dim3 block(kThreads);
+    const dim3 block(kPrefillThreads);
 
     gdn_prefill_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         q_c.data_ptr<at::BFloat16>(),
