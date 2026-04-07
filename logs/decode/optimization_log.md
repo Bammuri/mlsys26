@@ -23,3 +23,9 @@ Tracking all optimization iterations for the decode kernel.
 - **Result**: 1046.46x → 1079.33x mean speedup (**+3.1%**), max 2318x → 2353x, latency 0.022ms → 0.021ms
 - **Status**: accepted
 - **Learnings**: State data (128KB per head read+write) was polluting L2 despite being read/written only once. Streaming hints improved large-batch throughput where multiple blocks compete for L2 space. Tried and rejected: aggressive split factors (B=1 split=16, no improvement), template compile-time unrolling (#pragma unroll caused register spills for 32-iteration loops). Kernel is near memory-bandwidth limit for large batches; small batches (B=1-2) remain launch-latency dominated.
+
+## 2026-04-07 - Async Copy Double Buffering (cp.async)
+- **Idea**: Replace synchronous `ld.global.cs.v4.f32` state loads with `cp.async.cg.shared.global` into shared memory double buffers. Prefetch the next V-row's state while computing on the current row, hiding HBM latency (~200-400 cycles) behind compute. Shared memory: `smem_state[4][2][128]` = 4KB for 4 warps × 2 buffers.
+- **Result**: 1079.33x → 1107.74x mean speedup (**+2.6%**), max 2352.97x → 2547.35x (+8.3%), latency 0.0213ms → 0.0180ms (-15.5%)
+- **Status**: accepted
+- **Learnings**: Async copy overlap helped most at large batch sizes where memory bandwidth is saturated — max speedup jumped 8.3%. Small batches (B=1-2) unchanged at ~82x, confirming they are launch-latency dominated, not memory-latency limited. The 4 warps per block already provided some latency hiding via warp scheduling, so the additional benefit of software pipelining was modest (+2.6% mean). Next opportunities: reducing launch overhead for small batches (CUDA graphs if framework allows), or increasing parallelism (more warps per block).

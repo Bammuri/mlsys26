@@ -15,8 +15,9 @@
  *   output[vi]          = scale * (g * qs_sum + qk_dot * residual)
  *   new_state[vi,k]     = g * state[vi,k] + k[k] * residual
  *
- * Cache streaming hints: state read/write use ld.global.cs/st.global.cs
- * to avoid L2 cache pollution (data is accessed only once).
+ * Async copy double buffering: state rows are loaded via cp.async into shared
+ * memory with double buffering, so the next row's load overlaps with the
+ * current row's compute. Cache streaming hints on state writes via st.global.cs.
  */
 
 #include <cuda_runtime.h>
@@ -117,7 +118,9 @@ __global__ void gdn_decode_kernel(
     qk_dot = __shfl_sync(0xffffffff, qk_dot, 0);
 
     // Load v vector into shared memory (all warps cooperate)
+    // Double buffer for async state loads: [warp_id][buffer_idx][k_dim]
     __shared__ float s_v[HEAD_DIM];
+    __shared__ float smem_state[4][2][128];
     {
         // tid maps 1:1 to v indices (128 threads, 128 elements)
         s_v[tid] = __bfloat162float(v[batch * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + tid]);
@@ -134,16 +137,42 @@ __global__ void gdn_decode_kernel(
     // Each warp handles rows_per_warp vi rows within this block's split
     const int vi_start = split_id * rows_per_block + warp_id * rows_per_warp;
 
+    // Compute shared memory addresses for this warp's double buffers
+    const uint32_t smem_addr_buf0 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem_state[warp_id][0][lane * 4]));
+    const uint32_t smem_addr_buf1 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem_state[warp_id][1][lane * 4]));
+
+    // Prefetch first row (vi_off=0) into buffer 0
+    {
+        const float* src = state_base + vi_start * HEAD_DIM + lane * 4;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem_addr_buf0), "l"(src) : "memory");
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+    }
+
     for (int vi_off = 0; vi_off < rows_per_warp; vi_off++) {
         const int vi = vi_start + vi_off;
+        const int cur_buf = vi_off & 1;
+        const int nxt_buf = (vi_off + 1) & 1;
 
-        // Load 4 state values via float4 with cache streaming hint (read-once data)
-        const float* state_row = state_base + vi * HEAD_DIM + lane * 4;
-        float4 st4;
-        asm volatile("ld.global.cs.v4.f32 {%0,%1,%2,%3}, [%4];"
-            : "=f"(st4.x), "=f"(st4.y), "=f"(st4.z), "=f"(st4.w)
-            : "l"(state_row));
-        float state_vals[4] = { st4.x, st4.y, st4.z, st4.w };
+        // Prefetch next row into alternate buffer (if exists)
+        if (vi_off + 1 < rows_per_warp) {
+            const float* src_next = state_base + (vi + 1) * HEAD_DIM + lane * 4;
+            uint32_t dst_addr = (nxt_buf == 0) ? smem_addr_buf0 : smem_addr_buf1;
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst_addr), "l"(src_next) : "memory");
+            asm volatile("cp.async.commit_group;\n" ::: "memory");
+        }
+
+        // Wait for current row's load to complete
+        // If next prefetch was issued, wait until at most 1 group outstanding; else wait for all
+        if (vi_off + 1 < rows_per_warp) {
+            asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+        } else {
+            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        }
+        __syncwarp();
+
+        // Read state from shared memory
+        float* cur_smem = &smem_state[warp_id][cur_buf][lane * 4];
+        float state_vals[4] = { cur_smem[0], cur_smem[1], cur_smem[2], cur_smem[3] };
 
         // Simultaneous reductions: ks_sum and qs_sum
         float ks_local = k_vals[0] * state_vals[0] + k_vals[1] * state_vals[1]
