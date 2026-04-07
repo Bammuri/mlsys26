@@ -15,9 +15,9 @@
  *   output[vi]          = scale * (g * qs_sum + qk_dot * residual)
  *   new_state[vi,k]     = g * state[vi,k] + k[k] * residual
  *
- * Register-based 2-row software pipelining: state rows are loaded directly into
- * registers via float4 loads, processing 2 V-rows per iteration with prefetching.
- * Next 2 rows are prefetched into registers while current 2 rows are computed.
+ * Register-based 4-row software pipelining: state rows are loaded directly into
+ * registers via float4 loads, processing 4 V-rows per iteration with prefetching.
+ * Next 4 rows are prefetched into registers while current 4 rows are computed.
  * No shared memory needed for state. Default writeback caching for L2 residency.
  */
 
@@ -136,45 +136,65 @@ __global__ void gdn_decode_kernel(
     // Each warp handles rows_per_warp vi rows within this block's split
     const int vi_start = split_id * rows_per_block + warp_id * rows_per_warp;
 
-    // Prefetch first 2 rows into registers
+    // Prefetch first 4 rows into registers
     float4 pf_a = *reinterpret_cast<const float4*>(state_base + vi_start * HEAD_DIM + lane * 4);
     float4 pf_b = *reinterpret_cast<const float4*>(state_base + (vi_start + 1) * HEAD_DIM + lane * 4);
+    float4 pf_c = *reinterpret_cast<const float4*>(state_base + (vi_start + 2) * HEAD_DIM + lane * 4);
+    float4 pf_d = *reinterpret_cast<const float4*>(state_base + (vi_start + 3) * HEAD_DIM + lane * 4);
 
-    for (int vi_off = 0; vi_off < rows_per_warp; vi_off += 2) {
+    for (int vi_off = 0; vi_off < rows_per_warp; vi_off += 4) {
         const int vi_a = vi_start + vi_off;
         const int vi_b = vi_a + 1;
+        const int vi_c = vi_a + 2;
+        const int vi_d = vi_a + 3;
 
         // Current rows from prefetched registers
         float4 st4_a = pf_a;
         float4 st4_b = pf_b;
+        float4 st4_c = pf_c;
+        float4 st4_d = pf_d;
 
-        // Prefetch next 2 rows (if exist)
-        if (vi_off + 2 < rows_per_warp) {
-            pf_a = *reinterpret_cast<const float4*>(state_base + (vi_a + 2) * HEAD_DIM + lane * 4);
-            pf_b = *reinterpret_cast<const float4*>(state_base + (vi_a + 3) * HEAD_DIM + lane * 4);
+        // Prefetch next 4 rows (if exist)
+        if (vi_off + 4 < rows_per_warp) {
+            pf_a = *reinterpret_cast<const float4*>(state_base + (vi_a + 4) * HEAD_DIM + lane * 4);
+            pf_b = *reinterpret_cast<const float4*>(state_base + (vi_a + 5) * HEAD_DIM + lane * 4);
+            pf_c = *reinterpret_cast<const float4*>(state_base + (vi_a + 6) * HEAD_DIM + lane * 4);
+            pf_d = *reinterpret_cast<const float4*>(state_base + (vi_a + 7) * HEAD_DIM + lane * 4);
         }
 
-        // Compute dot products for both rows simultaneously
+        // Compute dot products for all 4 rows simultaneously
         float ks_a = k_vals[0]*st4_a.x + k_vals[1]*st4_a.y + k_vals[2]*st4_a.z + k_vals[3]*st4_a.w;
         float qs_a = q_vals[0]*st4_a.x + q_vals[1]*st4_a.y + q_vals[2]*st4_a.z + q_vals[3]*st4_a.w;
         float ks_b = k_vals[0]*st4_b.x + k_vals[1]*st4_b.y + k_vals[2]*st4_b.z + k_vals[3]*st4_b.w;
         float qs_b = q_vals[0]*st4_b.x + q_vals[1]*st4_b.y + q_vals[2]*st4_b.z + q_vals[3]*st4_b.w;
+        float ks_c = k_vals[0]*st4_c.x + k_vals[1]*st4_c.y + k_vals[2]*st4_c.z + k_vals[3]*st4_c.w;
+        float qs_c = q_vals[0]*st4_c.x + q_vals[1]*st4_c.y + q_vals[2]*st4_c.z + q_vals[3]*st4_c.w;
+        float ks_d = k_vals[0]*st4_d.x + k_vals[1]*st4_d.y + k_vals[2]*st4_d.z + k_vals[3]*st4_d.w;
+        float qs_d = q_vals[0]*st4_d.x + q_vals[1]*st4_d.y + q_vals[2]*st4_d.z + q_vals[3]*st4_d.w;
 
-        // Interleaved warp reductions (better ILP)
+        // Interleaved warp reductions (all 8 reductions for better ILP)
         for (int offset = 16; offset > 0; offset >>= 1) {
             ks_a += __shfl_down_sync(0xffffffff, ks_a, offset);
             ks_b += __shfl_down_sync(0xffffffff, ks_b, offset);
+            ks_c += __shfl_down_sync(0xffffffff, ks_c, offset);
+            ks_d += __shfl_down_sync(0xffffffff, ks_d, offset);
             qs_a += __shfl_down_sync(0xffffffff, qs_a, offset);
             qs_b += __shfl_down_sync(0xffffffff, qs_b, offset);
+            qs_c += __shfl_down_sync(0xffffffff, qs_c, offset);
+            qs_d += __shfl_down_sync(0xffffffff, qs_d, offset);
         }
 
         // Broadcast ks values to all lanes
         ks_a = __shfl_sync(0xffffffff, ks_a, 0);
         ks_b = __shfl_sync(0xffffffff, ks_b, 0);
+        ks_c = __shfl_sync(0xffffffff, ks_c, 0);
+        ks_d = __shfl_sync(0xffffffff, ks_d, 0);
 
         // Compute residuals
         float res_a = beta * (s_v[vi_a] - g * ks_a);
         float res_b = beta * (s_v[vi_b] - g * ks_b);
+        float res_c = beta * (s_v[vi_c] - g * ks_c);
+        float res_d = beta * (s_v[vi_d] - g * ks_d);
 
         // Write new states (float4 stores with default writeback caching for L2 residency)
         float4 new_a = make_float4(
@@ -183,13 +203,23 @@ __global__ void gdn_decode_kernel(
         float4 new_b = make_float4(
             g*st4_b.x + k_vals[0]*res_b, g*st4_b.y + k_vals[1]*res_b,
             g*st4_b.z + k_vals[2]*res_b, g*st4_b.w + k_vals[3]*res_b);
+        float4 new_c = make_float4(
+            g*st4_c.x + k_vals[0]*res_c, g*st4_c.y + k_vals[1]*res_c,
+            g*st4_c.z + k_vals[2]*res_c, g*st4_c.w + k_vals[3]*res_c);
+        float4 new_d = make_float4(
+            g*st4_d.x + k_vals[0]*res_d, g*st4_d.y + k_vals[1]*res_d,
+            g*st4_d.z + k_vals[2]*res_d, g*st4_d.w + k_vals[3]*res_d);
         *reinterpret_cast<float4*>(new_state_base + vi_a * HEAD_DIM + lane * 4) = new_a;
         *reinterpret_cast<float4*>(new_state_base + vi_b * HEAD_DIM + lane * 4) = new_b;
+        *reinterpret_cast<float4*>(new_state_base + vi_c * HEAD_DIM + lane * 4) = new_c;
+        *reinterpret_cast<float4*>(new_state_base + vi_d * HEAD_DIM + lane * 4) = new_d;
 
         // Lane 0 writes outputs
         if (lane == 0) {
             out_base[vi_a] = __float2bfloat16(scale * (g * qs_a + qk_dot * res_a));
             out_base[vi_b] = __float2bfloat16(scale * (g * qs_b + qk_dot * res_b));
+            out_base[vi_c] = __float2bfloat16(scale * (g * qs_c + qk_dot * res_c));
+            out_base[vi_d] = __float2bfloat16(scale * (g * qs_d + qk_dot * res_d));
         }
     }
 }

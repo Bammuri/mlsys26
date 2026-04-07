@@ -41,3 +41,9 @@ Tracking all optimization iterations for the decode kernel.
 - **Result**: 1303.71x → 1340.12x mean speedup (**+2.8%**), min 68.50x → 87.54x (+27.8%), max 2952.71x → 3155.02x (+6.8%), latency 0.0192ms → 0.018ms
 - **Status**: accepted
 - **Learnings**: Eliminating shared memory for state reduced overhead, especially for small batches (B=1 min speedup jumped 28%). The 2-row processing amortizes loop overhead and enables interleaved independent shuffles. Register prefetching provides similar latency hiding to cp.async without synchronization costs. Kernel is now deeply memory-bound (~0.375 FLOP/byte arithmetic intensity vs ~37.5 FLOP/byte L2 machine balance). Remaining opportunities: wider blocks for small batches, warp specialization (producer/consumer), or fundamentally different parallelization strategies.
+
+## 2026-04-07 - 4-Row Software Pipelining
+- **Idea**: Extend 2-row register pipelining to 4 rows per iteration. Prefetch 4 float4 state rows, compute 8 dot products (ks_a..ks_d, qs_a..qs_d) with all 8 reductions interleaved in a single shuffle loop for maximum ILP. Halves loop iterations and overhead.
+- **Result**: 1340.12x → 1579.97x mean speedup (**+17.9%**), min 87.54x → 84.71x (-3.2%), max 3155.02x → 3982.39x (+26.2%), latency 0.018ms → 0.0174ms
+- **Status**: accepted
+- **Learnings**: Doubling pipeline depth from 2 to 4 rows gave a surprisingly large gain (+17.9%), especially for large batches (max +26.2%). The 8 interleaved independent shuffle reductions provide excellent ILP, keeping the warp scheduler busy while waiting on memory. Small-batch (B=1) min speedup slightly regressed (-3.2%) due to overhead of 4-stage pipeline with fewer iterations. Register pressure remains low (~50 regs/thread). Remaining opportunities: L2 persistent access policy for cross-invocation caching, __launch_bounds__(128,2) for occupancy hints, or warp specialization.
