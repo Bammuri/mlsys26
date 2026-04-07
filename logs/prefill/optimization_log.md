@@ -53,3 +53,11 @@ Tracking all optimization iterations for the prefill kernel.
 - **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
 - **Status**: accepted
 - **Learnings**: Mean speedup was essentially flat (+0.5%, within noise), but mean latency dropped 35%. The divergence suggests `__launch_bounds__` improved occupancy/scheduling on shorter workloads where launch overhead matters more. The 4-row unrolling benefit is modest because the compiler was already unrolling the `#pragma unroll` loop effectively. For SPLIT=8, the loop was already just 2 iterations; now it's 1. Diminishing returns on ILP improvements — the kernel is approaching the compute-bound limit for the sequential recurrence.
+
+## 2026-04-07 - Shared Memory q/k Broadcast + Double-Buffered Prefetch (REVERTED)
+- **Idea**: Eliminate 4x redundant q/k global memory loads by having all 128 threads cooperatively load q and k into shared memory once, then all 4 warps read from smem. Double-buffered: next timestep's q/k prefetched during current compute. Also precomputed gates (g, beta) in smem to avoid redundant SFU ops across warps. Cost: 1 `__syncthreads` per timestep (~1KB smem).
+- **Result**: 254.16x → 214.07x mean speedup (-15.8%), latency 1.375ms → 1.491ms (+8.5%)
+- **Min/Max speedup**: 87.96x/603.22x → 81.19x/512.70x
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: reverted
+- **Learnings**: The `__syncthreads` per timestep destroys the warp-independent parallelism that is the kernel's key strength. Even though 4 warps load identical q/k data, the L1/L2 cache handles the redundant reads efficiently (data is hot after the first warp's load). The sync barrier forces all warps to wait for the slowest one, adding ~20+ cycles of stall per timestep. For SPLIT_FACTOR=8 with only 4 vi rows per warp, the compute per timestep is small (~250 cycles), making the sync overhead proportionally large (~8-10%). **Conclusion: any optimization that adds `__syncthreads` to the inner loop is likely net-negative for this kernel. The zero-sync warp-parallel design must be preserved.**
