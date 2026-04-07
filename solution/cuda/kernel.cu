@@ -66,7 +66,7 @@ __device__ inline float sigmoidf_stable(float x) {
     return z / (1.0f + z);
 }
 
-__global__ __launch_bounds__(kThreads, 8) void gdn_decode_kernel(
+__global__ void gdn_decode_kernel(
     const at::BFloat16* __restrict__ q,
     const at::BFloat16* __restrict__ k,
     const at::BFloat16* __restrict__ v,
