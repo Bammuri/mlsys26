@@ -28,7 +28,14 @@ Each step uses a specific agent. Spawn them via the Agent tool with the indicate
 
 ### Step 1: Assess Current State
 Read the current kernel code and the target kernel's `logs/<kernel>/bench_history.jsonl` directly (no agent needed).
-Identify the current bottleneck (compute-bound? memory-bound? latency?).
+
+**NCU Profile**: Run `modal run scripts/profile_kernel.py --kernel <decode|prefill>` to collect hardware-level metrics (throughput, occupancy, memory bandwidth, register usage, spills, cache hit rates). Parse the NCU output to identify the precise bottleneck:
+- Compute-bound: high compute throughput %, low memory throughput %
+- Memory-bound: high memory/DRAM throughput %, low compute %
+- Latency-bound: low both, low waves/SM, low achieved occupancy
+- Register pressure: high register count, low theoretical occupancy, spills > 0
+
+Use these NCU metrics (not guesses) to drive the bottleneck analysis for Step 2.
 
 ### Step 2: Research — spawn `researcher` agent
 Spawn the **`researcher`** agent (subagent_type=researcher) with:

@@ -44,6 +44,9 @@ logs/
 - DPS: outputs pre-allocated, write in-place
 - Correctness: atol=1, rtol=0.3, matched_ratio≥0.9
 
+## Profiling
+- **NCU (Nsight Compute) is available on Modal B200** — FAQ.md says otherwise but this is outdated. Use NCU freely for kernel profiling and bottleneck analysis.
+
 ## Rules
 - Correctness before performance — always
 - One optimization per iteration
