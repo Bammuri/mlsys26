@@ -61,3 +61,19 @@ Tracking all optimization iterations for the prefill kernel.
 - **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
 - **Status**: reverted
 - **Learnings**: The `__syncthreads` per timestep destroys the warp-independent parallelism that is the kernel's key strength. Even though 4 warps load identical q/k data, the L1/L2 cache handles the redundant reads efficiently (data is hot after the first warp's load). The sync barrier forces all warps to wait for the slowest one, adding ~20+ cycles of stall per timestep. For SPLIT_FACTOR=8 with only 4 vi rows per warp, the compute per timestep is small (~250 cycles), making the sync overhead proportionally large (~8-10%). **Conclusion: any optimization that adds `__syncthreads` to the inner loop is likely net-negative for this kernel. The zero-sync warp-parallel design must be preserved.**
+
+## 2026-04-07 - Fast Math Intrinsics + Lane-0 Gate Broadcast + Vectorized bf16 Loads (REVERTED)
+- **Idea**: Three micro-optimizations combined: (1) Replace expf/log1pf with __expf/__logf fast intrinsics for gate computation. (2) Compute gates on lane 0 only, broadcast via __shfl_sync (saves 31/32 redundant SFU ops). (3) Load q/k as int2 (64-bit) instead of 4 individual bf16 scalar loads.
+- **Result**: 254.16x → 212.06x mean speedup (-16.6%), latency 1.375ms → 1.358ms (-1.2%)
+- **Min/Max speedup**: 87.96x/603.22x → 64.51x/499.59x
+- **Correctness**: max_atol=3.11e-04, max_rtol=21.8, matched_ratio=1.0. **Severe precision regression** from fast math intrinsics (__expf accumulates error over T=8192 timesteps through multiplicative g chain).
+- **Status**: reverted
+- **Learnings**: Fast math intrinsics (__expf, __logf) are NOT safe for gate computation despite generous tolerances — the gate g is used multiplicatively in state updates, and small per-step errors compound over thousands of timesteps. Standard precision (expf, log1pf) is required. The lane-0 broadcast alone (without fast math) was also tested: 225.56x mean (-11.3%), same latency, correct precision — serializing gate computation on lane 0 adds critical-path latency that outweighs saved SFU throughput. Vectorized bf16 loads provided no measurable benefit (compiler already optimizes scalar bf16 loads well). **Conclusion: instruction-level micro-optimizations within the inner loop are exhausted. Further gains require algorithmic changes (e.g., chunkwise parallelism).**
+
+## 2026-04-07 - SPLIT_FACTOR=16 for N=1 (REVERTED)
+- **Idea**: Add SPLIT_FACTOR=16 (RPW=2, 2-row unrolling) for single-sequence workloads to double SM utilization (64→128 blocks on 192-SM B200). Required 2-row inner loop variant via if constexpr since 4-row unrolling needs RPW≥4.
+- **Result**: 254.16x → 236.84x mean speedup (-6.8%), latency 1.375ms → 1.375ms (flat)
+- **Min/Max speedup**: 87.96x/603.22x → 86.29x/529.48x
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: reverted
+- **Learnings**: The reduced per-warp ILP (2 rows → 4 interleaved reductions instead of 8) outweighs the SM utilization benefit. With RPW=2, each timestep has only 20 shuffles (vs 44 for RPW=4), meaning less opportunity to overlap shuffles with FMA compute. The mean latency being identical confirms the speedup drop is benchmark noise in the reference baseline, not actual regression. However, the approach provides no improvement either. **Conclusion: SPLIT_FACTOR=8 (RPW=4) is the optimal split for N=1. Higher splits sacrifice too much per-warp compute density.**
