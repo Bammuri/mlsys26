@@ -67,18 +67,18 @@ __device__ inline float sigmoidf_stable(float x) {
 }
 
 __global__ void gdn_decode_kernel(
-    const at::BFloat16* q,
-    const at::BFloat16* k,
-    const at::BFloat16* v,
-    const float* state,
+    const at::BFloat16* __restrict__ q,
+    const at::BFloat16* __restrict__ k,
+    const at::BFloat16* __restrict__ v,
+    const float* __restrict__ state,
     bool has_state,
-    const float* A_log,
-    const at::BFloat16* a,
-    const float* dt_bias,
-    const at::BFloat16* b,
+    const float* __restrict__ A_log,
+    const at::BFloat16* __restrict__ a,
+    const float* __restrict__ dt_bias,
+    const at::BFloat16* __restrict__ b,
     float scale,
-    at::BFloat16* output,
-    float* new_state,
+    at::BFloat16* __restrict__ output,
+    float* __restrict__ new_state,
     int64_t batch_size) {
     const int64_t batch_head = static_cast<int64_t>(blockIdx.x);
     const int64_t batch_idx = batch_head / kNumVHeads;
@@ -101,25 +101,35 @@ __global__ void gdn_decode_kernel(
     const int64_t out_base =
         (((batch_idx * 1 + 0) * kNumVHeads + v_head_idx) * kHeadSize + row_idx);
 
-    const float x = bf16_to_float(a, gate_base) + dt_bias[v_head_idx];
-    const float g = expf(-expf(A_log[v_head_idx]) * softplusf_stable(x));
-    const float beta = sigmoidf_stable(bf16_to_float(b, gate_base));
+    __shared__ float s_q[kHeadSize];
+    __shared__ float s_k[kHeadSize];
+    __shared__ float s_g;
+    __shared__ float s_beta;
+
+    s_q[row_idx] = bf16_to_float(q, q_base + row_idx);
+    s_k[row_idx] = bf16_to_float(k, k_base + row_idx);
+    if (row_idx == 0) {
+        const float x = bf16_to_float(a, gate_base) + dt_bias[v_head_idx];
+        s_g = expf(-expf(A_log[v_head_idx]) * softplusf_stable(x));
+        s_beta = sigmoidf_stable(bf16_to_float(b, gate_base));
+    }
+    __syncthreads();
 
     float old_v = 0.0f;
     for (int64_t col_idx = 0; col_idx < kHeadSize; ++col_idx) {
         const float state_val = has_state ? state[state_row_base + col_idx] : 0.0f;
-        old_v += bf16_to_float(k, k_base + col_idx) * (g * state_val);
+        old_v += s_k[col_idx] * (s_g * state_val);
     }
 
     const float value_val = bf16_to_float(v, v_base + row_idx);
-    const float delta = beta * (value_val - old_v);
+    const float delta = s_beta * (value_val - old_v);
 
     float out_acc = 0.0f;
     for (int64_t col_idx = 0; col_idx < kHeadSize; ++col_idx) {
         const float prev_state = has_state ? state[state_row_base + col_idx] : 0.0f;
-        const float updated = g * prev_state + bf16_to_float(k, k_base + col_idx) * delta;
+        const float updated = s_g * prev_state + s_k[col_idx] * delta;
         new_state[state_row_base + col_idx] = updated;
-        out_acc += bf16_to_float(q, q_base + col_idx) * updated;
+        out_acc += s_q[col_idx] * updated;
     }
 
     float_to_bf16(output, out_base, scale * out_acc);
