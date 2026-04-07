@@ -165,19 +165,19 @@ inline void configure_decode_kernel_launch() {
 }
 
 __global__ void gdn_prefill_kernel(
-    const at::BFloat16* q,
-    const at::BFloat16* k,
-    const at::BFloat16* v,
-    const float* state,
+    const at::BFloat16* __restrict__ q,
+    const at::BFloat16* __restrict__ k,
+    const at::BFloat16* __restrict__ v,
+    const float* __restrict__ state,
     bool has_state,
-    const float* A_log,
-    const at::BFloat16* a,
-    const float* dt_bias,
-    const at::BFloat16* b,
-    const int64_t* cu_seqlens,
+    const float* __restrict__ A_log,
+    const at::BFloat16* __restrict__ a,
+    const float* __restrict__ dt_bias,
+    const at::BFloat16* __restrict__ b,
+    const int64_t* __restrict__ cu_seqlens,
     float scale,
-    at::BFloat16* output,
-    float* new_state,
+    at::BFloat16* __restrict__ output,
+    float* __restrict__ new_state,
     int64_t num_seqs) {
     const int64_t seq_head = static_cast<int64_t>(blockIdx.x);
     const int64_t seq_idx = seq_head / kNumVHeads;
@@ -200,8 +200,11 @@ __global__ void gdn_prefill_kernel(
     }
 
     if (has_state) {
-        for (int64_t col_idx = 0; col_idx < kHeadSize; ++col_idx) {
-            new_state[state_row_base + col_idx] = state[state_row_base + col_idx];
+        const auto* state_vec = reinterpret_cast<const float4*>(state + state_row_base);
+        auto* new_state_vec = reinterpret_cast<float4*>(new_state + state_row_base);
+        #pragma unroll
+        for (int vec_idx = 0; vec_idx < kHeadSize / 4; ++vec_idx) {
+            new_state_vec[vec_idx] = state_vec[vec_idx];
         }
     }
 
@@ -219,20 +222,37 @@ __global__ void gdn_prefill_kernel(
         const float g = expf(-expf(A_log[v_head_idx]) * softplusf_stable(x));
         const float beta = sigmoidf_stable(bf16_to_float(b, gate_base));
 
+        auto* new_state_vec = reinterpret_cast<float4*>(new_state + state_row_base);
+
         float old_v = 0.0f;
-        for (int64_t col_idx = 0; col_idx < kHeadSize; ++col_idx) {
-            old_v += bf16_to_float(k, k_base + col_idx) * (g * new_state[state_row_base + col_idx]);
+        #pragma unroll
+        for (int vec_idx = 0; vec_idx < kHeadSize / 4; ++vec_idx) {
+            const int base = vec_idx * 4;
+            const float4 prev = new_state_vec[vec_idx];
+            old_v += bf16_to_float(k, k_base + base + 0) * (g * prev.x);
+            old_v += bf16_to_float(k, k_base + base + 1) * (g * prev.y);
+            old_v += bf16_to_float(k, k_base + base + 2) * (g * prev.z);
+            old_v += bf16_to_float(k, k_base + base + 3) * (g * prev.w);
         }
 
         const float value_val = bf16_to_float(v, v_base + row_idx);
         const float delta = beta * (value_val - old_v);
 
         float out_acc = 0.0f;
-        for (int64_t col_idx = 0; col_idx < kHeadSize; ++col_idx) {
-            const float updated =
-                g * new_state[state_row_base + col_idx] + bf16_to_float(k, k_base + col_idx) * delta;
-            new_state[state_row_base + col_idx] = updated;
-            out_acc += bf16_to_float(q, q_base + col_idx) * updated;
+        #pragma unroll
+        for (int vec_idx = 0; vec_idx < kHeadSize / 4; ++vec_idx) {
+            const int base = vec_idx * 4;
+            const float4 prev = new_state_vec[vec_idx];
+            float4 updated;
+            updated.x = g * prev.x + bf16_to_float(k, k_base + base + 0) * delta;
+            updated.y = g * prev.y + bf16_to_float(k, k_base + base + 1) * delta;
+            updated.z = g * prev.z + bf16_to_float(k, k_base + base + 2) * delta;
+            updated.w = g * prev.w + bf16_to_float(k, k_base + base + 3) * delta;
+            new_state_vec[vec_idx] = updated;
+            out_acc += bf16_to_float(q, q_base + base + 0) * updated.x;
+            out_acc += bf16_to_float(q, q_base + base + 1) * updated.y;
+            out_acc += bf16_to_float(q, q_base + base + 2) * updated.z;
+            out_acc += bf16_to_float(q, q_base + base + 3) * updated.w;
         }
 
         float_to_bf16(output, out_base, scale * out_acc);
