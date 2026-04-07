@@ -15,9 +15,10 @@
  *   output[vi]          = scale * (g * qs_sum + qk_dot * residual)
  *   new_state[vi,k]     = g * state[vi,k] + k[k] * residual
  *
- * Async copy double buffering: state rows are loaded via cp.async.ca into shared
- * memory with double buffering, so the next row's load overlaps with the
- * current row's compute. Default writeback caching for L2 residency across invocations.
+ * Register-based 2-row software pipelining: state rows are loaded directly into
+ * registers via float4 loads, processing 2 V-rows per iteration with prefetching.
+ * Next 2 rows are prefetched into registers while current 2 rows are computed.
+ * No shared memory needed for state. Default writeback caching for L2 residency.
  */
 
 #include <cuda_runtime.h>
@@ -118,9 +119,7 @@ __global__ void gdn_decode_kernel(
     qk_dot = __shfl_sync(0xffffffff, qk_dot, 0);
 
     // Load v vector into shared memory (all warps cooperate)
-    // Double buffer for async state loads: [warp_id][buffer_idx][k_dim]
     __shared__ float s_v[HEAD_DIM];
-    __shared__ float smem_state[4][2][128];
     {
         // tid maps 1:1 to v indices (128 threads, 128 elements)
         s_v[tid] = __bfloat162float(v[batch * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + tid]);
@@ -137,72 +136,60 @@ __global__ void gdn_decode_kernel(
     // Each warp handles rows_per_warp vi rows within this block's split
     const int vi_start = split_id * rows_per_block + warp_id * rows_per_warp;
 
-    // Compute shared memory addresses for this warp's double buffers
-    const uint32_t smem_addr_buf0 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem_state[warp_id][0][lane * 4]));
-    const uint32_t smem_addr_buf1 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem_state[warp_id][1][lane * 4]));
+    // Prefetch first 2 rows into registers
+    float4 pf_a = *reinterpret_cast<const float4*>(state_base + vi_start * HEAD_DIM + lane * 4);
+    float4 pf_b = *reinterpret_cast<const float4*>(state_base + (vi_start + 1) * HEAD_DIM + lane * 4);
 
-    // Prefetch first row (vi_off=0) into buffer 0
-    {
-        const float* src = state_base + vi_start * HEAD_DIM + lane * 4;
-        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" :: "r"(smem_addr_buf0), "l"(src) : "memory");
-        asm volatile("cp.async.commit_group;\n" ::: "memory");
-    }
+    for (int vi_off = 0; vi_off < rows_per_warp; vi_off += 2) {
+        const int vi_a = vi_start + vi_off;
+        const int vi_b = vi_a + 1;
 
-    for (int vi_off = 0; vi_off < rows_per_warp; vi_off++) {
-        const int vi = vi_start + vi_off;
-        const int cur_buf = vi_off & 1;
-        const int nxt_buf = (vi_off + 1) & 1;
+        // Current rows from prefetched registers
+        float4 st4_a = pf_a;
+        float4 st4_b = pf_b;
 
-        // Prefetch next row into alternate buffer (if exists)
-        if (vi_off + 1 < rows_per_warp) {
-            const float* src_next = state_base + (vi + 1) * HEAD_DIM + lane * 4;
-            uint32_t dst_addr = (nxt_buf == 0) ? smem_addr_buf0 : smem_addr_buf1;
-            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" :: "r"(dst_addr), "l"(src_next) : "memory");
-            asm volatile("cp.async.commit_group;\n" ::: "memory");
+        // Prefetch next 2 rows (if exist)
+        if (vi_off + 2 < rows_per_warp) {
+            pf_a = *reinterpret_cast<const float4*>(state_base + (vi_a + 2) * HEAD_DIM + lane * 4);
+            pf_b = *reinterpret_cast<const float4*>(state_base + (vi_a + 3) * HEAD_DIM + lane * 4);
         }
 
-        // Wait for current row's load to complete
-        // If next prefetch was issued, wait until at most 1 group outstanding; else wait for all
-        if (vi_off + 1 < rows_per_warp) {
-            asm volatile("cp.async.wait_group 1;\n" ::: "memory");
-        } else {
-            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        // Compute dot products for both rows simultaneously
+        float ks_a = k_vals[0]*st4_a.x + k_vals[1]*st4_a.y + k_vals[2]*st4_a.z + k_vals[3]*st4_a.w;
+        float qs_a = q_vals[0]*st4_a.x + q_vals[1]*st4_a.y + q_vals[2]*st4_a.z + q_vals[3]*st4_a.w;
+        float ks_b = k_vals[0]*st4_b.x + k_vals[1]*st4_b.y + k_vals[2]*st4_b.z + k_vals[3]*st4_b.w;
+        float qs_b = q_vals[0]*st4_b.x + q_vals[1]*st4_b.y + q_vals[2]*st4_b.z + q_vals[3]*st4_b.w;
+
+        // Interleaved warp reductions (better ILP)
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            ks_a += __shfl_down_sync(0xffffffff, ks_a, offset);
+            ks_b += __shfl_down_sync(0xffffffff, ks_b, offset);
+            qs_a += __shfl_down_sync(0xffffffff, qs_a, offset);
+            qs_b += __shfl_down_sync(0xffffffff, qs_b, offset);
         }
-        __syncwarp();
 
-        // Read state from shared memory
-        float* cur_smem = &smem_state[warp_id][cur_buf][lane * 4];
-        float state_vals[4] = { cur_smem[0], cur_smem[1], cur_smem[2], cur_smem[3] };
+        // Broadcast ks values to all lanes
+        ks_a = __shfl_sync(0xffffffff, ks_a, 0);
+        ks_b = __shfl_sync(0xffffffff, ks_b, 0);
 
-        // Simultaneous reductions: ks_sum and qs_sum
-        float ks_local = k_vals[0] * state_vals[0] + k_vals[1] * state_vals[1]
-                       + k_vals[2] * state_vals[2] + k_vals[3] * state_vals[3];
-        float qs_local = q_vals[0] * state_vals[0] + q_vals[1] * state_vals[1]
-                       + q_vals[2] * state_vals[2] + q_vals[3] * state_vals[3];
+        // Compute residuals
+        float res_a = beta * (s_v[vi_a] - g * ks_a);
+        float res_b = beta * (s_v[vi_b] - g * ks_b);
 
-        float ks_sum = warp_reduce_sum(ks_local);
-        float qs_sum = warp_reduce_sum(qs_local);
+        // Write new states (float4 stores with default writeback caching for L2 residency)
+        float4 new_a = make_float4(
+            g*st4_a.x + k_vals[0]*res_a, g*st4_a.y + k_vals[1]*res_a,
+            g*st4_a.z + k_vals[2]*res_a, g*st4_a.w + k_vals[3]*res_a);
+        float4 new_b = make_float4(
+            g*st4_b.x + k_vals[0]*res_b, g*st4_b.y + k_vals[1]*res_b,
+            g*st4_b.z + k_vals[2]*res_b, g*st4_b.w + k_vals[3]*res_b);
+        *reinterpret_cast<float4*>(new_state_base + vi_a * HEAD_DIM + lane * 4) = new_a;
+        *reinterpret_cast<float4*>(new_state_base + vi_b * HEAD_DIM + lane * 4) = new_b;
 
-        // Broadcast ks_sum from lane 0 to all lanes
-        ks_sum = __shfl_sync(0xffffffff, ks_sum, 0);
-
-        // Compute residual
-        float residual = beta * (s_v[vi] - g * ks_sum);
-
-        // Write new state with default writeback caching (L2 residency)
-        float4 new_st4;
-        new_st4.x = g * state_vals[0] + k_vals[0] * residual;
-        new_st4.y = g * state_vals[1] + k_vals[1] * residual;
-        new_st4.z = g * state_vals[2] + k_vals[2] * residual;
-        new_st4.w = g * state_vals[3] + k_vals[3] * residual;
-
-        float* new_state_row = new_state_base + vi * HEAD_DIM + lane * 4;
-        *reinterpret_cast<float4*>(new_state_row) = new_st4;
-
-        // Lane 0 writes output
+        // Lane 0 writes outputs
         if (lane == 0) {
-            float out_val = scale * (g * qs_sum + qk_dot * residual);
-            out_base[vi] = __float2bfloat16(out_val);
+            out_base[vi_a] = __float2bfloat16(scale * (g * qs_a + qk_dot * res_a));
+            out_base[vi_b] = __float2bfloat16(scale * (g * qs_b + qk_dot * res_b));
         }
     }
 }

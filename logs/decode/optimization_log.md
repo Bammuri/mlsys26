@@ -35,3 +35,9 @@ Tracking all optimization iterations for the decode kernel.
 - **Result**: 1107.74x → 1303.71x mean speedup (**+17.7%**), max 2547.35x → 2952.71x (+15.9%), min 82.0x → 68.5x
 - **Status**: accepted
 - **Learnings**: L2 residency across kernel invocations was a major win — the `.cs` hint was actively harmful for this workload pattern. Large batch sizes benefited most (L2 bandwidth ~3-5x HBM). Min speedup dropped slightly for one B=1 outlier workload but overall B=1 performance improved. Key lesson: cache hints should match the actual access pattern (repeated invocations = keep in cache), not the single-invocation pattern (read-once = stream). Next opportunities: B=1 split factor tuning, or occupancy improvements.
+
+## 2026-04-07 - Register-Based 2-Row Software Pipelining
+- **Idea**: Replace cp.async shared memory double buffering with register-based float4 loads. Process 2 V-rows per loop iteration with prefetching: load next 2 rows into registers while computing current 2 rows. Eliminates `smem_state[4][2][128]` shared memory, `__syncwarp()` barriers, and halves loop overhead. Interleaved warp reductions for 4 values (ks_a, ks_b, qs_a, qs_b) provide better ILP.
+- **Result**: 1303.71x → 1340.12x mean speedup (**+2.8%**), min 68.50x → 87.54x (+27.8%), max 2952.71x → 3155.02x (+6.8%), latency 0.0192ms → 0.018ms
+- **Status**: accepted
+- **Learnings**: Eliminating shared memory for state reduced overhead, especially for small batches (B=1 min speedup jumped 28%). The 2-row processing amortizes loop overhead and enables interleaved independent shuffles. Register prefetching provides similar latency hiding to cp.async without synchronization costs. Kernel is now deeply memory-bound (~0.375 FLOP/byte arithmetic intensity vs ~37.5 FLOP/byte L2 machine balance). Remaining opportunities: wider blocks for small batches, warp specialization (producer/consumer), or fundamentally different parallelization strategies.
