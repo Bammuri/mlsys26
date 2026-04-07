@@ -60,8 +60,8 @@ Spawn the **`evaluator`** agent (subagent_type=evaluator) with:
 ### Step 6: Evaluate & Decide
 Compare the evaluator's results with previous benchmarks:
 - If improved: update optimization log (Step 7), then commit using `/conventional-commit`
-- If regressed or no change: analyze why, consider reverting or adjusting
-- If correctness fails: revert and try the next-ranked idea from Step 2
+- If regressed or no change: update the bench_history.jsonl entry with `"reverted": true`, revert kernel, and analyze why
+- If correctness fails: update the bench_history.jsonl entry with `"reverted": true`, revert kernel, and try the next-ranked idea from Step 2
 
 ### Step 7: Update Optimization Log
 Append to `logs/<kernel>/optimization_log.md`:

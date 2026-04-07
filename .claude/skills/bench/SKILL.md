@@ -57,7 +57,8 @@ Append to the **kernel-specific** log file:
   "max_speedup": <float>,
   "correctness": {"max_atol": <float>, "max_rtol": <float>, "matched_ratio": <float>},
   "workload_count": <int>,
-  "notes": "<brief description of what changed>"
+  "notes": "<brief description of what changed>",
+  "reverted": false
 }
 ```
 

@@ -35,7 +35,8 @@ Each line is a JSON object:
   "max_speedup": 0.0,
   "correctness": {"max_atol": 0.0, "max_rtol": 0.0, "matched_ratio": 0.0},
   "workload_count": 0,
-  "notes": "description"
+  "notes": "description",
+  "reverted": false
 }
 ```
 

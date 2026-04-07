@@ -46,13 +46,25 @@ for i in $(seq 1 "$MAX_ITER"); do
         ITER_LOG="$LOG_DIR/$kern/iter_${i}.log"
         HISTORY="$LOG_DIR/$kern/bench_history.jsonl"
 
-        # Get baseline speedup before this iteration
-        BEFORE="none"
+        # Get baseline from last non-reverted entry
+        BEFORE_SPEEDUP="none"
+        BEFORE_LATENCY="none"
         if [[ -f "$HISTORY" ]]; then
-            BEFORE=$(tail -1 "$HISTORY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('mean_speedup','?'))" 2>/dev/null || echo "?")
+            read -r BEFORE_SPEEDUP BEFORE_LATENCY < <(python3 -c "
+import json
+last_good = None
+for line in open('$HISTORY'):
+    d = json.loads(line)
+    if not d.get('reverted', False):
+        last_good = d
+if last_good:
+    print(last_good.get('mean_speedup','?'), last_good.get('mean_latency_ms','?'))
+else:
+    print('?', '?')
+" 2>/dev/null || echo "? ?")
         fi
 
-        echo "=== [$kern] Iteration $i/$MAX_ITER (current: ${BEFORE}x) ==="
+        echo "=== [$kern] Iteration $i/$MAX_ITER (current: ${BEFORE_SPEEDUP}x, ${BEFORE_LATENCY}ms) ==="
         echo "    Start: $(date -Iseconds)"
 
         # Snapshot kernel before change for rollback
@@ -72,21 +84,25 @@ for i in $(seq 1 "$MAX_ITER"); do
             RUN_OK=false
         fi
 
-        # Check result
+        # Check result (last entry = this iteration's benchmark)
         if [[ -f "$HISTORY" ]]; then
             LAST=$(tail -1 "$HISTORY")
-            STATUS=$(echo "$LAST" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null || echo "unknown")
-            AFTER=$(echo "$LAST" | python3 -c "import sys,json; print(json.load(sys.stdin).get('mean_speedup','?'))" 2>/dev/null || echo "?")
+            read -r STATUS AFTER_SPEEDUP AFTER_LATENCY < <(echo "$LAST" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(d.get('status','unknown'), d.get('mean_speedup','?'), d.get('mean_latency_ms','?'))
+" 2>/dev/null || echo "unknown ? ?")
         else
             STATUS="unknown"
-            AFTER="?"
+            AFTER_SPEEDUP="?"
+            AFTER_LATENCY="?"
         fi
 
         if [[ "$STATUS" != "pass" || "$RUN_OK" != "true" ]]; then
             echo "    FAIL (status=$STATUS) — rolling back kernel"
             cp "$KERNEL_DIR/kernel.cu.bak" "$KERNEL_DIR/kernel.cu"
         else
-            echo "    PASS: ${BEFORE}x -> ${AFTER}x"
+            echo "    PASS: ${BEFORE_SPEEDUP}x -> ${AFTER_SPEEDUP}x (latency: ${BEFORE_LATENCY}ms -> ${AFTER_LATENCY}ms)"
         fi
 
         # Clean up backup
