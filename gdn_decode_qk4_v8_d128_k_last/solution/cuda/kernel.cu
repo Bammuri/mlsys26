@@ -242,7 +242,9 @@ void gdn_decode(
 
     // Choose split factor to increase SM utilization at small batch sizes
     int split_factor;
-    if (batch_size <= 4) {
+    if (batch_size <= 2) {
+        split_factor = 8;   // 16 V-rows per block, 4 per warp (1 iteration of 4-row pipeline)
+    } else if (batch_size <= 4) {
         split_factor = 4;   // 32 V-rows per block, 8 per warp
     } else if (batch_size <= 16) {
         split_factor = 2;   // 64 V-rows per block, 16 per warp

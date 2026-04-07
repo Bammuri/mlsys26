@@ -65,3 +65,15 @@ Tracking all optimization iterations for the decode kernel.
 - **Result**: 1579.97x → 1430.33x mean speedup (**-9.5%**), min 84.71x → 75.49x, max 3982x → 3610x
 - **Status**: reverted
 - **Learnings**: Shared memory v access is faster than shuffle broadcasts despite the `__syncthreads` cost. Shared memory provides uniform ~28-cycle latency for random access, while shuffle requires an instruction per broadcast. With 4 shuffles per iteration (v_a..v_d) vs one shared memory index per residual, the shuffle overhead exceeded the barrier savings. The kernel is deeply memory-bound on state traffic — v access optimization is not on the critical path.
+
+## 2026-04-07 - __launch_bounds__(128, 12) Occupancy Hint [REVERTED]
+- **Idea**: Add `__launch_bounds__(128, 12)` to target 12 blocks/SM (42 regs/thread), increasing occupancy from ~62.5% to 75%.
+- **Result**: 1579.97x → 1198.84x mean speedup (**-24.1%**), regression across all batch sizes
+- **Status**: reverted
+- **Learnings**: The 42-reg cap caused heavy register spills. The 4-row pipeline naturally uses ~50 regs/thread; forcing 42 regs created local memory traffic that dwarfed any occupancy benefit. The kernel is memory-bound, not occupancy-bound — more warps don't help when each warp's memory traffic increases from spills.
+
+## 2026-04-07 - Split Factor 8 for B≤2
+- **Idea**: Add split=8 tier for B≤2 (rows_per_warp=4, exactly 1 iteration of 4-row pipeline). Doubles SM utilization for B=1 from 22% to 43% (64 blocks vs 32). Previous "aggressive split" attempt used split=16 for B=1 which broke the 4-row pipeline (rows_per_warp=2 < 4); split=8 cleanly matches.
+- **Result**: 1579.97x → 1584.44x mean speedup (**+0.3%**), min 84.71x → 91.09x (**+7.5%**), max 3982x → 3748x (-5.9%), latency 0.0174ms → 0.0164ms (-5.7%)
+- **Status**: accepted
+- **Learnings**: Small-batch (B=1-2) min speedup improved from better SM utilization. Max speedup dropped slightly (run-to-run variance or minor overhead). The 4-row pipeline with rows_per_warp=4 runs a single clean iteration with no prefetch overhead, making split=8 viable where split=16 failed. Kernel is near-optimal for current algorithm; further gains likely require fundamentally different approaches (TMA, tensor cores, or algorithmic changes).
