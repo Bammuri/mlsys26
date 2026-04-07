@@ -85,3 +85,19 @@ Tracking all optimization iterations for the prefill kernel.
 - **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
 - **Status**: accepted
 - **Learnings**: The aggressive split factor thresholds drove the majority of the gain — max speedup jumped 61% (603→973x) indicating mid-batch workloads (num_seqs=3-8) were severely SM-underutilized before. The gate pipelining contributed to latency reduction (6.5%) by overlapping SFU ops for t+1 with FMA ops for t. Min speedup dropped slightly (88→78x) suggesting the smallest workloads pay a minor cost. Unlike the failed SPLIT_FACTOR=16 attempt, this change keeps RPW=4 (good ILP) while using split=8 for MORE workloads. **Key insight: the previous thresholds were set before the warp-parallel redesign and were overly conservative — with zero cross-warp sync, higher split factors are much cheaper than in the old design.**
+
+## 2026-04-07 - q/k/v Register Prefetch Pipeline (REVERTED)
+- **Idea**: Extend gate pipelining to also prefetch q, k, v values for timestep t+1 into spare registers while computing t's FMA/shuffle ops, hiding L2 latency. Required relaxing MIN_BLOCKS<8> from 8 to 6 (64→85 regs/thread target) to accommodate 9 extra pipeline registers (4 q_pipe + 4 k_pipe + 1 v_pipe).
+- **Result**: 331.97x → 204.85x mean speedup (-38.3%), latency 1.286ms → 1.350ms (+5.0%)
+- **Min/Max speedup**: 78.45x/973.45x → 53.98x/632.97x
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: reverted
+- **Learnings**: The occupancy reduction from MIN_BLOCKS 8→6 (25% fewer blocks/SM) devastated performance far more than latency hiding could recover. With SPLIT_FACTOR=8, the kernel is compute-bound with excellent L1/L2 cache hit rates on the small q/k/v data (~520 bytes/warp/timestep), so memory latency hiding provides minimal benefit. **Conclusion: occupancy is critical for this kernel — any optimization that increases register pressure beyond the 64-reg target (MIN_BLOCKS=8) will regress. The register budget is already at capacity.**
+
+## 2026-04-07 - SPLIT_FACTOR=16 with 2 Warps per Block (REVERTED)
+- **Idea**: Add SPLIT_FACTOR=16 with 2 warps (64 threads/block) instead of 4, preserving RPW=4 (same ILP as SPLIT=8). For N=1: 128 blocks (vs 64 with SPLIT=8), doubling SM utilization from 33% to 67%. For N=2: 256 blocks (>100% SM utilization). Threshold: num_seqs<=2 uses SPLIT=16. MIN_BLOCKS<16>=12.
+- **Result**: 331.97x → 228.98x mean speedup (-31.0%), latency 1.286ms → 1.280ms (-0.5%, within noise)
+- **Min/Max speedup**: 78.45x/973.45x → 79.09x/652.59x
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: reverted
+- **Learnings**: Despite doubling SM utilization for N=1, the 2-warp block provides insufficient warp scheduling to hide instruction latency, offsetting the parallelism gain. Mean latency essentially unchanged (noise). The mean speedup drop is primarily reference baseline variance across benchmark runs, not actual regression. **Conclusion: 4 warps per block (128 threads) is the minimum for adequate warp scheduling in the inner loop. SM underutilization for N=1 (33%) cannot be solved by reducing block size — it requires a fundamentally different parallelization strategy (e.g., chunkwise time-parallel decomposition).** Research also confirmed that chunkwise parallelism is likely net-negative because the register-resident sequential kernel at ~42 cycles/timestep already beats chunk-level GEMM approaches on the small 128x128 state matrix.
