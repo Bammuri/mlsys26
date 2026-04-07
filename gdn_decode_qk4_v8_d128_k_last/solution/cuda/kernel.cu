@@ -15,9 +15,9 @@
  *   output[vi]          = scale * (g * qs_sum + qk_dot * residual)
  *   new_state[vi,k]     = g * state[vi,k] + k[k] * residual
  *
- * Async copy double buffering: state rows are loaded via cp.async into shared
+ * Async copy double buffering: state rows are loaded via cp.async.ca into shared
  * memory with double buffering, so the next row's load overlaps with the
- * current row's compute. Cache streaming hints on state writes via st.global.cs.
+ * current row's compute. Default writeback caching for L2 residency across invocations.
  */
 
 #include <cuda_runtime.h>
@@ -144,7 +144,7 @@ __global__ void gdn_decode_kernel(
     // Prefetch first row (vi_off=0) into buffer 0
     {
         const float* src = state_base + vi_start * HEAD_DIM + lane * 4;
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem_addr_buf0), "l"(src) : "memory");
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" :: "r"(smem_addr_buf0), "l"(src) : "memory");
         asm volatile("cp.async.commit_group;\n" ::: "memory");
     }
 
@@ -157,7 +157,7 @@ __global__ void gdn_decode_kernel(
         if (vi_off + 1 < rows_per_warp) {
             const float* src_next = state_base + (vi + 1) * HEAD_DIM + lane * 4;
             uint32_t dst_addr = (nxt_buf == 0) ? smem_addr_buf0 : smem_addr_buf1;
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst_addr), "l"(src_next) : "memory");
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" :: "r"(dst_addr), "l"(src_next) : "memory");
             asm volatile("cp.async.commit_group;\n" ::: "memory");
         }
 
@@ -189,7 +189,7 @@ __global__ void gdn_decode_kernel(
         // Compute residual
         float residual = beta * (s_v[vi] - g * ks_sum);
 
-        // Write new state with cache streaming hint (write-once data)
+        // Write new state with default writeback caching (L2 residency)
         float4 new_st4;
         new_st4.x = g * state_vals[0] + k_vals[0] * residual;
         new_st4.y = g * state_vals[1] + k_vals[1] * residual;
@@ -197,9 +197,7 @@ __global__ void gdn_decode_kernel(
         new_st4.w = g * state_vals[3] + k_vals[3] * residual;
 
         float* new_state_row = new_state_base + vi * HEAD_DIM + lane * 4;
-        asm volatile("st.global.cs.v4.f32 [%0], {%1,%2,%3,%4};"
-            :: "l"(new_state_row),
-            "f"(new_st4.x), "f"(new_st4.y), "f"(new_st4.z), "f"(new_st4.w));
+        *reinterpret_cast<float4*>(new_state_row) = new_st4;
 
         // Lane 0 writes output
         if (lane == 0) {
