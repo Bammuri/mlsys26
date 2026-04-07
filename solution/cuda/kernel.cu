@@ -210,6 +210,10 @@ __global__ void gdn_prefill_kernel(
 
     const int64_t q_head_idx = v_head_idx / (kNumVHeads / kNumQHeads);
     const int64_t k_head_idx = v_head_idx / (kNumVHeads / kNumKHeads);
+    __shared__ __align__(16) float s_q[kHeadSize];
+    __shared__ __align__(16) float s_k[kHeadSize];
+    __shared__ float s_g;
+    __shared__ float s_beta;
 
     for (int64_t token_idx = seq_start; token_idx < seq_end; ++token_idx) {
         const int64_t q_base = ((token_idx * kNumQHeads + q_head_idx) * kHeadSize);
@@ -218,9 +222,14 @@ __global__ void gdn_prefill_kernel(
         const int64_t gate_base = (token_idx * kNumVHeads + v_head_idx);
         const int64_t out_base = ((token_idx * kNumVHeads + v_head_idx) * kHeadSize + row_idx);
 
-        const float x = bf16_to_float(a, gate_base) + dt_bias[v_head_idx];
-        const float g = expf(-expf(A_log[v_head_idx]) * softplusf_stable(x));
-        const float beta = sigmoidf_stable(bf16_to_float(b, gate_base));
+        s_q[row_idx] = bf16_to_float(q, q_base + row_idx);
+        s_k[row_idx] = bf16_to_float(k, k_base + row_idx);
+        if (row_idx == 0) {
+            const float x = bf16_to_float(a, gate_base) + dt_bias[v_head_idx];
+            s_g = expf(-expf(A_log[v_head_idx]) * softplusf_stable(x));
+            s_beta = sigmoidf_stable(bf16_to_float(b, gate_base));
+        }
+        __syncthreads();
 
         auto* new_state_vec = reinterpret_cast<float4*>(new_state + state_row_base);
 
@@ -229,14 +238,14 @@ __global__ void gdn_prefill_kernel(
         for (int vec_idx = 0; vec_idx < kHeadSize / 4; ++vec_idx) {
             const int base = vec_idx * 4;
             const float4 prev = new_state_vec[vec_idx];
-            old_v += bf16_to_float(k, k_base + base + 0) * (g * prev.x);
-            old_v += bf16_to_float(k, k_base + base + 1) * (g * prev.y);
-            old_v += bf16_to_float(k, k_base + base + 2) * (g * prev.z);
-            old_v += bf16_to_float(k, k_base + base + 3) * (g * prev.w);
+            old_v += s_k[base + 0] * (s_g * prev.x);
+            old_v += s_k[base + 1] * (s_g * prev.y);
+            old_v += s_k[base + 2] * (s_g * prev.z);
+            old_v += s_k[base + 3] * (s_g * prev.w);
         }
 
         const float value_val = bf16_to_float(v, v_base + row_idx);
-        const float delta = beta * (value_val - old_v);
+        const float delta = s_beta * (value_val - old_v);
 
         float out_acc = 0.0f;
         #pragma unroll
@@ -244,18 +253,19 @@ __global__ void gdn_prefill_kernel(
             const int base = vec_idx * 4;
             const float4 prev = new_state_vec[vec_idx];
             float4 updated;
-            updated.x = g * prev.x + bf16_to_float(k, k_base + base + 0) * delta;
-            updated.y = g * prev.y + bf16_to_float(k, k_base + base + 1) * delta;
-            updated.z = g * prev.z + bf16_to_float(k, k_base + base + 2) * delta;
-            updated.w = g * prev.w + bf16_to_float(k, k_base + base + 3) * delta;
+            updated.x = s_g * prev.x + s_k[base + 0] * delta;
+            updated.y = s_g * prev.y + s_k[base + 1] * delta;
+            updated.z = s_g * prev.z + s_k[base + 2] * delta;
+            updated.w = s_g * prev.w + s_k[base + 3] * delta;
             new_state_vec[vec_idx] = updated;
-            out_acc += bf16_to_float(q, q_base + base + 0) * updated.x;
-            out_acc += bf16_to_float(q, q_base + base + 1) * updated.y;
-            out_acc += bf16_to_float(q, q_base + base + 2) * updated.z;
-            out_acc += bf16_to_float(q, q_base + base + 3) * updated.w;
+            out_acc += s_q[base + 0] * updated.x;
+            out_acc += s_q[base + 1] * updated.y;
+            out_acc += s_q[base + 2] * updated.z;
+            out_acc += s_q[base + 3] * updated.w;
         }
 
         float_to_bf16(output, out_base, scale * out_acc);
+        __syncthreads();
     }
 }
 
