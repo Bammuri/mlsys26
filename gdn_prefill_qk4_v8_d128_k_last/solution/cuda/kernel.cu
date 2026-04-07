@@ -113,14 +113,29 @@ __global__ __launch_bounds__(128, MIN_BLOCKS<SPLIT_FACTOR>) void gdn_prefill_ker
 
     const float A_val = A_log[vh];
     const float dt_val = dt_bias[vh];
+    const float exp_A = expf(A_val);
+
+    // Gate pipeline: precompute gates for first timestep
+    float g_pipe, beta_pipe;
+    {
+        const int t0 = (int)seq_start;
+        g_pipe = expf(-exp_A * softplus(__bfloat162float(a[t0 * NUM_V_HEADS + vh]) + dt_val));
+        beta_pipe = 1.0f / (1.0f + expf(-__bfloat162float(b_gate[t0 * NUM_V_HEADS + vh])));
+    }
 
     for (int t_offset = 0; t_offset < seq_len; t_offset++) {
         const int t = (int)seq_start + t_offset;
 
-        // Gates (all threads compute same scalars)
-        float a_val = __bfloat162float(a[t * NUM_V_HEADS + vh]);
-        float g = expf(-expf(A_val) * softplus(a_val + dt_val));
-        float beta = 1.0f / (1.0f + expf(-__bfloat162float(b_gate[t * NUM_V_HEADS + vh])));
+        // Gates from pipeline (precomputed in previous iteration or prologue)
+        float g = g_pipe;
+        float beta = beta_pipe;
+
+        // Pipeline: precompute gates for next timestep (SFU overlaps with FMA below)
+        if (t_offset + 1 < seq_len) {
+            float a_next = __bfloat162float(a[(t + 1) * NUM_V_HEADS + vh]);
+            g_pipe = expf(-exp_A * softplus(a_next + dt_val));
+            beta_pipe = 1.0f / (1.0f + expf(-__bfloat162float(b_gate[(t + 1) * NUM_V_HEADS + vh])));
+        }
 
         // Each thread loads 4 contiguous k and q values
         const int kq_offset = t * NUM_K_HEADS * HEAD_DIM + qkh * HEAD_DIM + lane * 4;
@@ -253,9 +268,9 @@ void gdn_prefill(
 
     // Choose split factor based on batch size for SM utilization
     int split_factor;
-    if (num_seqs <= 2)       split_factor = 8;
-    else if (num_seqs <= 6)  split_factor = 4;
-    else if (num_seqs <= 16) split_factor = 2;
+    if (num_seqs <= 8)       split_factor = 8;
+    else if (num_seqs <= 16) split_factor = 4;
+    else if (num_seqs <= 32) split_factor = 2;
     else                     split_factor = 1;
 
     dim3 grid(num_seqs * NUM_V_HEADS * split_factor);

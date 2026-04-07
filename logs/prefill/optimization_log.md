@@ -77,3 +77,11 @@ Tracking all optimization iterations for the prefill kernel.
 - **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
 - **Status**: reverted
 - **Learnings**: The reduced per-warp ILP (2 rows → 4 interleaved reductions instead of 8) outweighs the SM utilization benefit. With RPW=2, each timestep has only 20 shuffles (vs 44 for RPW=4), meaning less opportunity to overlap shuffles with FMA compute. The mean latency being identical confirms the speedup drop is benchmark noise in the reference baseline, not actual regression. However, the approach provides no improvement either. **Conclusion: SPLIT_FACTOR=8 (RPW=4) is the optimal split for N=1. Higher splits sacrifice too much per-warp compute density.**
+
+## 2026-04-07 - Gate Pipeline + exp_A Precomputation + Aggressive Split Thresholds
+- **Idea**: Three combined optimizations: (1) Precompute `exp_A = expf(A_val)` outside the timestep loop (loop-invariant, saves 1 SFU/timestep). (2) Software-pipeline gate computation: precompute next timestep's gates (SFU ops: expf, log1pf, sigmoid) while processing current timestep's vi rows (FMA ops), exploiting SFU/FMA pipeline concurrency. (3) Extend split=8 threshold from num_seqs≤2 to ≤8, split=4 from ≤6 to ≤16, split=2 from ≤16 to ≤32, to eliminate SM idle waste for mid-batch workloads (e.g., num_seqs=3 went from 96→192 blocks, 50%→100% SM utilization).
+- **Result**: 254.16x → 331.97x mean speedup (+30.6%), latency 1.375ms → 1.286ms (-6.5%)
+- **Min/Max speedup**: 87.96x/603.22x → 78.45x/973.45x
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: accepted
+- **Learnings**: The aggressive split factor thresholds drove the majority of the gain — max speedup jumped 61% (603→973x) indicating mid-batch workloads (num_seqs=3-8) were severely SM-underutilized before. The gate pipelining contributed to latency reduction (6.5%) by overlapping SFU ops for t+1 with FMA ops for t. Min speedup dropped slightly (88→78x) suggesting the smallest workloads pay a minor cost. Unlike the failed SPLIT_FACTOR=16 attempt, this change keeps RPW=4 (good ILP) while using split=8 for MORE workloads. **Key insight: the previous thresholds were set before the warp-parallel redesign and were overly conservative — with zero cross-warp sync, higher split factors are much cheaper than in the old design.**
