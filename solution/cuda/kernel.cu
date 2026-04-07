@@ -237,19 +237,10 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
     scale = 1.0 / std::sqrt(static_cast<double>(kHeadSize));
   }
 
-  q = q.contiguous();
-  k = k.contiguous();
-  v = v.contiguous();
-  A_log = A_log.contiguous();
-  a = a.contiguous();
-  dt_bias = dt_bias.contiguous();
-  b = b.contiguous();
-  cu_seqlens = cu_seqlens.contiguous();
-
   bool has_state = state.has_value() && state.value().defined();
   torch::Tensor state_in;
   if (has_state) {
-    state_in = state.value().contiguous();
+    state_in = state.value();
     CHECK_CUDA(state_in);
     CHECK_CONTIGUOUS(state_in);
     CHECK_F32(state_in);
@@ -257,9 +248,11 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
 
   int64_t num_seqs = cu_seqlens.numel() - 1;
   auto output = torch::empty({q.size(0), kNumVHeads, kHeadSize}, q.options());
-  auto new_state = torch::empty(
-      {num_seqs, kNumVHeads, kHeadSize, kHeadSize},
-      torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+  auto new_state = has_state
+      ? state_in
+      : torch::empty(
+            {num_seqs, kNumVHeads, kHeadSize, kHeadSize},
+            torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
   auto gate_beta = torch::empty(
       {q.size(0), kNumVHeads, 2},
       torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
