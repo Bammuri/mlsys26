@@ -156,10 +156,18 @@ __global__ void gdn_decode_kernel(
 inline void configure_decode_kernel_launch() {
     static std::once_flag once;
     std::call_once(once, []() {
-        const auto err = cudaFuncSetCacheConfig(gdn_decode_kernel, cudaFuncCachePreferL1);
+        auto err = cudaFuncSetCacheConfig(gdn_decode_kernel, cudaFuncCachePreferL1);
         TORCH_CHECK(
             err == cudaSuccess,
             "gdn_decode cache config setup failed: ",
+            cudaGetErrorString(err));
+        err = cudaFuncSetAttribute(
+            gdn_decode_kernel,
+            cudaFuncAttributePreferredSharedMemoryCarveout,
+            0);
+        TORCH_CHECK(
+            err == cudaSuccess,
+            "gdn_decode carveout setup failed: ",
             cudaGetErrorString(err));
     });
 }
