@@ -1,8 +1,6 @@
 #include <torch/extension.h>
 
-#include <tuple>
-
-std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
+void gdn_prefill_cuda(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
@@ -12,9 +10,11 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill_cuda(
     torch::Tensor dt_bias,
     torch::Tensor b,
     torch::Tensor cu_seqlens,
-    double scale);
+    double scale,
+    torch::Tensor output,
+    torch::Tensor new_state);
 
-std::tuple<torch::Tensor, torch::Tensor> run(
+void run(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
@@ -24,8 +24,22 @@ std::tuple<torch::Tensor, torch::Tensor> run(
     torch::Tensor dt_bias,
     torch::Tensor b,
     torch::Tensor cu_seqlens,
-    double scale) {
-  return gdn_prefill_cuda(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale);
+    double scale,
+    torch::Tensor output,
+    torch::Tensor new_state) {
+  gdn_prefill_cuda(
+      q,
+      k,
+      v,
+      state,
+      A_log,
+      a,
+      dt_bias,
+      b,
+      cu_seqlens,
+      scale,
+      output,
+      new_state);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
