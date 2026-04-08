@@ -242,7 +242,7 @@ def download_remote_artifact(remote_artifact_path: str, definition: str) -> Path
             "get",
             "flashinfer-bench-results",
             volume_relative_path,
-            str(local_path),
+            str(local_dir),
             "--force",
         ],
         cwd=PROJECT_ROOT,
