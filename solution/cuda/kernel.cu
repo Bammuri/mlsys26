@@ -199,12 +199,17 @@ __global__ void gdn_prefill_kernel(
         return;
     }
 
+    float4 state_frag[kHeadSize / 4];
     if (has_state) {
         const auto* state_vec = reinterpret_cast<const float4*>(state + state_row_base);
-        auto* new_state_vec = reinterpret_cast<float4*>(new_state + state_row_base);
         #pragma unroll
         for (int vec_idx = 0; vec_idx < kHeadSize / 4; ++vec_idx) {
-            new_state_vec[vec_idx] = state_vec[vec_idx];
+            state_frag[vec_idx] = state_vec[vec_idx];
+        }
+    } else {
+        #pragma unroll
+        for (int vec_idx = 0; vec_idx < kHeadSize / 4; ++vec_idx) {
+            state_frag[vec_idx] = make_float4(0.f, 0.f, 0.f, 0.f);
         }
     }
 
@@ -222,13 +227,11 @@ __global__ void gdn_prefill_kernel(
         const float g = expf(-expf(A_log[v_head_idx]) * softplusf_stable(x));
         const float beta = sigmoidf_stable(bf16_to_float(b, gate_base));
 
-        auto* new_state_vec = reinterpret_cast<float4*>(new_state + state_row_base);
-
         float old_v = 0.0f;
         #pragma unroll
         for (int vec_idx = 0; vec_idx < kHeadSize / 4; ++vec_idx) {
             const int base = vec_idx * 4;
-            const float4 prev = new_state_vec[vec_idx];
+            const float4 prev = state_frag[vec_idx];
             old_v += bf16_to_float(k, k_base + base + 0) * (g * prev.x);
             old_v += bf16_to_float(k, k_base + base + 1) * (g * prev.y);
             old_v += bf16_to_float(k, k_base + base + 2) * (g * prev.z);
@@ -242,13 +245,13 @@ __global__ void gdn_prefill_kernel(
         #pragma unroll
         for (int vec_idx = 0; vec_idx < kHeadSize / 4; ++vec_idx) {
             const int base = vec_idx * 4;
-            const float4 prev = new_state_vec[vec_idx];
+            const float4 prev = state_frag[vec_idx];
             float4 updated;
             updated.x = g * prev.x + bf16_to_float(k, k_base + base + 0) * delta;
             updated.y = g * prev.y + bf16_to_float(k, k_base + base + 1) * delta;
             updated.z = g * prev.z + bf16_to_float(k, k_base + base + 2) * delta;
             updated.w = g * prev.w + bf16_to_float(k, k_base + base + 3) * delta;
-            new_state_vec[vec_idx] = updated;
+            state_frag[vec_idx] = updated;
             out_acc += bf16_to_float(q, q_base + base + 0) * updated.x;
             out_acc += bf16_to_float(q, q_base + base + 1) * updated.y;
             out_acc += bf16_to_float(q, q_base + base + 2) * updated.z;
@@ -256,6 +259,12 @@ __global__ void gdn_prefill_kernel(
         }
 
         float_to_bf16(output, out_base, scale * out_acc);
+    }
+
+    auto* new_state_vec = reinterpret_cast<float4*>(new_state + state_row_base);
+    #pragma unroll
+    for (int vec_idx = 0; vec_idx < kHeadSize / 4; ++vec_idx) {
+        new_state_vec[vec_idx] = state_frag[vec_idx];
     }
 }
 
