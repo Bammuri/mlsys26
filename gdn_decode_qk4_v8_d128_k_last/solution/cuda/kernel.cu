@@ -49,7 +49,8 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 /*
  * V-split blocks: each (batch, v_head) can be split across multiple blocks.
  * Grid: (B * NUM_V_HEADS * split_factor,)
- * Block: (128,) = 4 warps, each warp handles rows_per_warp vi rows
+ * Block: 128 threads (4 warps) for B<=16, 256 threads (8 warps) for B>16.
+ * Each warp handles rows_per_warp vi rows.
  */
 __global__ void gdn_decode_kernel(
     const bf16* __restrict__ q,         // [B, 1, 4, 128]
@@ -75,11 +76,12 @@ __global__ void gdn_decode_kernel(
     const int qkh = vh / V_PER_Q;
     const int tid = threadIdx.x;
 
-    const int warp_id = tid / 32;     // 0..3
+    const int warp_id = tid / 32;     // 0..3 or 0..7
     const int lane = tid % 32;        // 0..31
 
     const int rows_per_block = HEAD_DIM / split_factor;  // 128/split
-    const int rows_per_warp = rows_per_block / 4;        // per warp
+    const int num_warps = blockDim.x / 32;
+    const int rows_per_warp = rows_per_block / num_warps;  // per warp
 
     // Compute gates (uniform across all threads in block)
     float a_val = __bfloat162float(a[batch * NUM_V_HEADS + vh]);
@@ -121,8 +123,10 @@ __global__ void gdn_decode_kernel(
     // Load v vector into shared memory (all warps cooperate)
     __shared__ float s_v[HEAD_DIM];
     {
-        // tid maps 1:1 to v indices (128 threads, 128 elements)
-        s_v[tid] = __bfloat162float(v[batch * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + tid]);
+        // Only first HEAD_DIM threads load (handles 256-thread blocks)
+        if (tid < HEAD_DIM) {
+            s_v[tid] = __bfloat162float(v[batch * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + tid]);
+        }
     }
     __syncthreads();
 
@@ -256,8 +260,11 @@ void gdn_decode(
     cudaStream_t stream = static_cast<cudaStream_t>(
         TVMFFIEnvGetStream(dev.device_type, dev.device_id));
 
+    // Use 8 warps (256 threads) for large batches (B>16, sf=1) to better utilize SMs
+    int block_size = (batch_size > 16) ? 256 : 128;
+
     dim3 grid(batch_size * NUM_V_HEADS * split_factor);
-    dim3 block(HEAD_DIM);
+    dim3 block(block_size);
 
     gdn_decode_kernel<<<grid, block, 0, stream>>>(
         static_cast<const bf16*>(q.data_ptr()),

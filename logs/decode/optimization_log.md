@@ -102,3 +102,9 @@ Tracking all optimization iterations for the decode kernel.
 - **Key constraint**: 64 blocks (B=1, split=8) for 148 SMs — 43% SM coverage, most SMs idle
 - **Attempted fixes**: reducing block size, reducing register count — both regressed due to fewer warps per SM or register spills
 - **Conclusion**: B=1 performance is fundamentally limited by launch overhead + insufficient parallelism. The 4-warp/block × 64-reg/thread configuration is a local optimum: reducing either dimension hurts latency hiding or causes spills.
+
+## 2026-04-08 - 8-Warp Blocks for Large Batches (B>16)
+- **Idea**: Use 256-thread blocks (8 warps) instead of 128-thread (4 warps) for B>16. Each warp handles 16 V-rows (4 iterations of 4-row pipeline). Doubles warps/SM from ~7 to ~14 for B=32 and ~14 to ~28 for B=64, improving warp scheduler latency hiding for the memory-bound kernel. B<=16 unchanged.
+- **Result**: 1584.44x → 1737.91x mean speedup (**+9.7%**), min 91.09x → 88.89x (-2.4%), max 3748x → 4663x (**+24.4%**)
+- **Status**: accepted
+- **Learnings**: NCU confirmed B=48/64 had only 0.32-0.43 waves/SM and 15-20% achieved occupancy with 4-warp blocks. 8 warps doubles the warp count per SM, enabling better memory latency hiding. Large-batch max speedup jumped 24.4%, confirming the improvement. Small-batch min speedup unchanged (within Modal variance). This is the reverse of the failed 2-warp experiment — more warps per SM helps, fewer hurts. The kernel remains register-limited at 64 regs/thread.

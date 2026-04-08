@@ -171,3 +171,11 @@ Tracking all optimization iterations for the prefill kernel.
 - **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
 - **Status**: accepted
 - **Learnings**: The +30.4% mean speedup with flat latency confirms the gain is from better SM utilization on small-N workloads (max speedup 872→1188x, +36%). Min speedup unchanged (80x), showing no regression on large-N workloads which still use SF=8. **The key insight is that SF=16 REQUIRES 8 warps (2 warps/scheduler) to work — all previous SF=16 attempts had ≤1 warp/scheduler and failed. The warp/scheduler ratio is a prerequisite for any split factor change.** The reduced per-warp ILP (RPW=1 vs RPW=2) is fully compensated by (a) 2x more blocks for SM coverage and (b) lower register pressure enabling 6 blocks/SM capacity.
+
+## 2026-04-08 - Universal SF=16 Dispatch (REVERTED)
+- **Idea**: Remove adaptive SF dispatch and always use SPLIT_FACTOR=16 (RPW=1) for all workloads. Hypothesis: SF=16's higher occupancy (MIN_BLOCKS=6 vs 4) would benefit medium/large-N workloads similarly to how universal SF=8 beat adaptive SF=8/4/1.
+- **Result**: 404.93x → 332.60x mean speedup (-17.9%), latency 0.777ms → 0.798ms (+2.7%)
+- **Min/Max speedup**: 80.65x/1187.79x → 77.64x/802.62x
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: reverted
+- **Learnings**: RPW=1 has 20% more shuffle overhead per vi-row than RPW=2 (18 vs 15 shuffles/vi-row) due to worse amortization of the fixed per-timestep qk_dot cost. For N>2, the higher occupancy from MIN_BLOCKS=6 does NOT offset this per-vi-row penalty. The adaptive dispatch correctly matches SF to workload: RPW=1 for small N (SM utilization matters), RPW=2 for larger N (per-warp efficiency matters). **Universal SF logic only works when the per-row overhead difference is small — the jump from SF=4→SF=8 (RPW=8→4) had minimal overhead difference, but SF=8→SF=16 (RPW=2→1) crosses a threshold where fixed costs dominate.**
