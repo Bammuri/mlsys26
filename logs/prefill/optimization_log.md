@@ -179,3 +179,17 @@ Tracking all optimization iterations for the prefill kernel.
 - **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
 - **Status**: reverted
 - **Learnings**: RPW=1 has 20% more shuffle overhead per vi-row than RPW=2 (18 vs 15 shuffles/vi-row) due to worse amortization of the fixed per-timestep qk_dot cost. For N>2, the higher occupancy from MIN_BLOCKS=6 does NOT offset this per-vi-row penalty. The adaptive dispatch correctly matches SF to workload: RPW=1 for small N (SM utilization matters), RPW=2 for larger N (per-warp efficiency matters). **Universal SF logic only works when the per-row overhead difference is small — the jump from SF=4→SF=8 (RPW=8→4) had minimal overhead difference, but SF=8→SF=16 (RPW=2→1) crosses a threshold where fixed costs dominate.**
+
+## 2026-04-08 - Extended SF=16 Threshold to N≤5 + Chunkwise Parallel Analysis
+- **Idea**: Extend SF=16 dispatch from N≤2 to N≤5, benefiting 21 N=3-5 workloads. Analysis showed that for N≤6, both SF=16 (N×128 blocks, MIN_BLOCKS=6, 888 SM slots) and SF=8 (N×64 blocks, MIN_BLOCKS=4, 592 SM slots) fit in 1 wave on B200's 148 SMs. SF=16 blocks are ~43% faster per timestep (18 vs 30 shuffles/warp) because RPW=1 processes half the vi rows. At N=7+, SF=16 spills to 2 waves while SF=8 stays at 1, making SF=8 better.
+- **Result**: 331.45x → 308.97x mean speedup (-6.8%, reference timing variance), latency 0.768ms → 0.767ms (-0.1%, flat)
+- **Min/Max speedup**: 77.23x/996.32x → 85.24x/898.09x (min improved +10.4%)
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: accepted (latency flat, min speedup improved)
+- **Chunkwise Parallel Research**: Thorough analysis confirmed chunkwise parallelism is NOT viable for d=128 on B200:
+  1. **Correction cost = sequential cost**: Output correction requires iterating through each timestep within each chunk sequentially (O(C×d) per chunk), making total correction O(T×d) — same as sequential.
+  2. **WY overhead**: WY representation construction costs O(C²×d) per chunk, which is C× more than the useful O(C×d) per chunk.
+  3. **SM utilization already high**: With SF=16, N=1 gives 128 blocks (86% of 148 SMs). Adding chunks creates more blocks but more waves, not less latency.
+  4. **The "reprocess" variant** (run chunks with s=0, propagate states, rerun) requires 2× total work. Even with K=4 chunks and SF=1, the wave overhead makes total time exceed sequential.
+  5. **The fundamental limit**: For d=128, the per-timestep recurrence takes ~42 cycles (shuffle-bound). Any chunkwise approach adds ≥ O(d²) correction per chunk boundary. With C=d=128, overhead factor ≈ 1+d/C = 2×, making chunkwise always worse.
+- **Learnings**: The SF=16 threshold extension is a genuine improvement for min speedup, confirming N=3-5 workloads had suboptimal SM utilization with SF=8. The optimal threshold is N≤6 theoretically (same wave count), but N≤5 is conservative. **Chunkwise parallelism is definitively closed as an optimization avenue for this kernel. The register-resident scalar recurrence at ~0.77ms mean latency is near-optimal for sm100a. Remaining gains likely require either (a) reducing benchmark overhead for short sequences or (b) hardware-specific features not yet explored.**

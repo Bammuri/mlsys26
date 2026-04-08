@@ -293,9 +293,9 @@ void gdn_prefill(
         );
     };
 
-    // SF=16 for small N: RPW=1 with 8 warps, 2x more blocks for SM utilization
-    // SF=8 for larger N: RPW=2 for 2-row interleaved ILP
-    if (num_seqs <= 2) {
+    // SF=16 for N<=5: RPW=1 with 8 warps, 2x blocks for SM utilization (both SF fit in 1 wave for N<=6)
+    // SF=8 for N>5: RPW=2 for 2-row interleaved ILP (fewer waves needed at high N)
+    if (num_seqs <= 5) {
         launch(gdn_prefill_kernel<16>, 16);
     } else {
         launch(gdn_prefill_kernel<8>, 8);

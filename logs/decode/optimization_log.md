@@ -108,3 +108,64 @@ Tracking all optimization iterations for the decode kernel.
 - **Result**: 1584.44x → 1737.91x mean speedup (**+9.7%**), min 91.09x → 88.89x (-2.4%), max 3748x → 4663x (**+24.4%**)
 - **Status**: accepted
 - **Learnings**: NCU confirmed B=48/64 had only 0.32-0.43 waves/SM and 15-20% achieved occupancy with 4-warp blocks. 8 warps doubles the warp count per SM, enabling better memory latency hiding. Large-batch max speedup jumped 24.4%, confirming the improvement. Small-batch min speedup unchanged (within Modal variance). This is the reverse of the failed 2-warp experiment — more warps per SM helps, fewer hurts. The kernel remains register-limited at 64 regs/thread.
+
+## 2026-04-08 - Extend 8-Warp to Medium Batches (B>2 and B>4) [REVERTED]
+- **Idea**: Two attempts to extend 8-warp blocks below B>16. (1) B>2 threshold: 8 warps for B=3-64. (2) B>4 threshold: 8 warps for B=5-64 only, keeping B=3-4 at 4 warps.
+- **Result**: B>2: 1737.91x → 1423.37x (**-18.1%**). B>4: 1737.91x → 1620.63x (**-6.7%**).
+- **Status**: reverted (both)
+- **Learnings**: 8-warp blocks consistently hurt medium batches (B=4-16). For B=4 (sf=4, 8 warps), rows_per_warp=4 (only 1 pipeline iteration) — too little work per warp. For B=5-16 (sf=2, 8 warps), rows_per_warp=8 (2 iterations) — still worse than 4 warps with rows_per_warp=16. The likely explanation: medium batches already have adequate blocks/SM coverage (128-256 blocks for 148 SMs), so more warps per block just increases per-block register footprint (16384 vs 8192 regs) without enough latency-hiding benefit. **8-warp blocks only help when blocks/SM is very low (B>16, sf=1, 3.5 blocks/SM avg).**
+
+## 2026-04-08 - Python Binding with Custom NVCC Flags [REVERTED]
+- **Idea**: Switch from CUDA to Python solution to pass custom NVCC flags: `-O3` (vs default `-O2`), `--use_fast_math`, and `-arch=sm_100a` (vs default `sm_100`). Default TVM FFI build uses `-O2 -gencode=arch=compute_XX,code=sm_XX` with auto-detected arch.
+- **Result**: 1737.91x → 1520.34x mean speedup (**-12.5%**), but absolute latency improved 0.0184ms → 0.0167ms (**-9.2%**).
+- **Status**: reverted (inconclusive — likely Modal reference timing variance)
+- **Learnings**: The Python binding compiles and runs correctly. Absolute latency improved, suggesting custom flags may help, but speedup metric dropped due to Modal reference variance. Correctness unchanged (max_atol=3.05e-05). **Key discovery**: default TVM FFI build targets sm_100 (not sm_100a) and uses -O2. The Python binding approach is proven viable for future use if we need custom compilation flags. Need A/B testing within same Modal invocation for reliable comparison.
+
+## 2026-04-08 - sf=4 for B≤16 (Extend Split Factor) [REVERTED]
+- **Idea**: Extend sf=4 from B≤4 to B≤16, removing the sf=2 tier. B=5-16 get 2x grid size (e.g., B=8: 128→256 blocks). rows_per_warp drops from 16 to 8 (4→2 iterations of 4-row pipeline).
+- **Result**: 1737.91x → 1541.14x mean speedup (**-11.3%**), but absolute latency improved 0.0184ms → 0.017ms
+- **Status**: reverted (regression, though partly Modal variance)
+- **Learnings**: Doubling block count for B=5-16 did not compensate for halving pipeline iterations. 2 iterations of 4-row pipeline has less latency-hiding overlap than 4 iterations.
+
+## 2026-04-08 - sf=8 for ALL B≤16 (Maximum Split) [REVERTED]
+- **Idea**: Use sf=8 for all B≤16 (unified with B≤2 config). B=5-16 get 4x grid size (e.g., B=8: 128→512 blocks, B=16: 256→1024 blocks). rows_per_warp=4 (1 iteration of 4-row pipeline, no prefetch overlap).
+- **Result**: 1737.91x → 1597.85x mean speedup (**-8.1%**), absolute latency 0.0167ms
+- **Status**: reverted
+- **Learnings**: Even with 4x more blocks for B=5-16, the single-iteration pipeline (no load/compute overlap) and 20% per-block overhead ratio outweighed the SM utilization gains. **Key insight from NCU profiling**: B=5-16 medium batches are grid-limited (0.11-0.22 waves/SM) but the kernel's performance is more sensitive to per-warp pipeline depth than SM coverage. The 4-row pipeline with 4+ iterations is a hard requirement for good performance.
+
+## 2026-04-08 - Updated NCU Profiling Analysis
+- **NCU metrics across batch sizes**:
+  | B   | Grid | Waves/SM | Ach.Occ | Mem TP | Comp TP | Duration |
+  |-----|------|----------|---------|--------|---------|----------|
+  | 1   | 64   | 0.05     | 5.9%    | 1.7%   | 2.0%    | 5.70μs   |
+  | 4   | 128  | 0.11     | 5.9%    | 5.4%   | 5.2%    | 7.17μs   |
+  | 8   | 128  | 0.11     | 6.1%    | 7.7%   | 6.7%    | 8.22μs   |
+  | 16  | 256  | 0.22     | 10.0%   | 16.6%  | 13.8%   | 8.90μs   |
+  | 32  | 256  | 0.43     | 20.7%   | 27.7%  | 22.8%   | 10.37μs  |
+  | 64  | 512  | 0.86     | 38.7%   | 41.3%  | 34.6%   | 13.79μs  |
+- **Universal constraint**: 64 regs/thread → 50% theoretical occupancy → max 4 blocks/SM (256 threads) or 8 blocks/SM (128 threads)
+- **No spills**: Local memory spilling = 0 across all batch sizes
+- **L2 hit rate**: near 0% for B≥8 (state doesn't benefit from L2 within single invocation; cross-invocation benefit captured by benchmark's repeated calls)
+- **B200 DRAM bandwidth utilization**: B=64 at ~58% of peak (64MB state / 8TB/s DRAM = 8μs theoretical vs 13.79μs actual)
+- **Conclusion**: Kernel is approaching practical bandwidth limits. Further gains require either reducing register count below 64 (all attempts caused spills or pipeline degradation) or fundamentally different approaches (persistent kernels, tensor cores, algorithmic changes).
+
+## 2026-04-08 - Two-Kernel Dispatch: Simple 1-Row + Pipelined 4-Row [REVERTED]
+- **Idea**: Separate kernel function `gdn_decode_kernel_simple` for B≤16. Processes one V-row per loop iteration (no 4-row batching, no register prefetching). Uses sf=8 with 128-thread blocks. The hypothesis: fewer live registers → compiler produces lower register binary → higher occupancy.
+- **Result**: 1737.91x → 1361.97x mean speedup (**-21.6%**), absolute latency 0.017ms
+- **Status**: reverted
+- **Learnings**: The 1-row kernel is fundamentally worse than the 4-row pipeline regardless of register count or occupancy. Key reasons: (1) Only 2 warp reductions per iteration (ks, qs) vs 8 interleaved reductions in 4-row — poor ILP. (2) No load/compute overlap since only one state row is in-flight per warp. (3) The warp scheduler cannot compensate for intra-warp ILP loss with inter-warp parallelism at these occupancy levels. **Critical insight**: For this kernel, per-warp ILP (from batched dot products) is more important than occupancy. Any optimization that reduces pipeline depth will regress, regardless of block count or warp count.
+
+## 2026-04-08 - Optimization Ceiling Analysis
+After 25 benchmark runs and 16 optimization attempts (7 accepted, 9 reverted):
+- **Best result**: 1737.91x mean speedup (entry #19)
+- **Progression**: 396x → 888x → 1046x → 1079x → 1108x → 1304x → 1340x → 1580x → 1584x → 1738x
+- **Key accepted optimizations**: loop fusion (+124%), V-split (+18%), L2 residency (+18%), 4-row pipeline (+18%), 8-warp B>16 (+10%)
+- **Binding constraints**: 64 regs/thread (50% theoretical occupancy), memory-bound at ~58% DRAM utilization
+- **What doesn't work**: reducing pipeline depth (ILP loss), reducing register count (__launch_bounds__ spills), increasing split factor (overhead > utilization gain), alternative data paths (shared memory v, shuffle broadcasts)
+- **Remaining opportunities**: persistent kernels (complex + risky with TVM FFI), tensor cores for state dot products (degenerate matrix dimensions)
+
+## 2026-04-08 - Python Binding -O3 --use_fast_math -arch=sm_100a (tvm_ffi.cpp.load) [REVERTED]
+- **Idea**: Python solution wrapping the same kernel.cu, compiled via `tvm_ffi.cpp.load()` with `extra_cuda_cflags=["-O3", "--use_fast_math"]` and `TVM_FFI_CUDA_ARCH_LIST=10.0a`. Zero kernel code changes — compilation-only optimization.
+- **Result**: 1737.91x → 1583.45x mean speedup (**-8.9%**), absolute latency 0.0167ms (vs 0.0184ms baseline = -9.2%)
+- **Status**: reverted (inconclusive — Modal variance, second attempt confirming entry #22's result)
+- **Learnings**: Two independent Python binding runs (#22: 1520x, #26: 1583x) both show ~0.0167ms absolute latency. The CUDA build also shows similar latencies in recent runs (0.0149-0.0191ms range). **Conclusion**: -O3 / --use_fast_math / sm_100a compilation flags provide no measurable improvement over the default -O2 / sm_100 build. The kernel's hot loop (float4 loads, FMAs, shuffles) is not sensitive to optimization level or fast-math since it uses no transcendental functions. The gate computation (expf, log1pf) that would benefit from fast-math runs once per block — negligible. Python solution kept in `solution/python/` as backup but config.toml reverted to CUDA.
