@@ -269,8 +269,7 @@ void gdn_prefill(
     // Choose split factor based on batch size for SM utilization
     int split_factor;
     if (num_seqs <= 8)       split_factor = 8;
-    else if (num_seqs <= 16) split_factor = 4;
-    else if (num_seqs <= 32) split_factor = 2;
+    else if (num_seqs <= 64) split_factor = 4;
     else                     split_factor = 1;
 
     dim3 grid(num_seqs * NUM_V_HEADS * split_factor);
@@ -303,7 +302,6 @@ void gdn_prefill(
     switch (split_factor) {
         case 8:  launch(gdn_prefill_kernel<8>); break;
         case 4:  launch(gdn_prefill_kernel<4>); break;
-        case 2:  launch(gdn_prefill_kernel<2>); break;
         default: launch(gdn_prefill_kernel<1>); break;
     }
 }

@@ -77,3 +77,28 @@ Tracking all optimization iterations for the decode kernel.
 - **Result**: 1579.97x → 1584.44x mean speedup (**+0.3%**), min 84.71x → 91.09x (**+7.5%**), max 3982x → 3748x (-5.9%), latency 0.0174ms → 0.0164ms (-5.7%)
 - **Status**: accepted
 - **Learnings**: Small-batch (B=1-2) min speedup improved from better SM utilization. Max speedup dropped slightly (run-to-run variance or minor overhead). The 4-row pipeline with rows_per_warp=4 runs a single clean iteration with no prefetch overhead, making split=8 viable where split=16 failed. Kernel is near-optimal for current algorithm; further gains likely require fundamentally different approaches (TMA, tensor cores, or algorithmic changes).
+
+## 2026-04-08 - 2-Warp Blocks (64 threads/block) [REVERTED]
+- **Idea**: Reduce block size from 128 to 64 threads (2 warps). Doubles grid size for better SM utilization at B=1 (64→128 blocks). With 2 warps, split=16 becomes viable (rows_per_warp=4), enabling 128 blocks for B=1 (87% SM coverage vs 43%).
+- **Result**: 1584.44x → 1264.19x mean speedup (**-20.2%**), min 91.09x → 64.91x (-28.7%), max 3748x → 3041x (-18.9%)
+- **Status**: reverted
+- **Learnings**: Fewer warps per SM (2 vs 4) severely hurts memory latency hiding. Even though more SMs are utilized, each SM has fewer warps to switch between while waiting on memory. The kernel is deeply memory-bound (state reads/writes dominate), so latency hiding from intra-block warp scheduling is critical. This confirms: warp count per SM matters more than SM coverage for this kernel.
+
+## 2026-04-08 - __launch_bounds__(128, 10) + No Register Prefetch [REVERTED]
+- **Idea**: Remove register-based prefetching and add __launch_bounds__(128, 10) to target ~51 regs/thread (from 64). Fewer registers → 10 blocks/SM max → 40 warps = 62.5% occupancy (from 50%). Higher occupancy compensates for removed prefetch.
+- **Result**: 1584.44x → 873.66x mean speedup (**-44.8%**), but B=1 absolute latency dropped 2.3x (0.021ms→0.009ms)
+- **Status**: reverted
+- **Learnings**: The mean speedup regression may be partly Modal run-to-run reference variance (ref_time differed 2.5x between runs). However, the B=1 absolute latency improvement was genuine — reduced register pressure + higher occupancy benefits latency-bound small batches. The tradeoff: launch_bounds likely caused register spills that hurt throughput-bound large batches. Need A/B testing within same Modal invocation for reliable comparison.
+
+## 2026-04-08 - PTX L1 Prefetch Hints + Vectorized Output Writes [REVERTED]
+- **Idea**: (1) Add `prefetch.global.L1` PTX hints for state rows 2 iterations ahead, giving L1 cache more lead time. (2) Vectorize output writes: pack 4 consecutive bf16 values into one uint2 (64-bit) store instead of 4 scalar stores.
+- **Result**: ~1299x mean speedup — absolute latencies nearly identical to baseline, speedup difference attributable to Modal variance
+- **Status**: reverted (neutral impact)
+- **Learnings**: L1 prefetch hints are ineffective because the register-based prefetching already provides adequate latency hiding. Vectorized output writes are a negligible optimization (output traffic is tiny vs state traffic). **Key insight**: Modal B200 benchmark has significant run-to-run variance in reference timing (~2x), making small improvements (< 10%) unmeasurable with single-run comparisons. Need head-to-head A/B testing for reliable evaluation.
+
+## 2026-04-08 - NCU Profiling Insights (B=1 baseline)
+- **NCU metrics**: 64 regs/thread, 50% theoretical occupancy (register-limited), 6% achieved occupancy, 0.05 waves/SM
+- **Bottleneck**: Latency-bound for B=1 (compute 2%, memory 1.7% — both extremely low due to grid underutilization)
+- **Key constraint**: 64 blocks (B=1, split=8) for 148 SMs — 43% SM coverage, most SMs idle
+- **Attempted fixes**: reducing block size, reducing register count — both regressed due to fewer warps per SM or register spills
+- **Conclusion**: B=1 performance is fundamentally limited by launch overhead + insufficient parallelism. The 4-warp/block × 64-reg/thread configuration is a local optimum: reducing either dimension hurts latency hiding or causes spills.
