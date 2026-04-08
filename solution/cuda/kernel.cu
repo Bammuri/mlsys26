@@ -268,6 +268,17 @@ __global__ void gdn_prefill_kernel(
     }
 }
 
+inline void configure_prefill_kernel_launch() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        const auto err = cudaFuncSetCacheConfig(gdn_prefill_kernel, cudaFuncCachePreferL1);
+        TORCH_CHECK(
+            err == cudaSuccess,
+            "gdn_prefill cache config setup failed: ",
+            cudaGetErrorString(err));
+    });
+}
+
 std::tuple<torch::Tensor, torch::Tensor> gdn_decode(
     torch::Tensor q,
     torch::Tensor k,
@@ -439,6 +450,8 @@ std::tuple<torch::Tensor, torch::Tensor> gdn_prefill(
     auto new_state = torch::zeros(
         {num_seqs, kNumVHeads, kHeadSize, kHeadSize},
         torch::TensorOptions().device(q_c.device()).dtype(torch::kFloat32));
+
+    configure_prefill_kernel_launch();
 
     const dim3 grid(num_seqs * kNumVHeads);
     const dim3 block(kThreads);
