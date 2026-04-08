@@ -27,7 +27,9 @@ from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 app = modal.App("flashinfer-bench")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
+results_volume = modal.Volume.from_name("flashinfer-bench-results", create_if_missing=True)
 TRACE_SET_PATH = "/data"
+RESULTS_PATH = "/benchmark-results"
 
 image = (
     modal.Image.from_registry(
@@ -46,8 +48,18 @@ image = (
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
+@app.function(
+    image=image,
+    gpu="B200:1",
+    timeout=3600,
+    volumes={TRACE_SET_PATH: trace_volume, RESULTS_PATH: results_volume},
+)
+def run_benchmark(
+    solution: Solution,
+    config: BenchmarkConfig = None,
+    label: str = "",
+    git_commit: str = "unknown",
+) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
@@ -93,7 +105,37 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
             results[definition.name][trace.workload.uuid] = entry
 
-    return results
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_label = sanitize_label(label or solution.definition)
+    remote_dir = Path(RESULTS_PATH) / solution.definition
+    remote_dir.mkdir(parents=True, exist_ok=True)
+    remote_artifact_path = remote_dir / f"{timestamp}-{safe_label}.json"
+
+    payload = {
+        "metadata": {
+            "timestamp_utc": timestamp,
+            "label": label or solution.definition,
+            "definition": solution.definition,
+            "solution_name": solution.name,
+            "entry_point": solution.spec.entry_point,
+            "git_commit": git_commit,
+            "benchmark_config": {
+                "warmup_runs": config.warmup_runs,
+                "iterations": config.iterations,
+                "num_trials": config.num_trials,
+            },
+        },
+        "summary": summarize_results(results),
+        "results": results,
+    }
+    remote_artifact_path.write_text(json.dumps(payload, indent=2))
+
+    return {
+        "remote_artifact_path": str(remote_artifact_path),
+        "summary": payload["summary"],
+        "definition": solution.definition,
+        "label": payload["metadata"]["label"],
+    }
 
 
 def get_git_commit_hash() -> str:
@@ -187,6 +229,45 @@ def save_results_artifact(
     return artifact_path
 
 
+def download_remote_artifact(remote_artifact_path: str, definition: str) -> Path:
+    """Download a benchmark artifact from the Modal results volume."""
+    local_dir = PROJECT_ROOT / ".omx" / "benchmarks" / definition
+    local_dir.mkdir(parents=True, exist_ok=True)
+    local_path = local_dir / Path(remote_artifact_path).name
+    volume_relative_path = remote_artifact_path.removeprefix(f"{RESULTS_PATH}/").removeprefix("/")
+    subprocess.run(
+        [
+            "modal",
+            "volume",
+            "get",
+            "flashinfer-bench-results",
+            volume_relative_path,
+            str(local_path),
+            "--force",
+        ],
+        cwd=PROJECT_ROOT,
+        check=True,
+    )
+    return local_path
+
+
+def print_summary(summary: dict):
+    """Print a compact benchmark summary."""
+    print(
+        "Summary:",
+        f"passed={summary['passed_workloads']}/{summary['total_workloads']}",
+        f"avg_latency_ms={summary['avg_latency_ms']:.3f}"
+        if summary["avg_latency_ms"] is not None
+        else "avg_latency_ms=n/a",
+        f"avg_reference_latency_ms={summary['avg_reference_latency_ms']:.3f}"
+        if summary["avg_reference_latency_ms"] is not None
+        else "avg_reference_latency_ms=n/a",
+        f"avg_speedup_factor={summary['avg_speedup_factor']:.2f}"
+        if summary["avg_speedup_factor"] is not None
+        else "avg_speedup_factor=n/a",
+    )
+
+
 def summarize_log(log: str, max_lines: int = 20) -> str:
     """Return a compact multi-line log summary."""
     if not log:
@@ -250,6 +331,7 @@ def main(
     entry_point: str = "",
     language: str = "",
     binding: str = "",
+    git_commit: str = "",
     destination_passing_style: str = "",
     output_path: str = "",
     warmup_runs: int = 3,
@@ -298,18 +380,20 @@ def main(
         f"iterations={config.iterations}",
         f"num_trials={config.num_trials}",
     )
-    results = run_benchmark.remote(solution, config)
+    response = run_benchmark.remote(
+        solution,
+        config,
+        label=label or solution.definition,
+        git_commit=git_commit or get_git_commit_hash(),
+    )
 
-    if not results:
+    if not response:
         print("No results returned!")
         return
 
-    print_results(results)
-    artifact_path = save_results_artifact(
-        results=results,
-        solution=solution,
-        config=config,
-        label=label or solution.definition,
-        entry_point=solution.spec.entry_point,
+    print_summary(response["summary"])
+    artifact_path = download_remote_artifact(
+        response["remote_artifact_path"],
+        response["definition"],
     )
     print(f"\nSaved results: {artifact_path}")
