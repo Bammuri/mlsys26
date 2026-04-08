@@ -109,3 +109,25 @@ Tracking all optimization iterations for the prefill kernel.
 - **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
 - **Status**: accepted
 - **Learnings**: The 28 long-latency workloads (>1ms, likely N>16 or long T) were the primary beneficiaries of expanded SF=4. Reference implementation timing varies significantly across benchmark days (331.97x on Apr 7 vs 221.12x on Apr 8 for the SAME kernel), so cross-day speedup comparisons are unreliable — always use same-day control benchmarks. The chunkwise parallel recurrence was confirmed not viable: V-split approach requires only O(d) FLOPs/timestep vs O(d²) for chunkwise transition matrices (128x overhead). **The kernel is now shuffle-bound at ~54 warp shuffles/timestep, which is a fundamental limit of the warp-parallel approach with d=128. Remaining gains likely require reducing the number of reductions (algorithmically impossible) or novel hardware features.**
+
+## 2026-04-08 - Shuffle Reduction Package (REVERTED)
+- **Idea**: Four combined micro-optimizations to reduce shuffle count from 54→45 per timestep (-16.7%): (1) Butterfly (shfl_xor) for ks reductions, eliminating 4 broadcast shuffles. (2) Remove qk_dot broadcast (only lane 0 uses it). (3) Replace v shuffle broadcasts with direct L1-cached global loads. (4) Pack 4 scalar bf16 output stores into 1 uint2 (64-bit) store.
+- **Result**: 261.56x → 247.66x mean speedup (-5.3%), latency 0.897ms → 0.889ms (-0.9%, within noise)
+- **Min/Max speedup**: 76.20x/733.56x → 77.58x/713.05x
+- **Correctness**: max_atol=1.22e-04, max_rtol=**0.410** (regressed from 0.366), matched_ratio=1.0. **Precision regression** from butterfly reduction.
+- **Status**: reverted
+- **Learnings**: The butterfly (shfl_xor) reduction changes the floating-point association order compared to shfl_down. While mathematically equivalent, the different rounding per step compounds through the multiplicative gate chain over thousands of timesteps, pushing max_rtol from 0.366 to 0.410 (12% worse). The 9 saved shuffles provided zero measurable latency improvement — shuffles are pipelined with 8-way ILP, so eliminating a few on non-critical paths doesn't help. **Conclusion: shuffle count is NOT the true bottleneck despite being the dominant instruction type. The kernel is likely limited by instruction issue bandwidth or FMA pipeline depth, not individual shuffle latency. No further inner-loop micro-optimizations are viable. The kernel has reached a performance plateau at ~0.9ms mean latency for the current workload distribution.**
+
+## 2026-04-08 - CuTe/CUTLASS Feasibility Study (RESEARCH ONLY)
+- **Idea**: Investigate whether CuTe/CUTLASS features (TMA, UMMA/WGMMA, TMEM, CuTe layouts, cp.async) could break the performance plateau.
+- **Result**: No implementation — all CuTe/CUTLASS features are incompatible with the register-resident scalar recurrence.
+- **Status**: not implemented (research only)
+- **Findings**:
+  - **UMMA/WGMMA**: Requires operands in SMEM/TMEM (state is in registers). Rank-1 update has K=1 but minimum UMMA K=16, wasting 15/16 tensor core throughput. State must remain float32 (bf16 accumulation causes precision failure).
+  - **TMA**: State is loaded once at kernel start, not per-timestep. TMA adds GMEM→SMEM→RMEM hop (currently GMEM→RMEM directly). No benefit for one-shot load.
+  - **TMEM**: Exclusively accessible through UMMA operations. Cannot perform scalar FMA, warp shuffles, or conditionals on TMEM data.
+  - **CuTe layouts**: Designed for SMEM-centric kernels. This kernel uses zero shared memory.
+  - **cp.async/pipeline**: Already tested and failed (q/k/v prefetch: -38.3%). L1 hit rate is 92%, data is tiny (~520 bytes/timestep).
+  - **CTA clusters (sm100a)**: Blocks for the same v_head could share q/k via DSMEM, but L1 already handles redundant loads efficiently. No measurable benefit expected.
+- **Only viable CuTe/CUTLASS path**: Complete algorithmic rewrite to **chunked WY representation** (as cuLA implements). This reformulates the per-timestep scalar recurrence as chunk-level matmuls (O(d²) per chunk instead of O(d) per timestep), enabling UMMA tensor cores. However: 128x more FLOPs, requires 5-warp-role persistent kernel, TMA+UMMA+TMEM pipeline, and cuLA's own GDN support isn't complete yet. Multi-day implementation effort with uncertain payoff for T=6-8192.
+- **Learnings**: The register-resident warp-parallel scalar recurrence is fundamentally incompatible with tensor core acceleration. CuTe/CUTLASS are designed for throughput-oriented matmul workloads, not latency-sensitive sequential recurrences. **The kernel's ~42 cycles/timestep performance is near-optimal for the scalar recurrence approach on sm100a. Beating it requires either (a) chunked WY + tensor cores (high risk, multi-day) or (b) hardware changes (no sm100a shuffle/reduction improvements over Hopper).**
