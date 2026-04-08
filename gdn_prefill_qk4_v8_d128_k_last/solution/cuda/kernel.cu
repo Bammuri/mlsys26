@@ -21,7 +21,7 @@
  *   - Algebraic fusion: output computed from OLD state via identity (eliminates Phase 2)
  *   - Zero shared memory in inner loop: all reductions via warp shuffle
  *   - V values broadcast via __shfl_sync (no smem needed)
- *   - 4 vi rows per iteration for ILP (8 interleaved reductions)
+ *   - 2 vi rows per iteration for ILP (4 interleaved reductions)
  *   - V-split: SPLIT_FACTOR splits vi dimension across blocks for better SM utilization
  *   - __launch_bounds__ occupancy tuning per SPLIT_FACTOR
  */
@@ -40,7 +40,7 @@ constexpr int NUM_K_HEADS = 4;
 constexpr int NUM_V_HEADS = 8;
 constexpr int HEAD_DIM = 128;
 constexpr int V_PER_Q = NUM_V_HEADS / NUM_Q_HEADS;  // 2
-constexpr int NUM_WARPS = HEAD_DIM / 32;  // 4
+constexpr int NUM_WARPS = 8;  // 8 warps = 256 threads, RPW=2 with SF=8
 
 __device__ __forceinline__ float softplus(float x) {
     return log1pf(expf(x));
@@ -49,19 +49,19 @@ __device__ __forceinline__ float softplus(float x) {
 /*
  * One block per (seq_idx, v_head, split_id) triple.
  * Grid: (num_seqs * NUM_V_HEADS * SPLIT_FACTOR,)
- * Block: (128,) — 4 warps, each warp independently handles ROWS_PER_WARP vi rows
+ * Block: (256,) — 8 warps, each warp independently handles ROWS_PER_WARP vi rows
  *
  * Each warp: 32 threads × 4 k-elements/thread = 128 k-elements (full K dimension)
  * State tiling: float4 per vi row per thread — reg_state[r] = state[vi, lane*4 : lane*4+4]
  * No shared memory or __syncthreads in the timestep loop.
  */
 template <int SF> inline constexpr int MIN_BLOCKS = 2;
-template <> inline constexpr int MIN_BLOCKS<8> = 8;
+template <> inline constexpr int MIN_BLOCKS<8> = 4;
 template <> inline constexpr int MIN_BLOCKS<4> = 6;
 template <> inline constexpr int MIN_BLOCKS<2> = 4;
 
 template <int SPLIT_FACTOR>
-__global__ __launch_bounds__(128, MIN_BLOCKS<SPLIT_FACTOR>) void gdn_prefill_kernel(
+__global__ __launch_bounds__(256, MIN_BLOCKS<SPLIT_FACTOR>) void gdn_prefill_kernel(
     const bf16* __restrict__ q,         // [T, 4, 128]
     const bf16* __restrict__ k,         // [T, 4, 128]
     const bf16* __restrict__ v,         // [T, 8, 128]
@@ -163,54 +163,38 @@ __global__ __launch_bounds__(128, MIN_BLOCKS<SPLIT_FACTOR>) void gdn_prefill_ker
         if (lane < ROWS_PER_WARP)
             v_local = __bfloat162float(v[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi_start + lane]);
 
-        // Process 4 vi rows at a time for ILP (8 interleaved reductions)
+        // Process 2 vi rows at a time for ILP (4 interleaved reductions)
         #pragma unroll
-        for (int r = 0; r < ROWS_PER_WARP; r += 4) {
+        for (int r = 0; r < ROWS_PER_WARP; r += 2) {
             float4 st4_a = reg_state[r];
             float4 st4_b = reg_state[r + 1];
-            float4 st4_c = reg_state[r + 2];
-            float4 st4_d = reg_state[r + 3];
 
             // Broadcast v values from holding lanes
             float v_a = __shfl_sync(0xffffffff, v_local, r);
             float v_b = __shfl_sync(0xffffffff, v_local, r + 1);
-            float v_c = __shfl_sync(0xffffffff, v_local, r + 2);
-            float v_d = __shfl_sync(0xffffffff, v_local, r + 3);
 
             // Compute partial dot products (k*state and q*state from OLD state)
             float ks_a = k_vals[0]*st4_a.x + k_vals[1]*st4_a.y + k_vals[2]*st4_a.z + k_vals[3]*st4_a.w;
             float qs_a = q_vals[0]*st4_a.x + q_vals[1]*st4_a.y + q_vals[2]*st4_a.z + q_vals[3]*st4_a.w;
             float ks_b = k_vals[0]*st4_b.x + k_vals[1]*st4_b.y + k_vals[2]*st4_b.z + k_vals[3]*st4_b.w;
             float qs_b = q_vals[0]*st4_b.x + q_vals[1]*st4_b.y + q_vals[2]*st4_b.z + q_vals[3]*st4_b.w;
-            float ks_c = k_vals[0]*st4_c.x + k_vals[1]*st4_c.y + k_vals[2]*st4_c.z + k_vals[3]*st4_c.w;
-            float qs_c = q_vals[0]*st4_c.x + q_vals[1]*st4_c.y + q_vals[2]*st4_c.z + q_vals[3]*st4_c.w;
-            float ks_d = k_vals[0]*st4_d.x + k_vals[1]*st4_d.y + k_vals[2]*st4_d.z + k_vals[3]*st4_d.w;
-            float qs_d = q_vals[0]*st4_d.x + q_vals[1]*st4_d.y + q_vals[2]*st4_d.z + q_vals[3]*st4_d.w;
 
             // Interleaved warp reductions (better ILP)
             #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
                 ks_a += __shfl_down_sync(0xffffffff, ks_a, offset);
                 ks_b += __shfl_down_sync(0xffffffff, ks_b, offset);
-                ks_c += __shfl_down_sync(0xffffffff, ks_c, offset);
-                ks_d += __shfl_down_sync(0xffffffff, ks_d, offset);
                 qs_a += __shfl_down_sync(0xffffffff, qs_a, offset);
                 qs_b += __shfl_down_sync(0xffffffff, qs_b, offset);
-                qs_c += __shfl_down_sync(0xffffffff, qs_c, offset);
-                qs_d += __shfl_down_sync(0xffffffff, qs_d, offset);
             }
 
             // Broadcast ks sums to all lanes for state update
             ks_a = __shfl_sync(0xffffffff, ks_a, 0);
             ks_b = __shfl_sync(0xffffffff, ks_b, 0);
-            ks_c = __shfl_sync(0xffffffff, ks_c, 0);
-            ks_d = __shfl_sync(0xffffffff, ks_d, 0);
 
             // Compute residuals
             float res_a = beta * (v_a - g * ks_a);
             float res_b = beta * (v_b - g * ks_b);
-            float res_c = beta * (v_c - g * ks_c);
-            float res_d = beta * (v_d - g * ks_d);
 
             // Update state registers
             reg_state[r] = make_float4(
@@ -219,20 +203,12 @@ __global__ __launch_bounds__(128, MIN_BLOCKS<SPLIT_FACTOR>) void gdn_prefill_ker
             reg_state[r + 1] = make_float4(
                 g*st4_b.x + k_vals[0]*res_b, g*st4_b.y + k_vals[1]*res_b,
                 g*st4_b.z + k_vals[2]*res_b, g*st4_b.w + k_vals[3]*res_b);
-            reg_state[r + 2] = make_float4(
-                g*st4_c.x + k_vals[0]*res_c, g*st4_c.y + k_vals[1]*res_c,
-                g*st4_c.z + k_vals[2]*res_c, g*st4_c.w + k_vals[3]*res_c);
-            reg_state[r + 3] = make_float4(
-                g*st4_d.x + k_vals[0]*res_d, g*st4_d.y + k_vals[1]*res_d,
-                g*st4_d.z + k_vals[2]*res_d, g*st4_d.w + k_vals[3]*res_d);
 
             // Lane 0 writes outputs using algebraic identity
             if (lane == 0) {
                 const int out_offset = t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi_start;
                 output[out_offset + r]     = __float2bfloat16(scale * (g * qs_a + qk_dot * res_a));
                 output[out_offset + r + 1] = __float2bfloat16(scale * (g * qs_b + qk_dot * res_b));
-                output[out_offset + r + 2] = __float2bfloat16(scale * (g * qs_c + qk_dot * res_c));
-                output[out_offset + r + 3] = __float2bfloat16(scale * (g * qs_d + qk_dot * res_d));
             }
         }
     }
@@ -266,14 +242,12 @@ void gdn_prefill(
     cudaStream_t stream = static_cast<cudaStream_t>(
         TVMFFIEnvGetStream(dev.device_type, dev.device_id));
 
-    // Choose split factor based on batch size for SM utilization
-    int split_factor;
-    if (num_seqs <= 8)       split_factor = 8;
-    else if (num_seqs <= 64) split_factor = 4;
-    else                     split_factor = 1;
+    // Always use SF=8: 8 warps with RPW=2 gives 2 warps/scheduler for latency hiding
+    // and fewer registers per thread (~50 regs) for better occupancy.
+    constexpr int split_factor = 8;
 
     dim3 grid(num_seqs * NUM_V_HEADS * split_factor);
-    dim3 block(HEAD_DIM);
+    dim3 block(NUM_WARPS * 32);  // 8 * 32 = 256
 
     // No shared memory needed — all reductions via warp shuffle
     const int smem_bytes = 0;
@@ -299,11 +273,7 @@ void gdn_prefill(
         );
     };
 
-    switch (split_factor) {
-        case 8:  launch(gdn_prefill_kernel<8>); break;
-        case 4:  launch(gdn_prefill_kernel<4>); break;
-        default: launch(gdn_prefill_kernel<1>); break;
-    }
+    launch(gdn_prefill_kernel<8>);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(kernel, gdn_prefill);

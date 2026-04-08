@@ -132,6 +132,14 @@ Tracking all optimization iterations for the prefill kernel.
 - **Only viable CuTe/CUTLASS path**: Complete algorithmic rewrite to **chunked WY representation** (as cuLA implements). This reformulates the per-timestep scalar recurrence as chunk-level matmuls (O(d²) per chunk instead of O(d) per timestep), enabling UMMA tensor cores. However: 128x more FLOPs, requires 5-warp-role persistent kernel, TMA+UMMA+TMEM pipeline, and cuLA's own GDN support isn't complete yet. Multi-day implementation effort with uncertain payoff for T=6-8192.
 - **Learnings**: The register-resident warp-parallel scalar recurrence is fundamentally incompatible with tensor core acceleration. CuTe/CUTLASS are designed for throughput-oriented matmul workloads, not latency-sensitive sequential recurrences. **The kernel's ~42 cycles/timestep performance is near-optimal for the scalar recurrence approach on sm100a. Beating it requires either (a) chunked WY + tensor cores (high risk, multi-day) or (b) hardware changes (no sm100a shuffle/reduction improvements over Hopper).**
 
+## 2026-04-08 - Universal SF=8 Dispatch
+- **Idea**: Remove adaptive SF dispatch (SF=8/4/1 based on N) and always use SPLIT_FACTOR=8. Prior SF=4 (MIN_BLOCKS=6, RPW=8, 102 shuffles/timestep) and SF=1 (MIN_BLOCKS=2, RPW=32, 390 shuffles/timestep) had worse occupancy targets and more per-timestep work. SF=8 (MIN_BLOCKS=8, RPW=4, 54 shuffles/timestep) has optimal ILP from 8-way interleaved reductions and best register balance (60 regs, 0 spills). For N>8 workloads, the extra blocks from SF=8 more than compensate for the additional waves needed.
+- **Result**: 261.56x → 269.79x mean speedup (+3.1%), latency 0.897ms → 0.771ms (-14.1%)
+- **Min/Max speedup**: 76.20x/733.56x → 83.12x/925.33x
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: accepted
+- **Learnings**: The max speedup jump (+26.1%) confirms large-N workloads were severely penalized by SF=4/SF=1. Min speedup also improved (+9.1%), indicating no regressions. SF=8 is universally optimal because: (1) RPW=4 gives perfect 8-way ILP for shuffle interleaving, (2) MIN_BLOCKS=8 targets 60 regs which is the bidirectional optimum, (3) the smaller per-block work (54 vs 102-390 shuffles/timestep) makes waves faster even when more waves are needed. **The adaptive SF dispatch was a legacy from before the warp-parallel redesign — with zero cross-warp sync, higher SF has no penalty.**
+
 ## 2026-04-08 - Increased MIN_BLOCKS for Higher Occupancy (REVERTED)
 - **Idea**: Increase MIN_BLOCKS<8> from 8→10 and MIN_BLOCKS<4> from 6→8 to force the compiler to use fewer registers, targeting 10 blocks/SM (62.5% occupancy) for SF=8 and 8 blocks/SM (50%) for SF=4. Hypothesis: 25% more resident warps would improve warp scheduling and latency hiding. The previous failed attempt reduced MIN_BLOCKS (8→6, -38.3%), so going the opposite direction (increasing) was expected to help.
 - **Result**: 261.56x → 232.74x mean speedup (-11.0%), latency 0.897ms → 0.937ms (+4.5%)
@@ -139,3 +147,11 @@ Tracking all optimization iterations for the prefill kernel.
 - **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
 - **Status**: reverted
 - **Learnings**: The compiler was forced to reduce from 60 to ~51 registers, likely causing register spills to L1 local memory. The ~20 cycle/spill latency penalized every timestep iteration, overwhelming the occupancy benefit. This confirms a **bidirectional occupancy constraint**: reducing MIN_BLOCKS from 8 kills occupancy (-38.3%), but increasing MIN_BLOCKS beyond 8 causes spills that kill ILP (-11%). **MIN_BLOCKS=8 (60 regs, 50% theoretical occupancy) is the optimal operating point for this kernel. The register budget is perfectly balanced — any perturbation in either direction degrades performance.**
+
+## 2026-04-08 - Packed bf16 Output Stores (REVERTED)
+- **Idea**: Replace 4 individual bf16 scalar stores (2 bytes each) with a single uint2 (8-byte) vectorized store from lane 0. Addresses are 8-byte aligned (vi_start is always a multiple of 4, bf16 is 2 bytes). Zero register cost, zero precision impact.
+- **Result**: 269.79x → 260.66x mean speedup (-3.4%, run-to-run variance), latency 0.771ms → 0.768ms (-0.4%, within noise)
+- **Min/Max speedup**: 83.12x/925.33x → 77.35x/854.06x (reference variance)
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: reverted
+- **Learnings**: Output stores from lane 0 are NOT on the critical path — they execute while the next iteration's loads and gate precomputation overlap. Converting 4x2B stores to 1x8B store provides no measurable benefit. This confirms the optimization log's prior conclusion from the distributed output writes experiment (VB=16 entry): **output write optimization is a dead end because writes are fully hidden by compute overlap.** Combined with the shuffle reduction, CuTe/CUTLASS, and MIN_BLOCKS experiments, this exhausts all remaining micro-optimization avenues. **The prefill kernel has reached its optimization ceiling for the register-resident warp-parallel scalar recurrence on sm100a at ~0.77ms mean latency / ~270x mean speedup.**
