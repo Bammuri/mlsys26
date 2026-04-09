@@ -193,3 +193,12 @@ After 25 benchmark runs and 16 optimization attempts (7 accepted, 9 reverted):
 - **Root cause of DRAM underutilization**: Not enough bytes-in-flight per SM. With 4 blocks × 8 warps = 32 warps, each issuing 4 float4 loads (64 bytes), only ~2 KB/SM is in-flight. Blackwell needs >40 KB/SM for bandwidth saturation.
 - **What failed to increase bytes-in-flight**: 8-row pipeline (register pressure killed occupancy), .cg L1 bypass (doesn't change request count), PTX L1 prefetch hints (already handled by register prefetching)
 - **Remaining options**: cp.async.bulk (TMA DMA engine can queue large transfers without SM involvement), persistent kernels, or accepting the current ~60% DRAM efficiency as near-optimal for this algorithm
+
+## 2026-04-09 - TMA cp.async.bulk Double-Buffer Pipeline [REVERTED]
+- **Idea**: Replace register-based float4 loads with cp.async.bulk DMA engine for B>16 state loads. Separate `gdn_decode_kernel_tma` using shared memory double buffer (2 stages × 32 rows × 512B = 32KB) with mbarrier synchronization. Single thread issues cp.async.bulk transfers via TMA hardware, all threads compute from shared memory. Expected to increase bytes-in-flight from ~2KB/SM to ~32KB/SM.
+- **Result**: CRITICAL FAILURE — GPU crashes (XID 13: SM Global Exception / Multiple Warp Errors)
+  - Attempt 1: Single 16KB cp.async.bulk per chunk — 32/54 passed (B<=16 only), 22 failed with GPU crash
+  - Attempt 2: Per-row 512B cp.async.bulk (32 copies per chunk) — ALL workloads TIMEOUT, GPU unresponsive
+- **Status**: reverted (both attempts)
+- **Learnings**: **cp.async.bulk and mbarrier instructions are incompatible with the TVM FFI CUDA build environment.** The kernel compiles without error but crashes at runtime with XID 13, indicating the generated SASS code contains illegal instructions or memory accesses. Root cause: TVM FFI's default compilation targets `sm_100` (not `sm_100a`) and likely uses a virtual arch (compute_100) that generates incorrect machine code for cp.async.bulk + mbarrier PTX. This is a fundamental blocker — TMA-based optimizations cannot be used without control over the NVCC compilation flags (specifically `-arch=sm_100a` or appropriate PTX version). The Python binding approach (entries #22, #26) could potentially work but was inconclusive on performance.
+- **Remaining options after TMA failure**: (1) Python binding with explicit sm_100a arch to enable TMA, (2) persistent kernel via cooperative launch (likely blocked by TVM FFI), (3) accept current performance as near-optimal for register-based approach

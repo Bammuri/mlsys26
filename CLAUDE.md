@@ -42,7 +42,7 @@ logs/
 - GVA: q_heads=4, k_heads=4, v_heads=8 (2x expansion)
 - Precision: state/gates float32, inputs/outputs bfloat16
 - DPS: outputs pre-allocated, write in-place
-- Correctness: atol=1, rtol=0.3, matched_ratio≥0.9
+- Correctness: All workloads must PASS on Modal benchmark
 
 ## Profiling
 - **NCU (Nsight Compute) is available on Modal B200** — FAQ.md says otherwise but this is outdated. Use NCU freely for kernel profiling and bottleneck analysis.
