@@ -162,10 +162,34 @@ After 25 benchmark runs and 16 optimization attempts (7 accepted, 9 reverted):
 - **Key accepted optimizations**: loop fusion (+124%), V-split (+18%), L2 residency (+18%), 4-row pipeline (+18%), 8-warp B>16 (+10%)
 - **Binding constraints**: 64 regs/thread (50% theoretical occupancy), memory-bound at ~58% DRAM utilization
 - **What doesn't work**: reducing pipeline depth (ILP loss), reducing register count (__launch_bounds__ spills), increasing split factor (overhead > utilization gain), alternative data paths (shared memory v, shuffle broadcasts)
-- **Remaining opportunities**: persistent kernels (complex + risky with TVM FFI), tensor cores for state dot products (degenerate matrix dimensions)
+- **Remaining opportunities**: persistent kernels (complex + risky with TVM FFI), tensor cores for state dot products (degenerate matrix dimensions), cp.async.bulk (TMA DMA engine) for state loads
 
 ## 2026-04-08 - Python Binding -O3 --use_fast_math -arch=sm_100a (tvm_ffi.cpp.load) [REVERTED]
 - **Idea**: Python solution wrapping the same kernel.cu, compiled via `tvm_ffi.cpp.load()` with `extra_cuda_cflags=["-O3", "--use_fast_math"]` and `TVM_FFI_CUDA_ARCH_LIST=10.0a`. Zero kernel code changes — compilation-only optimization.
 - **Result**: 1737.91x → 1583.45x mean speedup (**-8.9%**), absolute latency 0.0167ms (vs 0.0184ms baseline = -9.2%)
 - **Status**: reverted (inconclusive — Modal variance, second attempt confirming entry #22's result)
 - **Learnings**: Two independent Python binding runs (#22: 1520x, #26: 1583x) both show ~0.0167ms absolute latency. The CUDA build also shows similar latencies in recent runs (0.0149-0.0191ms range). **Conclusion**: -O3 / --use_fast_math / sm_100a compilation flags provide no measurable improvement over the default -O2 / sm_100 build. The kernel's hot loop (float4 loads, FMAs, shuffles) is not sensitive to optimization level or fast-math since it uses no transcendental functions. The gate computation (expf, log1pf) that would benefit from fast-math runs once per block — negligible. Python solution kept in `solution/python/` as backup but config.toml reverted to CUDA.
+
+## 2026-04-09 - 8-Row Register Pipeline (rows_per_warp>=16) [REVERTED]
+- **Idea**: Extend 4-row register pipelining to 8 rows per iteration for configs with rows_per_warp>=16 (B>=5). Process 8 V-rows with 16 interleaved warp reductions for maximum ILP. Doubles bytes-in-flight from 2 KB to 4 KB per warp.
+- **Result**: 1737.91x → 1334.30x mean speedup (**-23.2%**), but absolute latency 0.016ms (vs 0.0184ms baseline = **-13%**)
+- **Status**: reverted (regression in speedup, likely combination of Modal reference variance + register pressure)
+- **Learnings**: The absolute latency improvement (13%) is encouraging but the speedup regression is too large to attribute solely to Modal variance. The 8-row pipeline adds ~16 registers for 4 extra float4 prefetch loads (64→~80 regs), dropping theoretical occupancy from 50% to 37.5%. For 8-warp blocks (B>16), this reduces blocks/SM from 4 to 3. The trade-off — deeper ILP vs lower occupancy — appears net-negative or at best neutral. Additionally, the condition `rows_per_warp >= 16` also affects B=5-16 (sf=2, 4 warps), replacing 4 iterations of 4-row with 2 iterations of 8-row, reducing prefetch overlap opportunities.
+
+## 2026-04-09 - ld.global.cg State Loads (L1 Bypass) [REVERTED]
+- **Idea**: Replace default float4 state loads with inline PTX `ld.global.cg.v4.f32` (bypass L1, cache in L2 only). NCU showed L1/TEX throughput at 65.6% — the highest metric — with only 13.36% hit rate, meaning 86.64% of L1 lookups are wasted misses. Bypassing L1 reduces tag lookup pressure while maintaining L2 caching for cross-invocation residency.
+- **Result**: 1737.91x → 1502.22x mean speedup (**-13.6%**), absolute latency 0.018ms (vs 0.0184ms baseline ≈ neutral)
+- **Status**: reverted (neutral impact — speedup regression entirely from Modal reference variance)
+- **Learnings**: L1 bypass had zero effect on absolute latency, confirming that the 65.6% L1 throughput is not actually a throughput bottleneck — it's just high traffic volume. The L1 miss handling overhead is not the limiting factor. State loads already go through the read-only cache path (compiler uses `ld.global.nc` due to `const __restrict__` pointers), which has its own efficient miss handling. **Key insight from NCU**: L1/TEX throughput being the highest metric doesn't mean L1 is the bottleneck — it means the most traffic flows through L1 relative to its peak, but the actual bandwidth limiter is DRAM at 31.4% throughput (the SM can't generate enough outstanding requests to saturate DRAM). The bottleneck is bytes-in-flight, not cache efficiency.
+
+## 2026-04-09 - Updated NCU Profiling (Fresh B200 Metrics)
+- **NCU metrics for B=64** (fresh run, confirms previous data):
+  - DRAM Throughput: 31.4%, Memory Throughput: 43.96%, Compute: 36.87%
+  - L1/TEX Throughput: 65.6% (highest metric), L1 Hit Rate: 13.36%
+  - L2 Throughput: 26.95%, L2 Hit Rate: 0.94%
+  - Achieved Occupancy: 39.35% (25.18 active warps/SM, theoretical 50%)
+  - Block Limit: Registers (4 blocks/SM), 64 regs/thread, no spills
+  - Duration: 14.21μs (theoretical minimum: ~8.4μs at peak DRAM BW)
+- **Root cause of DRAM underutilization**: Not enough bytes-in-flight per SM. With 4 blocks × 8 warps = 32 warps, each issuing 4 float4 loads (64 bytes), only ~2 KB/SM is in-flight. Blackwell needs >40 KB/SM for bandwidth saturation.
+- **What failed to increase bytes-in-flight**: 8-row pipeline (register pressure killed occupancy), .cg L1 bypass (doesn't change request count), PTX L1 prefetch hints (already handled by register prefetching)
+- **Remaining options**: cp.async.bulk (TMA DMA engine can queue large transfers without SM involvement), persistent kernels, or accepting the current ~60% DRAM efficiency as near-optimal for this algorithm

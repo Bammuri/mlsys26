@@ -193,3 +193,56 @@ Tracking all optimization iterations for the prefill kernel.
   4. **The "reprocess" variant** (run chunks with s=0, propagate states, rerun) requires 2× total work. Even with K=4 chunks and SF=1, the wave overhead makes total time exceed sequential.
   5. **The fundamental limit**: For d=128, the per-timestep recurrence takes ~42 cycles (shuffle-bound). Any chunkwise approach adds ≥ O(d²) correction per chunk boundary. With C=d=128, overhead factor ≈ 1+d/C = 2×, making chunkwise always worse.
 - **Learnings**: The SF=16 threshold extension is a genuine improvement for min speedup, confirming N=3-5 workloads had suboptimal SM utilization with SF=8. The optimal threshold is N≤6 theoretically (same wave count), but N≤5 is conservative. **Chunkwise parallelism is definitively closed as an optimization avenue for this kernel. The register-resident scalar recurrence at ~0.77ms mean latency is near-optimal for sm100a. Remaining gains likely require either (a) reducing benchmark overhead for short sequences or (b) hardware-specific features not yet explored.**
+
+## 2026-04-09 - Software Prefetch for q/k (REVERTED) + Blackwell Feature Assessment
+- **Idea**: Add `prefetch.global.L1` PTX instructions for next-timestep q and k arrays inside the gate pipeline block. Only 2 lanes (0 and 1) per warp issue prefetches, covering 2 cache lines × 2 arrays = 4 prefetches per warp per timestep. Targets the ~4% L1 miss rate for q/k loads. Zero register pressure, zero shared memory, zero cross-warp sync.
+- **Result**: 308.97x → 273.25x mean speedup (-11.6%), latency 0.767ms → 0.814ms (+6.1%)
+- **Min/Max speedup**: 85.24x/898.09x → 66.98x/719.58x (-21.4%/-19.8%)
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: reverted
+- **Learnings**: The software prefetch adds instruction overhead (branch predication, prefetch issue) that exceeds any cache benefit. The L1 hit rate is already 96%, and the B200 hardware prefetcher handles the strided q/k access pattern (stride=1024B between timesteps) adequately. **Explicit software prefetch is counterproductive for cache-hot, small data loads (<1KB/timestep) on Blackwell.** This aligns with the prior smem broadcast failure (-15.7%) and register prefetch pipeline failure (-38.3%) — any prefetch mechanism for q/k adds more overhead than it saves.
+
+### Blackwell Hardware Feature Assessment (TMEM, Tensor Cores, TMA)
+Comprehensive research and NCU profiling (sm100a) confirms these Blackwell features are fundamentally mismatched with the scalar recurrence kernel:
+
+1. **TMEM**: Only accessible through tcgen05 (tensor core) instructions. Cannot perform scalar FMA, warp shuffles, or conditional branching on TMEM-resident data. The recurrence requires per-element scalar operations on state every timestep, making TMEM→register→TMEM round-trips prohibitively expensive. **Verdict: Architecturally incompatible.**
+
+2. **Tensor Cores (WGMMA/tcgen05.mma)**: Minimum instruction shapes M=64, N=8, K=16 (1-SM mode). The GDN recurrence has two operations: (a) 1×128 dot products (ks_sum, qs_sum) which need M=1, K=128 — padding to M=64 wastes 98.4% throughput; (b) rank-1 outer product state update with K=1 — padding to K=16 wastes 93.75%. Additionally, state must remain fp32 throughout the recurrence (bf16 accumulation causes rtol compound error over thousands of timesteps). **Verdict: 94-98% throughput waste makes tensor cores strictly inferior to scalar FMA.**
+
+3. **TMA (cp.async.bulk)**: Per-timestep data is ~520 bytes, served at 96% L1 hit rate (~30 cycle latency). TMA adds GMEM→SMEM→RMEM indirection (extra hop) and requires mbarrier synchronization. Even with per-warp barriers (avoiding cross-warp sync), the SMEM intermediary adds latency for cache-hot data. The simpler software prefetch variant (tested above) also regressed, confirming the L1 cache path is already optimal. **Verdict: TMA designed for bulk KB-MB transfers, not sub-1KB cache-hot loads.**
+
+4. **NCU Profile (sm100a)**: Compute throughput 13-18%, Memory throughput 12-16% — kernel is **latency-bound**, not bandwidth-bound. Achieved occupancy 13% vs 75% theoretical (register-limited at 39 regs/thread). The ~42 cycle/timestep critical path is dominated by warp shuffle latency (~5 cycles × 15-18 shuffles), which is a fixed architectural constant unchanged from Hopper.
+
+**Conclusion: The prefill kernel has reached its optimization ceiling for the register-resident scalar recurrence on sm100a. All Blackwell-specific hardware acceleration features (TMEM, tensor cores, TMA) are designed for parallel matrix operations and bulk data movement, not sequential element-wise recurrences with warp-shuffle reductions. The only remaining path to a step-change improvement would be an algorithmic reformulation to chunked WY parallelism (converting the recurrence into GEMM-shaped work), but prior analysis shows this is net-negative for d=128 due to O(T×d) correction cost equaling the sequential cost.**
+
+## 2026-04-09 - Decouple qs from ks Reduction (REVERTED)
+- **Idea**: Split the 4-way interleaved shuffle reduction (ks_a, ks_b, qs_a, qs_b) into two phases: Phase 1 reduces only ks_a/ks_b (critical path for state update), then state update FMAs, then Phase 2 reduces qs_a/qs_b (only needed for output, off critical path). Hypothesis: the warp scheduler could overlap Phase 2 shuffles with Phase 1 state update FMAs. Also removes 2 unnecessary qs broadcast shuffles (only lane 0 needs qs results).
+- **Result**: 308.97x → 273.75x mean speedup (reference variance), latency 0.767ms → 0.768ms (+0.2%, flat)
+- **Min/Max speedup**: 85.24x/898.09x → 66.61x/750.67x (reference variance)
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: reverted
+- **Learnings**: Warp instructions execute in program order — the hardware does NOT reorder shuffles and FMAs within a single warp. The warp scheduler interleaves between warps (inter-warp), not within a warp (intra-warp). The compiler already optimally schedules instructions at compile time; changing source-level ordering of independent operations has no effect on SASS execution order. **Conclusion: instruction-level reordering within a warp's program is a compiler optimization, not a runtime scheduling optimization. All warp-level instruction scheduling approaches are exhausted.**
+
+## 2026-04-09 - SF=4 for Large N (3-Tier Dispatch) (REVERTED)
+- **Idea**: Add SPLIT_FACTOR=4 dispatch for N>12, creating 3-tier dispatch: SF=16 (N≤5), SF=8 (5<N≤12), SF=4 (N>12). SF=4 with 8 warps gives RPW=4 (same ILP as the pre-8-warp optimal config). This combination was never tested since the 8-warp transition. For N=32: SF=4 needs ~2 waves vs SF=8's ~4 waves. Per-row shuffle efficiency: 13.5/row (RPW=4) vs 15/row (RPW=2) = 10% better amortization of qk_dot fixed cost. MIN_BLOCKS<4>=4.
+- **Result**: 308.97x → 254.12x mean speedup, latency 0.767ms → 0.853ms (+11.3%)
+- **Min/Max speedup**: 85.24x/898.09x → 78.11x/655.84x
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: reverted
+- **Learnings**: RPW=4 with 8 warps requires ~64 registers (vs 56 for RPW=2), at the exact MIN_BLOCKS=4 limit (65536/(256×4)=64). The compiler likely produced suboptimal code at this register boundary — either tight spills or poor instruction scheduling from the pressure. The 10% per-row shuffle efficiency gain and wave reduction were completely overwhelmed by the register pressure penalty. **NCU confirmed SF=8 uses 56 regs; SF=4 would need ~64, leaving zero headroom.** The bidirectional register constraint (MIN_BLOCKS=4 → 64 regs max, RPW=4 needs ~64) makes SF=4 unviable with 8-warp blocks. **Only SF=8 (56 regs, 4 blocks/SM) and SF=16 (39 regs, 6 blocks/SM) are viable split factors with 256-thread blocks on sm100a.**
+
+## 2026-04-09 - Extend SF=16 Threshold to N≤6 (REVERTED)
+- **Idea**: Extend SF=16 dispatch from N≤5 to N≤6. Wave analysis: for N=6, both SF=16 (768 blocks, capacity 888) and SF=8 (384 blocks, capacity 592) fit in 1 wave. But SF=16 gives 87% SM slot utilization vs SF=8's 65%. The optimization log previously noted N≤6 was the theoretical optimal boundary.
+- **Result**: 308.97x → 271.41x mean speedup (reference variance), latency 0.767ms → 0.765ms (-0.2%, flat)
+- **Min/Max speedup**: 85.24x/898.09x → 83.49x/770.53x (reference variance)
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: reverted
+- **Learnings**: N=6 has only ~5 workloads in the benchmark set, and those workloads are already fast enough that the SF=16 vs SF=8 difference is negligible. The theoretical 32% SM utilization advantage is offset by SF=16's 20% higher per-row shuffle overhead. **The N≤5 threshold is the practical optimum — further extension provides zero measurable benefit. The SF=16 threshold boundary is now fully explored: N≤4, N≤5 (accepted), N≤6, and universal SF=16 have all been tested.**
+
+### Session Summary: Optimization Ceiling Confirmed
+Three independent optimization approaches were tested in this session, all resulting in no improvement:
+1. **Instruction-level reordering** (qs/ks split): compiler already optimal
+2. **Higher ILP via SF=4**: register pressure at 64-reg boundary kills performance
+3. **SF threshold tuning** (N≤6): marginal workload impact, no measurable gain
+
+Combined with the prior session's exhaustive analysis (Blackwell features, chunkwise parallelism, CuTe/CUTLASS), **the prefill kernel at ~0.77ms mean latency / ~309x mean speedup is confirmed at its optimization ceiling** for the register-resident warp-parallel scalar recurrence on B200 (sm100a). The ~42 cycle/timestep shuffle-bound critical path is an irreducible architectural limit of this approach.

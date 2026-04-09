@@ -64,11 +64,22 @@ Spawn the **`evaluator`** agent (subagent_type=evaluator) with:
 - Instructions to run `conda run -n fi-bench modal run scripts/run_modal_subfolder.py --subfolder <subfolder>`
 - Instructions to parse results and append to `logs/<kernel>/bench_history.jsonl`
 
-### Step 6: Evaluate & Decide
-Compare the evaluator's results with previous benchmarks:
-- If improved: update optimization log (Step 7), then commit using `/conventional-commit`
-- If regressed or no change: update the bench_history.jsonl entry with `"reverted": true`, revert kernel, and analyze why
-- If correctness fails: update the bench_history.jsonl entry with `"reverted": true`, revert kernel, and try the next-ranked idea from Step 2
+### Step 6: Post-Benchmark Profiling & Evaluate
+After benchmarking, run NCU profiling to understand **why** performance changed:
+
+1. **Run NCU profile**: `modal run scripts/profile_kernel.py --kernel <decode|prefill>`
+2. **Compare with Step 1 baseline profile** — check these key metrics:
+   - Did the **targeted bottleneck** actually improve? (e.g., if we aimed to reduce register pressure, did register count/spills decrease?)
+   - Did any **other metrics regress**? Common tradeoff patterns:
+     - Occupancy ↑ but register spills ↑ → net negative from L1 cache thrashing
+     - Compute throughput ↑ but memory throughput ↓ → data supply can't keep up
+     - Shared memory usage ↓ but bank conflicts ↑ → access pattern degraded
+     - Instruction count ↓ but warp stall cycles ↑ → introduced dependency chains
+3. **Decide** based on both benchmark numbers AND profile analysis:
+   - If improved AND profile confirms intended optimization worked cleanly: update optimization log (Step 7), then commit using `/conventional-commit`
+   - If improved BUT profile shows a new bottleneck was introduced: still accept, but note the new bottleneck in the optimization log as a follow-up target
+   - If regressed or no change: use profile diff to explain **why** (e.g., "occupancy improved 50%→75% but register spills increased 0→24, causing L1 thrashing"), update bench_history.jsonl entry with `"reverted": true`, revert kernel
+   - If correctness fails: update bench_history.jsonl entry with `"reverted": true`, revert kernel, and try the next-ranked idea from Step 2
 
 ### Step 7: Update Optimization Log
 Append to `logs/<kernel>/optimization_log.md`:
@@ -77,6 +88,8 @@ Append to `logs/<kernel>/optimization_log.md`:
 ## [Date] - [Optimization Name]
 - **Idea**: [Brief description]
 - **Result**: [speedup before] → [speedup after] ([+/-X%])
+- **Profile diff**: [Key metric changes, e.g., "occupancy 50%→75%, registers 64→48, spills 0→0"]
+- **Tradeoffs**: [Any metrics that regressed, or "none"]
 - **Git branch**: opt/<kernel>/<short-desc>
 - **Status**: accepted/reverted/needs-work
 - **Learnings**: [What we learned for future iterations]
