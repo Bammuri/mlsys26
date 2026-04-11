@@ -4,8 +4,7 @@ definition = "gdn_prefill_qk4_v8_d128_k_last" # Benchmark definition name
 author = "MSInfer"              # Team/author name
 
 [build]
-language = "cuda"                 # python | triton | cuda
-entry_point = "binding.cpp::run"   # Entry point: <file_path>::<function_name>
-dependencies = []
+language = "python"                 # python | triton | cuda
+entry_point = "main.py::run"   # Entry point: <file_path>::<function_name>
+dependencies = ["nvidia-cutlass-dsl"]
 destination_passing_style = false
-binding = "torch"
