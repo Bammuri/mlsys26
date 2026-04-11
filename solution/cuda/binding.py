@@ -128,7 +128,7 @@ def run(
 
     if chunk_gated_delta_rule is not None:
         x = a.float() + dt_bias.float()
-        g = -torch.exp(A_log.float()) * F.softplus(x)
+        g = torch.exp(-torch.exp(A_log.float()) * F.softplus(x))
         beta = torch.sigmoid(b.float())
         try:
             fast_output, fast_new_state = chunk_gated_delta_rule(
@@ -142,9 +142,13 @@ def run(
                 output_final_state=True,
                 cu_seqlens=cu_seqlens,
                 use_qk_l2norm_in_kernel=False,
+                output=output,
+                output_state=new_state,
             )
-            output.copy_(fast_output)
-            new_state.copy_(fast_new_state)
+            if fast_output.data_ptr() != output.data_ptr():
+                output.copy_(fast_output)
+            if fast_new_state.data_ptr() != new_state.data_ptr():
+                new_state.copy_(fast_new_state)
             return
         except Exception:
             pass
