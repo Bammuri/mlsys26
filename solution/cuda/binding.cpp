@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 
+#include <cstdlib>
 #include <tuple>
 
 namespace {
@@ -45,9 +46,8 @@ void check_inputs(
 torch::Tensor softplus_stable(const torch::Tensor& x) {
   return torch::where(x > 20.0, x, torch::log1p(torch::exp(x)));
 }
-}
 
-std::tuple<torch::Tensor, torch::Tensor> run(
+std::tuple<torch::Tensor, torch::Tensor> run_oracle_impl(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
@@ -58,8 +58,6 @@ std::tuple<torch::Tensor, torch::Tensor> run(
     torch::Tensor b,
     torch::Tensor cu_seqlens,
     double scale) {
-  check_inputs(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens);
-
   if (scale == 0.0) {
     scale = 1.0 / std::sqrt(static_cast<double>(kHeadSize));
   }
@@ -115,7 +113,78 @@ std::tuple<torch::Tensor, torch::Tensor> run(
 
   return std::make_tuple(output, new_state);
 }
+}  // namespace
+
+void gdn_prefill_cuda(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    c10::optional<torch::Tensor> state,
+    torch::Tensor A_log,
+    torch::Tensor a,
+    torch::Tensor dt_bias,
+    torch::Tensor b,
+    torch::Tensor cu_seqlens,
+    double scale,
+    torch::Tensor output,
+    torch::Tensor new_state);
+
+std::tuple<torch::Tensor, torch::Tensor> run_oracle(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    c10::optional<torch::Tensor> state,
+    torch::Tensor A_log,
+    torch::Tensor a,
+    torch::Tensor dt_bias,
+    torch::Tensor b,
+    torch::Tensor cu_seqlens,
+    double scale) {
+  check_inputs(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens);
+  return run_oracle_impl(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> run_kernel(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    c10::optional<torch::Tensor> state,
+    torch::Tensor A_log,
+    torch::Tensor a,
+    torch::Tensor dt_bias,
+    torch::Tensor b,
+    torch::Tensor cu_seqlens,
+    double scale) {
+  check_inputs(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens);
+  auto output = torch::empty({q.size(0), kNumVHeads, kHeadSize}, q.options());
+  torch::Tensor new_state;
+  if (state.has_value() && state.value().defined()) {
+    new_state = state.value();
+  } else {
+    new_state = torch::empty(
+        {cu_seqlens.size(0) - 1, kNumVHeads, kHeadSize, kHeadSize},
+        torch::TensorOptions().device(q.device()).dtype(torch::kFloat32));
+  }
+  gdn_prefill_cuda(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output, new_state);
+  return std::make_tuple(output, new_state);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> run(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    c10::optional<torch::Tensor> state,
+    torch::Tensor A_log,
+    torch::Tensor a,
+    torch::Tensor dt_bias,
+    torch::Tensor b,
+    torch::Tensor cu_seqlens,
+    double scale) {
+  return run_kernel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale);
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("run", &run, "Correctness-first native CUDA GDN prefill");
+  m.def("run", &run, "GDN prefill dispatch entrypoint");
+  m.def("run_oracle", &run_oracle, "Correctness-first oracle path");
+  m.def("run_kernel", &run_kernel, "kernel.cu fast path");
 }

@@ -27,29 +27,48 @@ constexpr int kRowTilesPerHead = kHeadSize / kRowsPerBlock;
 #define CHECK_F32(x) TORCH_CHECK((x).scalar_type() == torch::kFloat32, #x " must be float32")
 #define CHECK_I64(x) TORCH_CHECK((x).scalar_type() == torch::kInt64, #x " must be int64")
 
-__device__ inline float bf16_to_float(const c10::BFloat16* ptr) {
+__device__ __forceinline__ float bf16_to_float(const c10::BFloat16* ptr) {
   const __nv_bfloat16* raw = reinterpret_cast<const __nv_bfloat16*>(ptr);
   return __bfloat162float(*raw);
 }
 
-__device__ inline void float_to_bf16(float x, c10::BFloat16* ptr) {
+__device__ __forceinline__ void float_to_bf16(float x, c10::BFloat16* ptr) {
   __nv_bfloat16* raw = reinterpret_cast<__nv_bfloat16*>(ptr);
   *raw = __float2bfloat16(x);
 }
 
-__device__ inline float softplusf_stable(float x) {
+__device__ __forceinline__ float softplusf_stable(float x) {
   if (x > 20.0f) return x;
   if (x < -20.0f) return expf(x);
   return log1pf(expf(x));
 }
 
-__device__ inline float dot_float4(const float4& a, const float4& b) {
+__device__ __forceinline__ float4 load_bf16x4(const c10::BFloat16* ptr) {
+  const __nv_bfloat162* raw = reinterpret_cast<const __nv_bfloat162*>(ptr);
+  const float2 xy = __bfloat1622float2(raw[0]);
+  const float2 zw = __bfloat1622float2(raw[1]);
+  return make_float4(xy.x, xy.y, zw.x, zw.y);
+}
+
+__device__ __forceinline__ float dot_float4(const float4& a, const float4& b) {
   float acc = 0.0f;
   acc = fmaf(a.x, b.x, acc);
   acc = fmaf(a.y, b.y, acc);
   acc = fmaf(a.z, b.z, acc);
   acc = fmaf(a.w, b.w, acc);
   return acc;
+}
+
+__device__ __forceinline__ float warp_sum(float value) {
+#pragma unroll
+  for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+    value += __shfl_down_sync(0xffffffffu, value, offset);
+  }
+  return value;
+}
+
+__device__ __forceinline__ float warp_broadcast_0(float value) {
+  return __shfl_sync(0xffffffffu, value, 0);
 }
 
 __global__ __launch_bounds__(256, 2) void compute_gate_beta_kernel(
@@ -75,7 +94,7 @@ __global__ __launch_bounds__(256, 2) void compute_gate_beta_kernel(
       1.0f / (1.0f + expf(-b_val)));
 }
 
-__global__ __launch_bounds__(128, 2) void gdn_prefill_kernel(
+__global__ __launch_bounds__(kThreads, 4) void gdn_prefill_kernel(
     const c10::BFloat16* __restrict__ q,
     const c10::BFloat16* __restrict__ k,
     const c10::BFloat16* __restrict__ v,
@@ -87,99 +106,74 @@ __global__ __launch_bounds__(128, 2) void gdn_prefill_kernel(
     int64_t num_seqs,
     double scale,
     bool has_state) {
-  int seq_idx = blockIdx.y;
-  int head_idx = blockIdx.x;
-  int v_idx = threadIdx.x;
+  const int seq_idx = blockIdx.y;
+  const int head_idx = blockIdx.x / kRowTilesPerHead;
+  const int row_tile_idx = blockIdx.x % kRowTilesPerHead;
+  const int warp_idx = threadIdx.x / kWarpSize;
+  const int lane_idx = threadIdx.x % kWarpSize;
+  const int row_idx = row_tile_idx * kRowsPerBlock + warp_idx;
 
-  if (seq_idx >= num_seqs || head_idx >= kNumVHeads || v_idx >= kHeadSize) {
+  if (seq_idx >= num_seqs || head_idx >= kNumVHeads || row_idx >= kHeadSize) {
     return;
   }
 
-  extern __shared__ float shared_mem[];
-  float* state_sh = shared_mem;  // [128, 128]
-  float* q_sh = state_sh + kHeadSize * kHeadSize;
-  float* k_sh = q_sh + kHeadSize;
-  __shared__ float gate_sh;
-  __shared__ float beta_sh;
+  const int col_base = lane_idx * kVecSize;
+  const int q_head_idx = head_idx / (kNumVHeads / kNumQHeads);
+  const int k_head_idx = head_idx / (kNumVHeads / kNumKHeads);
+  const float scale_f = static_cast<float>(scale);
+  const int64_t seq_start = cu_seqlens[seq_idx];
+  const int64_t seq_end = cu_seqlens[seq_idx + 1];
+  const int64_t state_offset =
+      (((static_cast<int64_t>(seq_idx) * kNumVHeads + head_idx) * kHeadSize + row_idx) * kHeadSize +
+       col_base);
 
-  float* row = state_sh + v_idx * kHeadSize;
-  float4* row4 = reinterpret_cast<float4*>(row);
-  int64_t state_base = ((static_cast<int64_t>(seq_idx) * kNumVHeads + head_idx) * kHeadSize + v_idx) * kHeadSize;
-
+  float4 state_vec;
   if (has_state) {
-    const float4* state_in4 = reinterpret_cast<const float4*>(state_in + state_base);
-#pragma unroll
-    for (int i = 0; i < kHeadSize / 4; ++i) {
-      row4[i] = state_in4[i];
-    }
+    state_vec = reinterpret_cast<const float4*>(state_in + state_offset)[0];
   } else {
-#pragma unroll
-    for (int i = 0; i < kHeadSize / 4; ++i) {
-      row4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
-    }
+    state_vec = make_float4(0.f, 0.f, 0.f, 0.f);
   }
-  __syncthreads();
-
-  int64_t seq_start = cu_seqlens[seq_idx];
-  int64_t seq_end = cu_seqlens[seq_idx + 1];
-  int q_head_idx = head_idx / (kNumVHeads / kNumQHeads);
-  int k_head_idx = head_idx / (kNumVHeads / kNumKHeads);
-  float scale_f = static_cast<float>(scale);
 
   for (int64_t t = seq_start; t < seq_end; ++t) {
-    int64_t k_base = (t * kNumKHeads + k_head_idx) * kHeadSize;
-    int64_t q_base = (t * kNumQHeads + q_head_idx) * kHeadSize;
-    int64_t v_base = (t * kNumVHeads + head_idx) * kHeadSize;
+    const int64_t q_offset = ((t * kNumQHeads + q_head_idx) * kHeadSize) + col_base;
+    const int64_t k_offset = ((t * kNumKHeads + k_head_idx) * kHeadSize) + col_base;
+    const int64_t v_offset = ((t * kNumVHeads + head_idx) * kHeadSize) + row_idx;
 
-    q_sh[v_idx] = bf16_to_float(q + q_base + v_idx);
-    k_sh[v_idx] = bf16_to_float(k + k_base + v_idx);
-    __syncthreads();
+    const float4 q_vec = load_bf16x4(q + q_offset);
+    const float4 k_vec = load_bf16x4(k + k_offset);
 
-    if (v_idx == 0) {
-      int64_t gate_idx = t * kNumVHeads + head_idx;
-      float2 gate_beta_vec = gate_beta[gate_idx];
-      gate_sh = gate_beta_vec.x;
-      beta_sh = gate_beta_vec.y;
+    float gate = 0.0f;
+    float beta = 0.0f;
+    if (lane_idx == 0) {
+      const float2 gate_beta_vec = gate_beta[t * kNumVHeads + head_idx];
+      gate = gate_beta_vec.x;
+      beta = gate_beta_vec.y;
     }
-    __syncthreads();
+    gate = warp_broadcast_0(gate);
+    beta = warp_broadcast_0(beta);
 
-    float old_v = 0.0f;
-    const float4* k4 = reinterpret_cast<const float4*>(k_sh);
-#pragma unroll
-    for (int i = 0; i < kHeadSize / 4; ++i) {
-      old_v += dot_float4(k4[i], row4[i]);
+    float old_v = warp_sum(dot_float4(k_vec, state_vec));
+    old_v = gate * warp_broadcast_0(old_v);
+
+    float v_val = 0.0f;
+    if (lane_idx == 0) {
+      v_val = bf16_to_float(v + v_offset);
     }
-    old_v *= gate_sh;
+    v_val = warp_broadcast_0(v_val);
 
-    float v_val = bf16_to_float(v + v_base + v_idx);
-    float diff = beta_sh * (v_val - old_v);
+    const float diff = beta * (v_val - old_v);
+    state_vec.x = fmaf(k_vec.x, diff, gate * state_vec.x);
+    state_vec.y = fmaf(k_vec.y, diff, gate * state_vec.y);
+    state_vec.z = fmaf(k_vec.z, diff, gate * state_vec.z);
+    state_vec.w = fmaf(k_vec.w, diff, gate * state_vec.w);
 
-#pragma unroll
-    for (int i = 0; i < kHeadSize / 4; ++i) {
-      float4 k_vec = k4[i];
-      float4 r_vec = row4[i];
-      r_vec.x = fmaf(k_vec.x, diff, gate_sh * r_vec.x);
-      r_vec.y = fmaf(k_vec.y, diff, gate_sh * r_vec.y);
-      r_vec.z = fmaf(k_vec.z, diff, gate_sh * r_vec.z);
-      r_vec.w = fmaf(k_vec.w, diff, gate_sh * r_vec.w);
-      row4[i] = r_vec;
+    float out = warp_sum(dot_float4(q_vec, state_vec));
+    if (lane_idx == 0) {
+      float_to_bf16(scale_f * out, output + v_offset);
     }
-
-    float out = 0.0f;
-    const float4* q4 = reinterpret_cast<const float4*>(q_sh);
-#pragma unroll
-    for (int i = 0; i < kHeadSize / 4; ++i) {
-      out += dot_float4(q4[i], row4[i]);
-    }
-    float_to_bf16(scale_f * out, output + v_base + v_idx);
-    __syncthreads();
   }
 
-  float4* state_out4 = reinterpret_cast<float4*>(state_out + state_base);
-#pragma unroll
-  for (int i = 0; i < kHeadSize / 4; ++i) {
-    state_out4[i] = row4[i];
-  }
+  reinterpret_cast<float4*>(state_out + state_offset)[0] = state_vec;
 }
 
 }  // namespace
@@ -249,7 +243,7 @@ void gdn_prefill_cuda(
     scale = 1.0 / std::sqrt(static_cast<double>(kHeadSize));
   }
 
-  bool has_state = state.has_value() && state.value().defined();
+  const bool has_state = state.has_value() && state.value().defined();
   torch::Tensor state_in;
   if (has_state) {
     state_in = state.value();
@@ -258,7 +252,7 @@ void gdn_prefill_cuda(
     CHECK_F32(state_in);
   }
 
-  int64_t num_seqs = cu_seqlens.numel() - 1;
+  const int64_t num_seqs = cu_seqlens.numel() - 1;
   auto gate_beta = torch::empty(
       {q.size(0), kNumVHeads, 2},
       torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
@@ -279,20 +273,13 @@ void gdn_prefill_cuda(
   TORCH_CHECK(output.device() == q.device(), "output must be on the same device as q");
   TORCH_CHECK(new_state.device() == q.device(), "new_state must be on the same device as q");
 
-  dim3 grid(kNumVHeads, static_cast<unsigned int>(num_seqs), 1);
-  dim3 block(kThreads, 1, 1);
-  size_t shared_bytes =
-      static_cast<size_t>(kHeadSize * kHeadSize + kHeadSize + kHeadSize) * sizeof(float);
-
-  cudaFuncSetAttribute(
-      gdn_prefill_kernel,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(shared_bytes));
+  const dim3 grid(kNumVHeads * kRowTilesPerHead, static_cast<unsigned int>(num_seqs), 1);
+  const dim3 block(kThreads, 1, 1);
 
   auto stream = c10::cuda::getDefaultCUDAStream();
-  int total_gate_elems = static_cast<int>(q.size(0) * kNumVHeads);
-  int pre_threads = 256;
-  int pre_blocks = (total_gate_elems + pre_threads - 1) / pre_threads;
+  const int total_gate_elems = static_cast<int>(q.size(0) * kNumVHeads);
+  const int pre_threads = 256;
+  const int pre_blocks = (total_gate_elems + pre_threads - 1) / pre_threads;
   compute_gate_beta_kernel<<<pre_blocks, pre_threads, 0, stream.stream()>>>(
       A_log.data_ptr<float>(),
       a.data_ptr<c10::BFloat16>(),
@@ -301,7 +288,8 @@ void gdn_prefill_cuda(
       reinterpret_cast<float2*>(gate_beta.data_ptr<float>()),
       static_cast<int>(q.size(0)));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  gdn_prefill_kernel<<<grid, block, shared_bytes, stream.stream()>>>(
+
+  gdn_prefill_kernel<<<grid, block, 0, stream.stream()>>>(
       q.data_ptr<c10::BFloat16>(),
       k.data_ptr<c10::BFloat16>(),
       v.data_ptr<c10::BFloat16>(),
@@ -313,6 +301,5 @@ void gdn_prefill_cuda(
       num_seqs,
       scale,
       has_state);
-
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
