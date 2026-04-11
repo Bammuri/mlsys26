@@ -5,6 +5,7 @@ author = "MSInfer"              # Team/author name
 
 [build]
 language = "cuda"                 # python | triton | cuda
-entry_point = "binding.py::run"   # Entry point: <file_path>::<function_name>
+entry_point = "binding.cpp::run"   # Entry point: <file_path>::<function_name>
 dependencies = []
+destination_passing_style = false
 binding = "torch"
