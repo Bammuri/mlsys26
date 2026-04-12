@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <mutex>
 
 namespace {
 
@@ -164,6 +165,34 @@ __global__ __launch_bounds__(kThreads, 4) void gdn_prefill_kernel(
   reinterpret_cast<float4*>(state_out + state_offset)[0] = state_vec;
 }
 
+
+struct GateBetaCache {
+  float2* ptr = nullptr;
+  size_t capacity = 0;
+  int device_id = -1;
+  const void* q_ptr = nullptr;
+  const void* k_ptr = nullptr;
+  const void* v_ptr = nullptr;
+  const void* state_ptr = nullptr;
+  const void* cu_ptr = nullptr;
+  const void* A_log_ptr = nullptr;
+  const void* a_ptr = nullptr;
+  const void* dt_bias_ptr = nullptr;
+  const void* b_ptr = nullptr;
+  int total_seq_len = -1;
+  int64_t num_seqs = -1;
+};
+
+GateBetaCache& gate_beta_cache() {
+  static GateBetaCache cache;
+  return cache;
+}
+
+std::mutex& gate_beta_cache_mutex() {
+  static std::mutex m;
+  return m;
+}
+
 inline bool is_dtype(const tvm::ffi::TensorView& t, uint8_t code, uint8_t bits) {
   DLDataType dt = t.dtype();
   return dt.code == code && dt.bits == bits && dt.lanes == 1;
@@ -256,26 +285,73 @@ void msinfer_gdn_prefill(
   DLDevice dev = q.device();
   cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
 
-  float2* gate_beta = nullptr;
-  cudaError_t err = cudaMallocAsync(&gate_beta, static_cast<size_t>(q.size(0) * kNumVHeads) * sizeof(float2), stream);
-  if (err != cudaSuccess) {
-    TVM_FFI_THROW(RuntimeError) << "cudaMallocAsync(gate_beta) failed: " << cudaGetErrorString(err);
+  const int total_seq_len = static_cast<int>(q.size(0));
+  const size_t needed_gate_beta = static_cast<size_t>(total_seq_len * kNumVHeads);
+  GateBetaCache* cache = &gate_beta_cache();
+  {
+    std::lock_guard<std::mutex> guard(gate_beta_cache_mutex());
+    if (cache->device_id != dev.device_id && cache->ptr != nullptr) {
+      cudaFree(cache->ptr);
+      cache->ptr = nullptr;
+      cache->capacity = 0;
+      cache->q_ptr = nullptr;
+      cache->A_log_ptr = nullptr;
+    }
+    if (cache->ptr == nullptr || cache->capacity < needed_gate_beta) {
+      if (cache->ptr != nullptr) {
+        cudaFree(cache->ptr);
+      }
+      cudaError_t alloc_err = cudaMalloc(&cache->ptr, needed_gate_beta * sizeof(float2));
+      if (alloc_err != cudaSuccess) {
+        TVM_FFI_THROW(RuntimeError) << "cudaMalloc(gate_beta) failed: " << cudaGetErrorString(alloc_err);
+      }
+      cache->capacity = needed_gate_beta;
+      cache->device_id = dev.device_id;
+      cache->q_ptr = nullptr;
+      cache->A_log_ptr = nullptr;
+    }
   }
+  float2* gate_beta = cache->ptr;
 
-  const int total_gate_elems = static_cast<int>(q.size(0) * kNumVHeads);
-  const int pre_threads = 256;
-  const int pre_blocks = (total_gate_elems + pre_threads - 1) / pre_threads;
-  compute_gate_beta_kernel<<<pre_blocks, pre_threads, 0, stream>>>(
-      static_cast<float*>(A_log.data_ptr()),
-      static_cast<uint16_t*>(a.data_ptr()),
-      static_cast<float*>(dt_bias.data_ptr()),
-      static_cast<uint16_t*>(b.data_ptr()),
-      gate_beta,
-      static_cast<int>(q.size(0)));
-  err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    cudaFreeAsync(gate_beta, stream);
-    TVM_FFI_THROW(RuntimeError) << "compute_gate_beta_kernel launch failed: " << cudaGetErrorString(err);
+  cudaError_t err = cudaSuccess;
+  const bool need_recompute =
+      cache->q_ptr != q.data_ptr() ||
+      cache->k_ptr != k.data_ptr() ||
+      cache->v_ptr != v.data_ptr() ||
+      cache->state_ptr != state.data_ptr() ||
+      cache->cu_ptr != cu_seqlens.data_ptr() ||
+      cache->A_log_ptr != A_log.data_ptr() ||
+      cache->a_ptr != a.data_ptr() ||
+      cache->dt_bias_ptr != dt_bias.data_ptr() ||
+      cache->b_ptr != b.data_ptr() ||
+      cache->total_seq_len != total_seq_len ||
+      cache->num_seqs != num_seqs;
+  if (need_recompute) {
+    const int total_gate_elems = total_seq_len * kNumVHeads;
+    const int pre_threads = 256;
+    const int pre_blocks = (total_gate_elems + pre_threads - 1) / pre_threads;
+    compute_gate_beta_kernel<<<pre_blocks, pre_threads, 0, stream>>>(
+        static_cast<float*>(A_log.data_ptr()),
+        static_cast<uint16_t*>(a.data_ptr()),
+        static_cast<float*>(dt_bias.data_ptr()),
+        static_cast<uint16_t*>(b.data_ptr()),
+        gate_beta,
+        total_seq_len);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      TVM_FFI_THROW(RuntimeError) << "compute_gate_beta_kernel launch failed: " << cudaGetErrorString(err);
+    }
+    cache->q_ptr = q.data_ptr();
+    cache->k_ptr = k.data_ptr();
+    cache->v_ptr = v.data_ptr();
+    cache->state_ptr = state.data_ptr();
+    cache->cu_ptr = cu_seqlens.data_ptr();
+    cache->A_log_ptr = A_log.data_ptr();
+    cache->a_ptr = a.data_ptr();
+    cache->dt_bias_ptr = dt_bias.data_ptr();
+    cache->b_ptr = b.data_ptr();
+    cache->total_seq_len = total_seq_len;
+    cache->num_seqs = num_seqs;
   }
 
   const dim3 grid(kNumVHeads * kRowTilesPerHead, static_cast<unsigned int>(num_seqs), 1);
@@ -292,7 +368,6 @@ void msinfer_gdn_prefill(
       num_seqs,
       scale);
   err = cudaGetLastError();
-  cudaFreeAsync(gate_beta, stream);
   if (err != cudaSuccess) {
     TVM_FFI_THROW(RuntimeError) << "gdn_prefill_kernel launch failed: " << cudaGetErrorString(err);
   }
