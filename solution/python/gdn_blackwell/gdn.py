@@ -4530,6 +4530,7 @@ def _get_compiled_gdn_prefill_kernel(
     is_initial_state: bool,
     is_output_state: bool,
     scale: float,
+    is_persistent: bool,
 ):
     """Cache compiled kernel for given configuration."""
     return {}
@@ -4548,6 +4549,7 @@ def chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     output: Optional[torch.Tensor] = None,
     output_state: Optional[torch.Tensor] = None,
+    is_persistent: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Public API: compile (on first call) and run the GDN chunked linear attention kernel.
 
@@ -4605,6 +4607,7 @@ def chunk_gated_delta_rule(
         is_initial_state,
         is_output_state,
         scale,
+        is_persistent,
     )
     cache = _get_compiled_gdn_prefill_kernel(*cache_key)
 
@@ -4612,7 +4615,7 @@ def chunk_gated_delta_rule(
 
     if "compiled_gdn" not in cache:
         # GDN kernel
-        gdn = GDN()
+        gdn = GDN(is_persistent=is_persistent)
         q_tensor = from_dlpack(q, assumed_align=16, enable_tvm_ffi=True)
         k_tensor = from_dlpack(k, assumed_align=16, enable_tvm_ffi=True)
         v_tensor = from_dlpack(v, assumed_align=16, enable_tvm_ffi=True)
