@@ -5,6 +5,6 @@ author = "MSInfer"              # Team/author name
 
 [build]
 language = "python"                 # python | triton | cuda
-entry_point = "main.py::run"   # Entry point: <file_path>::<function_name>
+entry_point = "msinfer_entry.py::run"   # Entry point: <file_path>::<function_name>
 dependencies = ["nvidia-cutlass-dsl", "cuda-python>=12.8"]
-destination_passing_style = false
+destination_passing_style = true
