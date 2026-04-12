@@ -1,14 +1,12 @@
+#include <torch/extension.h>
+
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-#include <dlpack/dlpack.h>
-#include <tvm/ffi/container/tensor.h>
-#include <tvm/ffi/error.h>
-#include <tvm/ffi/extra/c_env_api.h>
-#include <tvm/ffi/function.h>
 
 #include <cmath>
 #include <cstdint>
-#include <mutex>
 
 namespace {
 
@@ -23,12 +21,18 @@ constexpr int kRowsPerBlock = kWarpsPerBlock;
 constexpr int kThreads = kWarpsPerBlock * kWarpSize;
 constexpr int kRowTilesPerHead = kHeadSize / kRowsPerBlock;
 
-__device__ __forceinline__ float bf16_to_float(const uint16_t* ptr) {
+#define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
+#define CHECK_BF16(x) TORCH_CHECK((x).scalar_type() == torch::kBFloat16, #x " must be bfloat16")
+#define CHECK_F32(x) TORCH_CHECK((x).scalar_type() == torch::kFloat32, #x " must be float32")
+#define CHECK_I64(x) TORCH_CHECK((x).scalar_type() == torch::kInt64, #x " must be int64")
+
+__device__ __forceinline__ float bf16_to_float(const c10::BFloat16* ptr) {
   const __nv_bfloat16* raw = reinterpret_cast<const __nv_bfloat16*>(ptr);
   return __bfloat162float(*raw);
 }
 
-__device__ __forceinline__ void float_to_bf16(float x, uint16_t* ptr) {
+__device__ __forceinline__ void float_to_bf16(float x, c10::BFloat16* ptr) {
   __nv_bfloat16* raw = reinterpret_cast<__nv_bfloat16*>(ptr);
   *raw = __float2bfloat16(x);
 }
@@ -39,7 +43,7 @@ __device__ __forceinline__ float softplusf_stable(float x) {
   return log1pf(expf(x));
 }
 
-__device__ __forceinline__ float4 load_bf16x4(const uint16_t* ptr) {
+__device__ __forceinline__ float4 load_bf16x4(const c10::BFloat16* ptr) {
   const __nv_bfloat162* raw = reinterpret_cast<const __nv_bfloat162*>(ptr);
   const float2 xy = __bfloat1622float2(raw[0]);
   const float2 zw = __bfloat1622float2(raw[1]);
@@ -69,9 +73,9 @@ __device__ __forceinline__ float warp_broadcast_0(float value) {
 
 __global__ __launch_bounds__(256, 2) void compute_gate_beta_kernel(
     const float* __restrict__ A_log,
-    const uint16_t* __restrict__ a,
+    const c10::BFloat16* __restrict__ a,
     const float* __restrict__ dt_bias,
-    const uint16_t* __restrict__ b,
+    const c10::BFloat16* __restrict__ b,
     float2* __restrict__ gate_beta,
     int total_seq_len) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -91,16 +95,17 @@ __global__ __launch_bounds__(256, 2) void compute_gate_beta_kernel(
 }
 
 __global__ __launch_bounds__(kThreads, 4) void gdn_prefill_kernel(
-    const uint16_t* __restrict__ q,
-    const uint16_t* __restrict__ k,
-    const uint16_t* __restrict__ v,
+    const c10::BFloat16* __restrict__ q,
+    const c10::BFloat16* __restrict__ k,
+    const c10::BFloat16* __restrict__ v,
     const float* __restrict__ state_in,
     float* __restrict__ state_out,
     const float2* __restrict__ gate_beta,
     const int64_t* __restrict__ cu_seqlens,
-    uint16_t* __restrict__ output,
+    c10::BFloat16* __restrict__ output,
     int64_t num_seqs,
-    float scale) {
+    double scale,
+    bool has_state) {
   const int seq_idx = blockIdx.y;
   const int head_idx = blockIdx.x / kRowTilesPerHead;
   const int row_tile_idx = blockIdx.x % kRowTilesPerHead;
@@ -115,13 +120,19 @@ __global__ __launch_bounds__(kThreads, 4) void gdn_prefill_kernel(
   const int col_base = lane_idx * kVecSize;
   const int q_head_idx = head_idx / (kNumVHeads / kNumQHeads);
   const int k_head_idx = head_idx / (kNumVHeads / kNumKHeads);
+  const float scale_f = static_cast<float>(scale);
   const int64_t seq_start = cu_seqlens[seq_idx];
   const int64_t seq_end = cu_seqlens[seq_idx + 1];
   const int64_t state_offset =
       (((static_cast<int64_t>(seq_idx) * kNumVHeads + head_idx) * kHeadSize + row_idx) * kHeadSize +
        col_base);
 
-  float4 state_vec = reinterpret_cast<const float4*>(state_in + state_offset)[0];
+  float4 state_vec;
+  if (has_state) {
+    state_vec = reinterpret_cast<const float4*>(state_in + state_offset)[0];
+  } else {
+    state_vec = make_float4(0.f, 0.f, 0.f, 0.f);
+  }
 
   for (int64_t t = seq_start; t < seq_end; ++t) {
     const int64_t q_offset = ((t * kNumQHeads + q_head_idx) * kHeadSize) + col_base;
@@ -158,221 +169,137 @@ __global__ __launch_bounds__(kThreads, 4) void gdn_prefill_kernel(
 
     float out = warp_sum(dot_float4(q_vec, state_vec));
     if (lane_idx == 0) {
-      float_to_bf16(scale * out, output + v_offset);
+      float_to_bf16(scale_f * out, output + v_offset);
     }
   }
 
   reinterpret_cast<float4*>(state_out + state_offset)[0] = state_vec;
 }
 
+}  // namespace
 
-struct GateBetaCache {
-  float2* ptr = nullptr;
-  size_t capacity = 0;
-  int device_id = -1;
-  const void* q_ptr = nullptr;
-  const void* k_ptr = nullptr;
-  const void* v_ptr = nullptr;
-  const void* state_ptr = nullptr;
-  const void* cu_ptr = nullptr;
-  const void* A_log_ptr = nullptr;
-  const void* a_ptr = nullptr;
-  const void* dt_bias_ptr = nullptr;
-  const void* b_ptr = nullptr;
-  int total_seq_len = -1;
-  int64_t num_seqs = -1;
-};
+void gdn_prefill_cuda(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    c10::optional<torch::Tensor> state,
+    torch::Tensor A_log,
+    torch::Tensor a,
+    torch::Tensor dt_bias,
+    torch::Tensor b,
+    torch::Tensor cu_seqlens,
+    double scale,
+    torch::Tensor output,
+    torch::Tensor new_state) {
+  CHECK_CUDA(q);
+  CHECK_CUDA(k);
+  CHECK_CUDA(v);
+  CHECK_CUDA(A_log);
+  CHECK_CUDA(a);
+  CHECK_CUDA(dt_bias);
+  CHECK_CUDA(b);
+  CHECK_CUDA(cu_seqlens);
+  CHECK_CUDA(output);
+  CHECK_CUDA(new_state);
 
-GateBetaCache& gate_beta_cache() {
-  static GateBetaCache cache;
-  return cache;
-}
+  CHECK_CONTIGUOUS(q);
+  CHECK_CONTIGUOUS(k);
+  CHECK_CONTIGUOUS(v);
+  CHECK_CONTIGUOUS(A_log);
+  CHECK_CONTIGUOUS(a);
+  CHECK_CONTIGUOUS(dt_bias);
+  CHECK_CONTIGUOUS(b);
+  CHECK_CONTIGUOUS(cu_seqlens);
+  CHECK_CONTIGUOUS(output);
+  CHECK_CONTIGUOUS(new_state);
 
-std::mutex& gate_beta_cache_mutex() {
-  static std::mutex m;
-  return m;
-}
+  CHECK_BF16(q);
+  CHECK_BF16(k);
+  CHECK_BF16(v);
+  CHECK_BF16(a);
+  CHECK_BF16(b);
+  CHECK_BF16(output);
+  CHECK_F32(A_log);
+  CHECK_F32(dt_bias);
+  CHECK_F32(new_state);
+  CHECK_I64(cu_seqlens);
 
-inline bool is_dtype(const tvm::ffi::TensorView& t, uint8_t code, uint8_t bits) {
-  DLDataType dt = t.dtype();
-  return dt.code == code && dt.bits == bits && dt.lanes == 1;
-}
+  TORCH_CHECK(q.dim() == 3, "q must have shape [total_seq_len, 4, 128]");
+  TORCH_CHECK(k.dim() == 3, "k must have shape [total_seq_len, 4, 128]");
+  TORCH_CHECK(v.dim() == 3, "v must have shape [total_seq_len, 8, 128]");
+  TORCH_CHECK(q.size(1) == kNumQHeads && k.size(1) == kNumKHeads && v.size(1) == kNumVHeads,
+              "unexpected head counts");
+  TORCH_CHECK(q.size(2) == kHeadSize && k.size(2) == kHeadSize && v.size(2) == kHeadSize,
+              "head size must be 128");
+  TORCH_CHECK(A_log.numel() == kNumVHeads, "A_log must have 8 elements");
+  TORCH_CHECK(dt_bias.numel() == kNumVHeads, "dt_bias must have 8 elements");
+  TORCH_CHECK(a.size(0) == q.size(0) && a.size(1) == kNumVHeads, "a must have shape [T, 8]");
+  TORCH_CHECK(b.size(0) == q.size(0) && b.size(1) == kNumVHeads, "b must have shape [T, 8]");
+  TORCH_CHECK(cu_seqlens.dim() == 1 && cu_seqlens.numel() >= 2, "cu_seqlens must be [N+1]");
 
-inline void check_cuda_tensor(const tvm::ffi::TensorView& t, const char* name) {
-  if (t.device().device_type != kDLCUDA) {
-    TVM_FFI_THROW(ValueError) << name << " must be a CUDA tensor";
-  }
-  if (!t.IsContiguous()) {
-    TVM_FFI_THROW(ValueError) << name << " must be contiguous";
-  }
-}
+  c10::cuda::CUDAGuard device_guard(q.device());
 
-void msinfer_gdn_prefill(
-    tvm::ffi::TensorView q,
-    tvm::ffi::TensorView k,
-    tvm::ffi::TensorView v,
-    tvm::ffi::TensorView state,
-    tvm::ffi::TensorView A_log,
-    tvm::ffi::TensorView a,
-    tvm::ffi::TensorView dt_bias,
-    tvm::ffi::TensorView b,
-    tvm::ffi::TensorView cu_seqlens,
-    float scale,
-    tvm::ffi::TensorView output,
-    tvm::ffi::TensorView new_state) {
-  check_cuda_tensor(q, "q");
-  check_cuda_tensor(k, "k");
-  check_cuda_tensor(v, "v");
-  check_cuda_tensor(state, "state");
-  check_cuda_tensor(A_log, "A_log");
-  check_cuda_tensor(a, "a");
-  check_cuda_tensor(dt_bias, "dt_bias");
-  check_cuda_tensor(b, "b");
-  check_cuda_tensor(cu_seqlens, "cu_seqlens");
-  check_cuda_tensor(output, "output");
-  check_cuda_tensor(new_state, "new_state");
-
-  if (!is_dtype(q, kDLBfloat, 16) || !is_dtype(k, kDLBfloat, 16) || !is_dtype(v, kDLBfloat, 16) ||
-      !is_dtype(a, kDLBfloat, 16) || !is_dtype(b, kDLBfloat, 16) || !is_dtype(output, kDLBfloat, 16)) {
-    TVM_FFI_THROW(TypeError) << "q/k/v/a/b/output must be bfloat16";
-  }
-  if (!is_dtype(A_log, kDLFloat, 32) || !is_dtype(dt_bias, kDLFloat, 32) || !is_dtype(state, kDLFloat, 32) ||
-      !is_dtype(new_state, kDLFloat, 32)) {
-    TVM_FFI_THROW(TypeError) << "A_log/dt_bias/state/new_state must be float32";
-  }
-  if (!is_dtype(cu_seqlens, kDLInt, 64)) {
-    TVM_FFI_THROW(TypeError) << "cu_seqlens must be int64";
+  if (scale == 0.0) {
+    scale = 1.0 / std::sqrt(static_cast<double>(kHeadSize));
   }
 
-  if (q.ndim() != 3 || k.ndim() != 3 || v.ndim() != 3) {
-    TVM_FFI_THROW(ValueError) << "q/k/v must be rank-3";
-  }
-  if (state.ndim() != 4 || new_state.ndim() != 4 || output.ndim() != 3) {
-    TVM_FFI_THROW(ValueError) << "state/new_state/output ranks are invalid";
-  }
-  if (q.size(1) != kNumQHeads || k.size(1) != kNumKHeads || v.size(1) != kNumVHeads) {
-    TVM_FFI_THROW(ValueError) << "unexpected head counts";
-  }
-  if (q.size(2) != kHeadSize || k.size(2) != kHeadSize || v.size(2) != kHeadSize) {
-    TVM_FFI_THROW(ValueError) << "head size must be 128";
-  }
-  if (A_log.numel() != kNumVHeads || dt_bias.numel() != kNumVHeads) {
-    TVM_FFI_THROW(ValueError) << "A_log and dt_bias must have 8 elements";
-  }
-  if (a.size(0) != q.size(0) || a.size(1) != kNumVHeads || b.size(0) != q.size(0) || b.size(1) != kNumVHeads) {
-    TVM_FFI_THROW(ValueError) << "a/b shape mismatch";
-  }
-  if (cu_seqlens.ndim() != 1 || cu_seqlens.numel() < 2) {
-    TVM_FFI_THROW(ValueError) << "cu_seqlens must be [N+1]";
+  const bool has_state = state.has_value() && state.value().defined();
+  torch::Tensor state_in;
+  if (has_state) {
+    state_in = state.value();
+    CHECK_CUDA(state_in);
+    CHECK_CONTIGUOUS(state_in);
+    CHECK_F32(state_in);
   }
 
   const int64_t num_seqs = cu_seqlens.numel() - 1;
-  if (state.size(0) != num_seqs || new_state.size(0) != num_seqs) {
-    TVM_FFI_THROW(ValueError) << "state/new_state num_seqs mismatch";
-  }
-  if (state.size(1) != kNumVHeads || state.size(2) != kHeadSize || state.size(3) != kHeadSize ||
-      new_state.size(1) != kNumVHeads || new_state.size(2) != kHeadSize || new_state.size(3) != kHeadSize) {
-    TVM_FFI_THROW(ValueError) << "state/new_state shape mismatch";
-  }
-  if (output.size(0) != q.size(0) || output.size(1) != kNumVHeads || output.size(2) != kHeadSize) {
-    TVM_FFI_THROW(ValueError) << "output shape mismatch";
-  }
+  auto gate_beta = torch::empty(
+      {q.size(0), kNumVHeads, 2},
+      torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
 
-  if (scale == 0.0f) {
-    scale = 1.0f / std::sqrt(static_cast<float>(kHeadSize));
+  if (has_state) {
+    TORCH_CHECK(
+        state_in.sizes() == new_state.sizes(),
+        "state must have shape [num_seqs, 8, 128, 128]");
   }
-
-  DLDevice dev = q.device();
-  cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
-
-  const int total_seq_len = static_cast<int>(q.size(0));
-  const size_t needed_gate_beta = static_cast<size_t>(total_seq_len * kNumVHeads);
-  GateBetaCache* cache = &gate_beta_cache();
-  {
-    std::lock_guard<std::mutex> guard(gate_beta_cache_mutex());
-    if (cache->device_id != dev.device_id && cache->ptr != nullptr) {
-      cudaFree(cache->ptr);
-      cache->ptr = nullptr;
-      cache->capacity = 0;
-      cache->q_ptr = nullptr;
-      cache->A_log_ptr = nullptr;
-    }
-    if (cache->ptr == nullptr || cache->capacity < needed_gate_beta) {
-      if (cache->ptr != nullptr) {
-        cudaFree(cache->ptr);
-      }
-      cudaError_t alloc_err = cudaMalloc(&cache->ptr, needed_gate_beta * sizeof(float2));
-      if (alloc_err != cudaSuccess) {
-        TVM_FFI_THROW(RuntimeError) << "cudaMalloc(gate_beta) failed: " << cudaGetErrorString(alloc_err);
-      }
-      cache->capacity = needed_gate_beta;
-      cache->device_id = dev.device_id;
-      cache->q_ptr = nullptr;
-      cache->A_log_ptr = nullptr;
-    }
-  }
-  float2* gate_beta = cache->ptr;
-
-  cudaError_t err = cudaSuccess;
-  const bool need_recompute =
-      cache->q_ptr != q.data_ptr() ||
-      cache->k_ptr != k.data_ptr() ||
-      cache->v_ptr != v.data_ptr() ||
-      cache->state_ptr != state.data_ptr() ||
-      cache->cu_ptr != cu_seqlens.data_ptr() ||
-      cache->A_log_ptr != A_log.data_ptr() ||
-      cache->a_ptr != a.data_ptr() ||
-      cache->dt_bias_ptr != dt_bias.data_ptr() ||
-      cache->b_ptr != b.data_ptr() ||
-      cache->total_seq_len != total_seq_len ||
-      cache->num_seqs != num_seqs;
-  if (need_recompute) {
-    const int total_gate_elems = total_seq_len * kNumVHeads;
-    const int pre_threads = 256;
-    const int pre_blocks = (total_gate_elems + pre_threads - 1) / pre_threads;
-    compute_gate_beta_kernel<<<pre_blocks, pre_threads, 0, stream>>>(
-        static_cast<float*>(A_log.data_ptr()),
-        static_cast<uint16_t*>(a.data_ptr()),
-        static_cast<float*>(dt_bias.data_ptr()),
-        static_cast<uint16_t*>(b.data_ptr()),
-        gate_beta,
-        total_seq_len);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      TVM_FFI_THROW(RuntimeError) << "compute_gate_beta_kernel launch failed: " << cudaGetErrorString(err);
-    }
-    cache->q_ptr = q.data_ptr();
-    cache->k_ptr = k.data_ptr();
-    cache->v_ptr = v.data_ptr();
-    cache->state_ptr = state.data_ptr();
-    cache->cu_ptr = cu_seqlens.data_ptr();
-    cache->A_log_ptr = A_log.data_ptr();
-    cache->a_ptr = a.data_ptr();
-    cache->dt_bias_ptr = dt_bias.data_ptr();
-    cache->b_ptr = b.data_ptr();
-    cache->total_seq_len = total_seq_len;
-    cache->num_seqs = num_seqs;
-  }
+  TORCH_CHECK(
+      output.dim() == 3 && output.size(0) == q.size(0) && output.size(1) == kNumVHeads &&
+          output.size(2) == kHeadSize,
+      "output must have shape [total_seq_len, 8, 128]");
+  TORCH_CHECK(
+      new_state.dim() == 4 && new_state.size(0) == num_seqs && new_state.size(1) == kNumVHeads &&
+          new_state.size(2) == kHeadSize && new_state.size(3) == kHeadSize,
+      "new_state must have shape [num_seqs, 8, 128, 128]");
+  TORCH_CHECK(output.device() == q.device(), "output must be on the same device as q");
+  TORCH_CHECK(new_state.device() == q.device(), "new_state must be on the same device as q");
 
   const dim3 grid(kNumVHeads * kRowTilesPerHead, static_cast<unsigned int>(num_seqs), 1);
   const dim3 block(kThreads, 1, 1);
-  gdn_prefill_kernel<<<grid, block, 0, stream>>>(
-      static_cast<uint16_t*>(q.data_ptr()),
-      static_cast<uint16_t*>(k.data_ptr()),
-      static_cast<uint16_t*>(v.data_ptr()),
-      static_cast<float*>(state.data_ptr()),
-      static_cast<float*>(new_state.data_ptr()),
-      gate_beta,
-      static_cast<int64_t*>(cu_seqlens.data_ptr()),
-      static_cast<uint16_t*>(output.data_ptr()),
+
+  auto stream = c10::cuda::getDefaultCUDAStream();
+  const int total_gate_elems = static_cast<int>(q.size(0) * kNumVHeads);
+  const int pre_threads = 256;
+  const int pre_blocks = (total_gate_elems + pre_threads - 1) / pre_threads;
+  compute_gate_beta_kernel<<<pre_blocks, pre_threads, 0, stream.stream()>>>(
+      A_log.data_ptr<float>(),
+      a.data_ptr<c10::BFloat16>(),
+      dt_bias.data_ptr<float>(),
+      b.data_ptr<c10::BFloat16>(),
+      reinterpret_cast<float2*>(gate_beta.data_ptr<float>()),
+      static_cast<int>(q.size(0)));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  gdn_prefill_kernel<<<grid, block, 0, stream.stream()>>>(
+      q.data_ptr<c10::BFloat16>(),
+      k.data_ptr<c10::BFloat16>(),
+      v.data_ptr<c10::BFloat16>(),
+      has_state ? state_in.data_ptr<float>() : nullptr,
+      new_state.data_ptr<float>(),
+      reinterpret_cast<const float2*>(gate_beta.data_ptr<float>()),
+      cu_seqlens.data_ptr<int64_t>(),
+      output.data_ptr<c10::BFloat16>(),
       num_seqs,
-      scale);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    TVM_FFI_THROW(RuntimeError) << "gdn_prefill_kernel launch failed: " << cudaGetErrorString(err);
-  }
+      scale,
+      has_state);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-
-}  // namespace
-
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(msinfer_gdn_prefill, msinfer_gdn_prefill);
