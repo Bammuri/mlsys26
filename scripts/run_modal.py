@@ -20,18 +20,18 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import modal
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 
-app = modal.App("flashinfer-bench")
+app = modal.App("flashinfer-bench-v2")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:latest", add_python="3.12")
     .pip_install("flashinfer-bench", "torch", "triton", "numpy")
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+@app.function(image=image, gpu="B200:1", timeout=7200, volumes={TRACE_SET_PATH: trace_volume})
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
