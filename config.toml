@@ -1,5 +1,5 @@
 [solution]
-name = "gdn-cuda-v2"
+name = "gdn-cuda-v6"
 definition = "gdn_decode_qk4_v8_d128_k_last"
 author = "team"
 
