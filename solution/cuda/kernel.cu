@@ -1,6 +1,6 @@
 /*
  * GDN decode + prefill CUDA kernels with TVM FFI binding.
- * v13: v12 + V-dim split (2 blocks per (batch, v_head), 64 threads each).
+ * v14: 4-way V-dim split (4 blocks per (batch, v_head), 32 threads each).
  */
 
 #include <cuda_bf16.h>
@@ -56,11 +56,11 @@ __device__ __forceinline__ void st_global_cs_v4(float4* addr, float4 v) {
 // Decode kernel — v13: V-dim split (2 blocks per work item, 64 threads each)
 // Block layout: bid encodes (batch, v_head, split). split=0 → rows 0-63, split=1 → 64-127.
 // ---------------------------------------------------------------------------
-constexpr int kSplits = 2;
-constexpr int kThreadsV13 = 64;
-constexpr int kRowsPerBlock = 64;
+constexpr int kSplits = 4;
+constexpr int kThreadsV13 = 32;
+constexpr int kRowsPerBlock = 32;
 
-__global__ __launch_bounds__(64)
+__global__ __launch_bounds__(32)
 void gdn_decode_kernel(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
@@ -97,11 +97,12 @@ void gdn_decode_kernel(
     __shared__ __align__(16) float s_k[kHeadSize];
     __shared__ float s_g, s_beta, s_qk;
 
-    // 64 threads cooperatively load 128 elements (each loads 2)
-    s_q[tid] = __bfloat162float(q[q_off + tid]);
-    s_q[tid + 64] = __bfloat162float(q[q_off + tid + 64]);
-    s_k[tid] = __bfloat162float(k[k_off + tid]);
-    s_k[tid + 64] = __bfloat162float(k[k_off + tid + 64]);
+    // 32 threads cooperatively load 128 elements (each loads 4)
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        s_q[tid + j*32] = __bfloat162float(q[q_off + tid + j*32]);
+        s_k[tid + j*32] = __bfloat162float(k[k_off + tid + j*32]);
+    }
 
     if (tid == 0) {
         const float x = __bfloat162float(a_in[g_off]) + dt_bias[v_head];
@@ -110,8 +111,8 @@ void gdn_decode_kernel(
     }
     __syncthreads();
 
-    // Compute qk = Q^T @ K once via warp reduction (uses warp 0 = 32 threads)
-    if (tid < 32) {
+    // Compute qk = Q^T @ K via warp reduction (use the only warp = 32 threads)
+    {
         float qk = 0.0f;
         #pragma unroll
         for (int i = tid; i < kHeadSize; i += 32) {
