@@ -1,6 +1,6 @@
 /*
  * GDN decode + prefill CUDA kernels with TVM FFI binding.
- * v7 (best): cp.async bf16 pipeline + ILP accumulators + 128 threads.
+ * v12: v11 + launch_bounds(128) hint + st.global.cs streaming write + g_k precomp.
  */
 
 #include <cuda_bf16.h>
@@ -46,10 +46,17 @@ __device__ __forceinline__ void cp_async_wait_all() {
     asm volatile("cp.async.wait_group 0;\n");
 }
 
+// Streaming store (write-once, no L1 alloc) for state and output
+__device__ __forceinline__ void st_global_cs_v4(float4* addr, float4 v) {
+    asm volatile("st.global.cs.v4.f32 [%0], {%1, %2, %3, %4};"
+        :: "l"(addr), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w));
+}
+
 // ---------------------------------------------------------------------------
-// Decode kernel — single-pass, g*state pre-multiply, ILP accumulators
+// Decode kernel — v12: math fusion + streaming store + launch_bounds hint
 // ---------------------------------------------------------------------------
-__global__ void gdn_decode_kernel(
+__global__ __launch_bounds__(128)
+void gdn_decode_kernel(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
@@ -79,7 +86,7 @@ __global__ void gdn_decode_kernel(
 
     __shared__ __align__(16) float s_q[kHeadSize];
     __shared__ __align__(16) float s_k[kHeadSize];
-    __shared__ float s_g, s_beta;
+    __shared__ float s_g, s_beta, s_qk;
 
     s_q[tid] = __bfloat162float(q[q_off + tid]);
     s_k[tid] = __bfloat162float(k[k_off + tid]);
@@ -90,43 +97,69 @@ __global__ void gdn_decode_kernel(
     }
     __syncthreads();
 
+    // Compute qk = Q^T @ K once via warp reduction (used by all threads)
+    if (tid < 32) {
+        float qk = 0.0f;
+        #pragma unroll
+        for (int i = tid; i < kHeadSize; i += 32) {
+            qk += s_q[i] * s_k[i];
+        }
+        // warp shuffle reduction
+        qk += __shfl_xor_sync(0xffffffff, qk, 16);
+        qk += __shfl_xor_sync(0xffffffff, qk, 8);
+        qk += __shfl_xor_sync(0xffffffff, qk, 4);
+        qk += __shfl_xor_sync(0xffffffff, qk, 2);
+        qk += __shfl_xor_sync(0xffffffff, qk, 1);
+        if (tid == 0) s_qk = qk;
+    }
+    __syncthreads();
+
     const float g = s_g;
     const float beta = s_beta;
+    const float qk = s_qk;
     const auto* st_vec = reinterpret_cast<const float4*>(state + st_off);
     auto* ns_vec = reinterpret_cast<float4*>(new_state + st_off);
 
     float4 sr[kVecsPerRow];
     float ov0 = 0.0f, ov1 = 0.0f, ov2 = 0.0f, ov3 = 0.0f;
+    float qs0 = 0.0f, qs1 = 0.0f, qs2 = 0.0f, qs3 = 0.0f;
 
+    // Pass 1: read state, decay, accumulate K^T@state AND Q^T@state
     #pragma unroll
     for (int i = 0; i < kVecsPerRow; ++i) {
-        float4 tmp = st_vec[i];
+        float4 tmp = __ldg(&st_vec[i]);
         const int b4 = i * 4;
         tmp.x *= g; tmp.y *= g; tmp.z *= g; tmp.w *= g;
         sr[i] = tmp;
         ov0 += s_k[b4+0]*tmp.x; ov1 += s_k[b4+1]*tmp.y;
         ov2 += s_k[b4+2]*tmp.z; ov3 += s_k[b4+3]*tmp.w;
+        qs0 += s_q[b4+0]*tmp.x; qs1 += s_q[b4+1]*tmp.y;
+        qs2 += s_q[b4+2]*tmp.z; qs3 += s_q[b4+3]*tmp.w;
     }
 
-    const float delta = beta * (__bfloat162float(v[v_off + tid]) - (ov0+ov1+ov2+ov3));
+    const float old_v = ov0 + ov1 + ov2 + ov3;
+    const float qs = qs0 + qs1 + qs2 + qs3;
+    const float delta = beta * (__bfloat162float(v[v_off + tid]) - old_v);
 
-    float oa0 = 0.0f, oa1 = 0.0f, oa2 = 0.0f, oa3 = 0.0f;
+    // Output computed from decomposition: output = g*(Q^T@state) + delta*(Q^T@K)
+    //                                            = qs           + delta * qk
+    const float out_acc = qs + delta * qk;
+
+    // Pass 2: state update + streaming write (write-once, no L1 alloc)
     #pragma unroll
     for (int i = 0; i < kVecsPerRow; ++i) {
         const int b4 = i * 4;
         sr[i].x += s_k[b4+0]*delta; sr[i].y += s_k[b4+1]*delta;
         sr[i].z += s_k[b4+2]*delta; sr[i].w += s_k[b4+3]*delta;
-        ns_vec[i] = sr[i];
-        oa0 += s_q[b4+0]*sr[i].x; oa1 += s_q[b4+1]*sr[i].y;
-        oa2 += s_q[b4+2]*sr[i].z; oa3 += s_q[b4+3]*sr[i].w;
+        st_global_cs_v4(&ns_vec[i], sr[i]);
     }
 
     output[(batch_idx * kNumVHeads + v_head) * kHeadSize + tid] =
-        __float2bfloat16(scale * (oa0+oa1+oa2+oa3));
+        __float2bfloat16(scale * out_acc);
 }
 
 // ---------------------------------------------------------------------------
-// Prefill kernel — cp.async double-buffered bf16, ILP accumulators
+// Prefill kernel — cp.async double-buffered bf16, ILP accumulators (UNCHANGED)
 // ---------------------------------------------------------------------------
 __global__ void gdn_prefill_kernel(
     const __nv_bfloat16* __restrict__ q,
