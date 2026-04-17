@@ -1,6 +1,6 @@
 /*
  * GDN decode + prefill CUDA kernels with TVM FFI binding.
- * v14: 4-way V-dim split (4 blocks per (batch, v_head), 32 threads each).
+ * v15: v14 minus launch_bounds(32) — let compiler choose register layout.
  */
 
 #include <cuda_bf16.h>
@@ -60,7 +60,7 @@ constexpr int kSplits = 4;
 constexpr int kThreadsV13 = 32;
 constexpr int kRowsPerBlock = 32;
 
-__global__ __launch_bounds__(32)
+__global__
 void gdn_decode_kernel(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
