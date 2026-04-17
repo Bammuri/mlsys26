@@ -168,8 +168,18 @@ void gdn_decode_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Prefill kernel — cp.async double-buffered bf16, ILP accumulators (UNCHANGED)
+// Prefill kernel — v2: 4-way V-dim split, 32 threads per block (1 warp).
+// 16-byte cp.async per thread loads K + Q for each token.
 // ---------------------------------------------------------------------------
+constexpr int kPrefillSplits = 4;
+constexpr int kPrefillThreads = 32;
+constexpr int kPrefillRowsPerBlock = kHeadSize / kPrefillSplits;  // 32
+
+__device__ __forceinline__ void cp_async_16b(void* smem, const void* gmem) {
+    unsigned sa = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" :: "r"(sa), "l"(gmem));
+}
+
 __global__ void gdn_prefill_kernel(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
@@ -186,9 +196,11 @@ __global__ void gdn_prefill_kernel(
     int64_t num_seqs)
 {
     const int bid = blockIdx.x;
-    const int seq_idx = bid / kNumVHeads;
-    const int v_head = bid % kNumVHeads;
+    const int split = bid % kPrefillSplits;
+    const int v_head = (bid / kPrefillSplits) % kNumVHeads;
+    const int seq_idx = bid / (kPrefillSplits * kNumVHeads);
     const int tid = threadIdx.x;
+    const int row = split * kPrefillRowsPerBlock + tid;  // V-dim row this thread owns
 
     if (seq_idx >= num_seqs) return;
 
@@ -197,7 +209,7 @@ __global__ void gdn_prefill_kernel(
     if (seq_end <= seq_start) return;
 
     const int qk_head = v_head / (kNumVHeads / kNumQHeads);
-    const int64_t st_off = ((int64_t)(seq_idx * kNumVHeads + v_head) * kHeadSize + tid) * kHeadSize;
+    const int64_t st_off = ((int64_t)(seq_idx * kNumVHeads + v_head) * kHeadSize + row) * kHeadSize;
 
     const float A_log_val = A_log[v_head];
     const float dt_bias_val = dt_bias[v_head];
@@ -207,7 +219,7 @@ __global__ void gdn_prefill_kernel(
         const auto* sv = reinterpret_cast<const float4*>(state + st_off);
         #pragma unroll
         for (int i = 0; i < kVecsPerRow; ++i)
-            sr[i] = sv[i];
+            sr[i] = __ldg(&sv[i]);
     }
 
     __shared__ __align__(16) __nv_bfloat16 s_k_bf16[2][kHeadSize];
@@ -215,30 +227,32 @@ __global__ void gdn_prefill_kernel(
 
     int buf = 0;
 
+    // 32 threads × 16 bytes = 512 bytes = 128 bf16 K + 128 bf16 Q.
+    // tid 0-15: K (each loads 8 bf16). tid 16-31: Q (each loads 8 bf16).
     {
         const int64_t k0 = (seq_start * kNumKHeads + qk_head) * kHeadSize;
         const int64_t q0 = (seq_start * kNumQHeads + qk_head) * kHeadSize;
-        if (tid < 64) {
-            cp_async_4b(&s_k_bf16[0][tid * 2], &k[k0 + tid * 2]);
+        if (tid < 16) {
+            cp_async_16b(&s_k_bf16[0][tid * 8], &k[k0 + tid * 8]);
         } else {
-            const int qi = tid - 64;
-            cp_async_4b(&s_q_bf16[0][qi * 2], &q[q0 + qi * 2]);
+            const int qi = tid - 16;
+            cp_async_16b(&s_q_bf16[0][qi * 8], &q[q0 + qi * 8]);
         }
         cp_async_commit();
         cp_async_wait_all();
     }
-    __syncthreads();
+    __syncwarp();
 
     for (int64_t t = seq_start; t < seq_end; ++t) {
         if (t + 1 < seq_end) {
             const int nb = 1 - buf;
             const int64_t nk = ((t + 1) * kNumKHeads + qk_head) * kHeadSize;
             const int64_t nq = ((t + 1) * kNumQHeads + qk_head) * kHeadSize;
-            if (tid < 64) {
-                cp_async_4b(&s_k_bf16[nb][tid * 2], &k[nk + tid * 2]);
+            if (tid < 16) {
+                cp_async_16b(&s_k_bf16[nb][tid * 8], &k[nk + tid * 8]);
             } else {
-                const int qi = tid - 64;
-                cp_async_4b(&s_q_bf16[nb][qi * 2], &q[nq + qi * 2]);
+                const int qi = tid - 16;
+                cp_async_16b(&s_q_bf16[nb][qi * 8], &q[nq + qi * 8]);
             }
             cp_async_commit();
         }
@@ -263,7 +277,7 @@ __global__ void gdn_prefill_kernel(
         }
         const float old_v = ov0 + ov1 + ov2 + ov3;
 
-        const float delta = beta * (__bfloat162float(v[(t * kNumVHeads + v_head) * kHeadSize + tid]) - old_v);
+        const float delta = beta * (__bfloat162float(v[(t * kNumVHeads + v_head) * kHeadSize + row]) - old_v);
 
         float oa0 = 0.0f, oa1 = 0.0f, oa2 = 0.0f, oa3 = 0.0f;
         #pragma unroll
@@ -282,10 +296,10 @@ __global__ void gdn_prefill_kernel(
         }
         const float out_acc = oa0 + oa1 + oa2 + oa3;
 
-        output[(t * kNumVHeads + v_head) * kHeadSize + tid] = __float2bfloat16(scale * out_acc);
+        output[(t * kNumVHeads + v_head) * kHeadSize + row] = __float2bfloat16(scale * out_acc);
 
         cp_async_wait_all();
-        __syncthreads();
+        __syncwarp();
         buf = 1 - buf;
     }
 
@@ -334,7 +348,7 @@ void GDNPrefill(
     float sf = (scale == 0.0) ? (1.0f / sqrtf(128.0f)) : static_cast<float>(scale);
     DLDevice dev = q.device();
     cudaStream_t st = static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
-    gdn_prefill_kernel<<<ns * kNumVHeads, kThreads, 0, st>>>(
+    gdn_prefill_kernel<<<ns * kNumVHeads * kPrefillSplits, kPrefillThreads, 0, st>>>(
         static_cast<const __nv_bfloat16*>(q.data_ptr()),
         static_cast<const __nv_bfloat16*>(k.data_ptr()),
         static_cast<const __nv_bfloat16*>(v.data_ptr()),
