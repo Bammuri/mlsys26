@@ -1,6 +1,6 @@
 /*
  * GDN decode + prefill CUDA kernels with TVM FFI binding.
- * v15: v14 minus launch_bounds(32) — let compiler choose register layout.
+ * v16: v15 minus streaming store — restore default cache write policy.
  */
 
 #include <cuda_bf16.h>
@@ -160,7 +160,7 @@ void gdn_decode_kernel(
         const int b4 = i * 4;
         sr[i].x += s_k[b4+0]*delta; sr[i].y += s_k[b4+1]*delta;
         sr[i].z += s_k[b4+2]*delta; sr[i].w += s_k[b4+3]*delta;
-        st_global_cs_v4(&ns_vec[i], sr[i]);
+        ns_vec[i] = sr[i];
     }
 
     output[(batch_idx * kNumVHeads + v_head) * kHeadSize + row] =
