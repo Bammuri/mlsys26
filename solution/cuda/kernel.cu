@@ -177,7 +177,8 @@ constexpr int kPrefillRowsPerBlock = kHeadSize / kPrefillSplits;  // 32
 
 __device__ __forceinline__ void cp_async_16b(void* smem, const void* gmem) {
     unsigned sa = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" :: "r"(sa), "l"(gmem));
+    // .cg = L2-only (skip L1); K/Q is stream-read once per token.
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(sa), "l"(gmem));
 }
 
 __global__ void gdn_prefill_kernel(
