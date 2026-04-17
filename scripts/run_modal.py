@@ -32,7 +32,7 @@ image = (
 
 
 @app.function(image=image, gpu="B200:1", timeout=7200, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
+def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_workloads: int = 0) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
@@ -47,6 +47,18 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
+
+    if max_workloads > 0 and len(workloads) > max_workloads:
+        # Sort by total_seq_len asc (or fallback to insertion order); pick smallest N.
+        # Avoid 8192-token reference Python loops blowing up benchmark time.
+        def _len_key(w):
+            try:
+                return int(w.workload.axes.get("total_seq_len", 0))
+            except Exception:
+                return 0
+        workloads = sorted(workloads, key=_len_key)[:max_workloads]
+        max_len = _len_key(workloads[-1]) if workloads else 0
+        print(f"Subsampled to {len(workloads)} smallest workloads (max_seq_len={max_len})")
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -103,7 +115,7 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main():
+def main(max_workloads: int = 0):
     """Pack solution and run benchmark on Modal."""
     from scripts.pack_solution import pack_solution
 
@@ -114,8 +126,8 @@ def main():
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
 
-    print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+    print(f"\nRunning benchmark on Modal B200 (max_workloads={max_workloads})...")
+    results = run_benchmark.remote(solution, max_workloads=max_workloads)
 
     if not results:
         print("No results returned!")
