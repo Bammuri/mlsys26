@@ -1,6 +1,6 @@
 /*
  * GDN decode + prefill CUDA kernels with TVM FFI binding.
- * v12: v11 + launch_bounds(128) hint + st.global.cs streaming write + g_k precomp.
+ * v13: v12 + V-dim split (2 blocks per (batch, v_head), 64 threads each).
  */
 
 #include <cuda_bf16.h>
@@ -53,9 +53,14 @@ __device__ __forceinline__ void st_global_cs_v4(float4* addr, float4 v) {
 }
 
 // ---------------------------------------------------------------------------
-// Decode kernel — v12: math fusion + streaming store + launch_bounds hint
+// Decode kernel — v13: V-dim split (2 blocks per work item, 64 threads each)
+// Block layout: bid encodes (batch, v_head, split). split=0 → rows 0-63, split=1 → 64-127.
 // ---------------------------------------------------------------------------
-__global__ __launch_bounds__(128)
+constexpr int kSplits = 2;
+constexpr int kThreadsV13 = 64;
+constexpr int kRowsPerBlock = 64;
+
+__global__ __launch_bounds__(64)
 void gdn_decode_kernel(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
@@ -71,9 +76,13 @@ void gdn_decode_kernel(
     int64_t batch_size)
 {
     const int bid = blockIdx.x;
-    const int batch_idx = bid / kNumVHeads;
-    const int v_head = bid % kNumVHeads;
+    const int batch_v_split = bid;
+    const int split = batch_v_split % kSplits;
+    const int v_idx = (batch_v_split / kSplits) % kNumVHeads;
+    const int batch_idx = batch_v_split / (kSplits * kNumVHeads);
+    const int v_head = v_idx;
     const int tid = threadIdx.x;
+    const int row = split * kRowsPerBlock + tid;  // V-dim row this thread owns
 
     if (batch_idx >= batch_size) return;
 
@@ -82,14 +91,18 @@ void gdn_decode_kernel(
     const int64_t k_off  = (batch_idx * kNumKHeads + qk_head) * kHeadSize;
     const int64_t v_off  = (batch_idx * kNumVHeads + v_head) * kHeadSize;
     const int64_t g_off  = batch_idx * kNumVHeads + v_head;
-    const int64_t st_off = ((int64_t)(batch_idx * kNumVHeads + v_head) * kHeadSize + tid) * kHeadSize;
+    const int64_t st_off = ((int64_t)(batch_idx * kNumVHeads + v_head) * kHeadSize + row) * kHeadSize;
 
     __shared__ __align__(16) float s_q[kHeadSize];
     __shared__ __align__(16) float s_k[kHeadSize];
     __shared__ float s_g, s_beta, s_qk;
 
+    // 64 threads cooperatively load 128 elements (each loads 2)
     s_q[tid] = __bfloat162float(q[q_off + tid]);
+    s_q[tid + 64] = __bfloat162float(q[q_off + tid + 64]);
     s_k[tid] = __bfloat162float(k[k_off + tid]);
+    s_k[tid + 64] = __bfloat162float(k[k_off + tid + 64]);
+
     if (tid == 0) {
         const float x = __bfloat162float(a_in[g_off]) + dt_bias[v_head];
         s_g = expf(-expf(A_log[v_head]) * softplusf_stable(x));
@@ -97,14 +110,13 @@ void gdn_decode_kernel(
     }
     __syncthreads();
 
-    // Compute qk = Q^T @ K once via warp reduction (used by all threads)
+    // Compute qk = Q^T @ K once via warp reduction (uses warp 0 = 32 threads)
     if (tid < 32) {
         float qk = 0.0f;
         #pragma unroll
         for (int i = tid; i < kHeadSize; i += 32) {
             qk += s_q[i] * s_k[i];
         }
-        // warp shuffle reduction
         qk += __shfl_xor_sync(0xffffffff, qk, 16);
         qk += __shfl_xor_sync(0xffffffff, qk, 8);
         qk += __shfl_xor_sync(0xffffffff, qk, 4);
@@ -124,7 +136,6 @@ void gdn_decode_kernel(
     float ov0 = 0.0f, ov1 = 0.0f, ov2 = 0.0f, ov3 = 0.0f;
     float qs0 = 0.0f, qs1 = 0.0f, qs2 = 0.0f, qs3 = 0.0f;
 
-    // Pass 1: read state, decay, accumulate K^T@state AND Q^T@state
     #pragma unroll
     for (int i = 0; i < kVecsPerRow; ++i) {
         float4 tmp = __ldg(&st_vec[i]);
@@ -139,13 +150,10 @@ void gdn_decode_kernel(
 
     const float old_v = ov0 + ov1 + ov2 + ov3;
     const float qs = qs0 + qs1 + qs2 + qs3;
-    const float delta = beta * (__bfloat162float(v[v_off + tid]) - old_v);
-
-    // Output computed from decomposition: output = g*(Q^T@state) + delta*(Q^T@K)
-    //                                            = qs           + delta * qk
+    // V is loaded per-row from global (no smem)
+    const float delta = beta * (__bfloat162float(v[v_off + row]) - old_v);
     const float out_acc = qs + delta * qk;
 
-    // Pass 2: state update + streaming write (write-once, no L1 alloc)
     #pragma unroll
     for (int i = 0; i < kVecsPerRow; ++i) {
         const int b4 = i * 4;
@@ -154,7 +162,7 @@ void gdn_decode_kernel(
         st_global_cs_v4(&ns_vec[i], sr[i]);
     }
 
-    output[(batch_idx * kNumVHeads + v_head) * kHeadSize + tid] =
+    output[(batch_idx * kNumVHeads + v_head) * kHeadSize + row] =
         __float2bfloat16(scale * out_acc);
 }
 
@@ -300,7 +308,7 @@ void GDNDecode(
     float sf = (scale == 0.0) ? (1.0f / sqrtf(128.0f)) : static_cast<float>(scale);
     DLDevice dev = q.device();
     cudaStream_t st = static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
-    gdn_decode_kernel<<<bs * kNumVHeads, kThreads, 0, st>>>(
+    gdn_decode_kernel<<<bs * kNumVHeads * kSplits, kThreadsV13, 0, st>>>(
         static_cast<const __nv_bfloat16*>(q.data_ptr()),
         static_cast<const __nv_bfloat16*>(k.data_ptr()),
         static_cast<const __nv_bfloat16*>(v.data_ptr()),
