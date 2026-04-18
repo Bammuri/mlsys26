@@ -40,6 +40,13 @@ DEFAULT_SCALE = 1.0 / math.sqrt(float(D))
 SOFTPLUS_BETA = 1.0
 SOFTPLUS_THRESHOLD = 20.0
 
+# v2 layout — mirrors static-CUDA v17/v7 on fullagent/submission-gdn-v7-v17:
+# grid = (B * HV * kSplits, 1, 1); block = (kWarpThreads, 1, 1) = 1 warp.
+# Each lane owns one V-row out of (kSplits=4) × (kRowsPerBlock=32) = 128.
+kSplits       = 4
+kRowsPerBlock = D // kSplits    # 32
+kWarpThreads  = kRowsPerBlock   # 32 — one warp per block
+
 # ----------------------------------------------------------------------------
 # Compile options — sm_100a + -O3 + fast math are the ones that move SASS.
 # ----------------------------------------------------------------------------
@@ -82,9 +89,12 @@ def _sigmoid_stable(x: cutlass.Float32) -> cutlass.Float32:
 
 
 # ----------------------------------------------------------------------------
-# Decode kernel.
-#   Grid: (B * HV, 1, 1), Block: (D, 1, 1) = 128 threads (4 warps).
-#   Each thread owns exactly one V-row of the 128x128 state.
+# Decode kernel — v2: 4-way V-split, 1 warp per block (mirrors static CUDA v17).
+#   Grid:  (B * HV * kSplits, 1, 1)
+#   Block: (kWarpThreads=32, 1, 1)
+#   Each lane owns one V-row `row = split*32 + tid` and holds the full 128-fp32
+#   state as a register array `sr[D]`. qk is reduced warp-only via butterfly
+#   shuffle — no cross-warp smem, no block barrier in the critical path.
 # ----------------------------------------------------------------------------
 @cute.kernel
 def _gdn_decode_dev(
@@ -103,51 +113,39 @@ def _gdn_decode_dev(
     bid_x, _, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
 
-    batch = bid_x // HV
-    v_head = bid_x % HV
+    split   = bid_x % kSplits
+    v_head  = (bid_x // kSplits) % HV
+    batch   = bid_x // (kSplits * HV)
     qk_head = v_head // (HV // HQ)
-    row = tid  # 0..127
+    row     = split * kRowsPerBlock + tid   # 0..127
 
-    # ----- Cooperative smem load of Q, K (128 threads, each loads 1 bf16). --
+    # Cooperative smem load — 32 lanes × 4 elements = 128.
     smem = cutlass.utils.SmemAllocator()
     sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 16)
     sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 16)
+    for j in cutlass.range_constexpr(D // kWarpThreads):  # 4
+        idx = tid + j * kWarpThreads
+        sQ[idx] = cutlass.Float32(q[batch, 0, qk_head, idx])
+        sK[idx] = cutlass.Float32(k[batch, 0, qk_head, idx])
 
-    sQ[tid] = cutlass.Float32(q[batch, 0, qk_head, tid])
-    sK[tid] = cutlass.Float32(k[batch, 0, qk_head, tid])
-
-    # ----- Gate scalars — every lane computes redundantly. --------------------
+    # Gate scalars — every lane computes redundantly (MUFU is per-lane SIMD).
     a_val = cutlass.Float32(a_in[batch, 0, v_head]) + cutlass.Float32(dt_bias[v_head])
     sp = _softplus_stable(a_val)
     g = cute.exp(-cute.exp(cutlass.Float32(A_log[v_head]), fastmath=True) * sp, fastmath=True)
     beta = _sigmoid_stable(cutlass.Float32(b_in[batch, 0, v_head]))
 
-    cute.arch.barrier()  # Wait on sQ, sK writes.
+    cute.arch.barrier()  # With 1 warp, degenerates to __syncwarp.
 
-    # ----- qk = q · k (scalar, block-wide). -----------------------------------
-    # Each of 128 threads contributes 1 element; reduce across threads via smem.
-    sQK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((1,)), 4)
-    # Staged reduce: use one partial per lane in smem; final reduce by lane 0.
-    # Simpler: 128-way reduction via warp shuffle + block barrier using a second smem.
-    sPartials = smem.allocate_tensor(cutlass.Float32, cute.make_layout((4,)), 16)  # 4 warp sums
-
-    local_qk = sQ[tid] * sK[tid]
-    # Butterfly-reduce within warp (32 lanes).
+    # qk = q · k (block scalar). Warp-only butterfly reduce — every lane ends
+    # up with full qk. Each lane contributes 4 of the 128 elements.
+    qk = cutlass.Float32(0.0)
+    for j in cutlass.range_constexpr(D // kWarpThreads):  # 4
+        idx = tid + j * kWarpThreads
+        qk += sQ[idx] * sK[idx]
     for offset in [16, 8, 4, 2, 1]:
-        local_qk += cute.arch.shuffle_sync_bfly(local_qk, offset=offset, mask=-1, mask_and_clamp=31)
-    # Lane 0 of each warp writes partial; sync; thread 0 finalises.
-    warp_id = tid // 32
-    lane = tid & 31
-    if lane == 0:
-        sPartials[warp_id] = local_qk
-    cute.arch.barrier()
-    if tid == 0:
-        sQK[0] = sPartials[0] + sPartials[1] + sPartials[2] + sPartials[3]
-    cute.arch.barrier()
-    qk = sQK[0]
+        qk += cute.arch.shuffle_sync_bfly(qk, offset=offset, mask=-1, mask_and_clamp=31)
 
-    # ----- Fused first pass: sr[c] = g * state_in[c]; ov = K·sr; qs = Q·sr. --
-    # Each thread owns one V-row, holds 128 fp32 state entries in registers.
+    # Fused first pass: sr[c] = g * state_in[c]; ov = K·sr; qs = Q·sr.
     sr = cute.make_rmem_tensor(cute.make_layout((D,), stride=(1,)), cutlass.Float32)
     ov = cutlass.Float32(0.0)
     qs = cutlass.Float32(0.0)
@@ -157,12 +155,11 @@ def _gdn_decode_dev(
         ov += sK[c] * s
         qs += sQ[c] * s
 
-    # ----- delta, out_acc. ----------------------------------------------------
     v_val = cutlass.Float32(v[batch, 0, v_head, row])
     delta = beta * (v_val - ov)
     out_acc = qs + delta * qk
 
-    # ----- Second pass: state_out[c] = sr[c] + K[c] * delta. -----------------
+    # Second pass: state_out[c] = sr[c] + K[c] * delta.
     for c in cutlass.range_constexpr(D):
         new_s = sr[c] + sK[c] * delta
         state_out[batch, v_head, row, c] = new_s
@@ -188,8 +185,8 @@ def _gdn_decode_jit(
         q, k, v, state_in, A_log, a_in, dt_bias, b_in, out, state_out,
         DEFAULT_SCALE,
     ).launch(
-        grid=(B * HV, 1, 1),
-        block=(D, 1, 1),
+        grid=(B * HV * kSplits, 1, 1),
+        block=(kWarpThreads, 1, 1),
     )
 
 
@@ -217,16 +214,17 @@ def _gdn_prefill_dev(
     bid_x, _, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
 
-    seq_idx = bid_x // HV
-    v_head = bid_x % HV
+    split   = bid_x % kSplits
+    v_head  = (bid_x // kSplits) % HV
+    seq_idx = bid_x // (kSplits * HV)
     qk_head = v_head // (HV // HQ)
-    row = tid
+    row     = split * kRowsPerBlock + tid   # 0..127
 
     # cu_seqlens is int64; the DSL dynamic-range loop requires Int32 bounds.
     seq_start = cutlass.Int32(cu_seqlens[seq_idx])
-    seq_end = cutlass.Int32(cu_seqlens[seq_idx + 1])
+    seq_end   = cutlass.Int32(cu_seqlens[seq_idx + 1])
 
-    A_log_val = cutlass.Float32(A_log[v_head])
+    A_log_val   = cutlass.Float32(A_log[v_head])
     dt_bias_val = cutlass.Float32(dt_bias[v_head])
 
     # Load this row of state_in into a register array once; mutate in place.
@@ -237,37 +235,29 @@ def _gdn_prefill_dev(
     smem = cutlass.utils.SmemAllocator()
     sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 16)
     sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 16)
-    sPartials = smem.allocate_tensor(cutlass.Float32, cute.make_layout((4,)), 16)
-    sScalar = smem.allocate_tensor(cutlass.Float32, cute.make_layout((1,)), 4)
 
     for t in range(seq_start, seq_end):
-        # Cooperative load of Q[t], K[t] into smem.
-        sQ[tid] = cutlass.Float32(q[t, qk_head, tid])
-        sK[tid] = cutlass.Float32(k[t, qk_head, tid])
+        # Cooperative load of Q[t], K[t] into smem — 32 lanes × 4 elems.
+        for j in cutlass.range_constexpr(D // kWarpThreads):
+            idx = tid + j * kWarpThreads
+            sQ[idx] = cutlass.Float32(q[t, qk_head, idx])
+            sK[idx] = cutlass.Float32(k[t, qk_head, idx])
 
-        # Gate scalars (redundant across lanes).
+        # Gate scalars (redundant per lane).
         a_val = cutlass.Float32(a_in[t, v_head]) + dt_bias_val
         sp = _softplus_stable(a_val)
         g = cute.exp(-cute.exp(A_log_val, fastmath=True) * sp, fastmath=True)
         beta = _sigmoid_stable(cutlass.Float32(b_in[t, v_head]))
 
-        cute.arch.barrier()  # Wait on smem Q/K population.
+        cute.arch.barrier()  # 1-warp block ⇒ __syncwarp.
 
-        # qk = Q · K scalar reduce.
-        local_qk = sQ[tid] * sK[tid]
+        # qk warp-reduce — every lane ends up with full qk.
+        qk = cutlass.Float32(0.0)
+        for j in cutlass.range_constexpr(D // kWarpThreads):
+            idx = tid + j * kWarpThreads
+            qk += sQ[idx] * sK[idx]
         for offset in [16, 8, 4, 2, 1]:
-            local_qk += cute.arch.shuffle_sync_bfly(
-                local_qk, offset=offset, mask=-1, mask_and_clamp=31,
-            )
-        warp_id = tid // 32
-        lane = tid & 31
-        if lane == 0:
-            sPartials[warp_id] = local_qk
-        cute.arch.barrier()
-        if tid == 0:
-            sScalar[0] = sPartials[0] + sPartials[1] + sPartials[2] + sPartials[3]
-        cute.arch.barrier()
-        qk = sScalar[0]
+            qk += cute.arch.shuffle_sync_bfly(qk, offset=offset, mask=-1, mask_and_clamp=31)
 
         # Fused pass 1: sr ← g·sr; accumulate ov = K·sr, qs = Q·sr.
         ov = cutlass.Float32(0.0)
@@ -313,8 +303,8 @@ def _gdn_prefill_jit(
         q, k, v, state_in, A_log, a_in, dt_bias, b_in, cu_seqlens,
         out, state_out, DEFAULT_SCALE,
     ).launch(
-        grid=(N * HV, 1, 1),
-        block=(D, 1, 1),
+        grid=(N * HV * kSplits, 1, 1),
+        block=(kWarpThreads, 1, 1),
     )
 
 
