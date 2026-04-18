@@ -1,5 +1,5 @@
 [solution]
-name = "gdn-cute-prefill-v2"                   # Solution name
+name = "gdn-cute-prefill-v3"                   # Solution name
 definition = "gdn_prefill_qk4_v8_d128_k_last"  # Benchmark definition name
 author = "team"                                # Team/author name
 

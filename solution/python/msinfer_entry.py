@@ -145,24 +145,37 @@ def _gdn_decode_dev(
     for offset in [16, 8, 4, 2, 1]:
         qk += cute.arch.shuffle_sync_bfly(qk, offset=offset, mask=-1, mask_and_clamp=31)
 
-    # Fused first pass: sr[c] = g * state_in[c]; ov = K·sr; qs = Q·sr.
+    # Fused first pass — vectorized state load (ldg.128 × 32 tiles).
+    #   sr is held as 32 × 4 float tiles; each iteration loads one float4
+    #   slice via `local_tile` + `autovec_copy` so the DSL emits 128-bit
+    #   gmem reads instead of 128 scalar 32-bit reads.
     sr = cute.make_rmem_tensor(cute.make_layout((D,), stride=(1,)), cutlass.Float32)
+    tmp = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), cutlass.Float32)
     ov = cutlass.Float32(0.0)
     qs = cutlass.Float32(0.0)
-    for c in cutlass.range_constexpr(D):
-        s = cutlass.Float32(state_in[batch, v_head, row, c]) * g
-        sr[c] = s
-        ov += sK[c] * s
-        qs += sQ[c] * s
+    for i in cutlass.range_constexpr(D // 4):  # 32 tiles × 4 elems
+        state_tile = cute.local_tile(
+            state_in, (1, 1, 1, 4), (batch, v_head, row, i),
+        )
+        cute.autovec_copy(state_tile, tmp)
+        for c in cutlass.range_constexpr(4):
+            s = tmp[c] * g
+            sr[i * 4 + c] = s
+            ov += sK[i * 4 + c] * s
+            qs += sQ[i * 4 + c] * s
 
     v_val = cutlass.Float32(v[batch, 0, v_head, row])
     delta = beta * (v_val - ov)
     out_acc = qs + delta * qk
 
-    # Second pass: state_out[c] = sr[c] + K[c] * delta.
-    for c in cutlass.range_constexpr(D):
-        new_s = sr[c] + sK[c] * delta
-        state_out[batch, v_head, row, c] = new_s
+    # Second pass — vectorized state store (stg.128 × 32 tiles).
+    for i in cutlass.range_constexpr(D // 4):
+        for c in cutlass.range_constexpr(4):
+            tmp[c] = sr[i * 4 + c] + sK[i * 4 + c] * delta
+        state_tile = cute.local_tile(
+            state_out, (1, 1, 1, 4), (batch, v_head, row, i),
+        )
+        cute.autovec_copy(tmp, state_tile)
 
     out[batch, 0, v_head, row] = cutlass.BFloat16(cutlass.Float32(scale) * out_acc)
 
@@ -228,9 +241,16 @@ def _gdn_prefill_dev(
     dt_bias_val = cutlass.Float32(dt_bias[v_head])
 
     # Load this row of state_in into a register array once; mutate in place.
+    # Vectorized ldg.128 × 32 tiles.
     sr = cute.make_rmem_tensor(cute.make_layout((D,), stride=(1,)), cutlass.Float32)
-    for c in cutlass.range_constexpr(D):
-        sr[c] = cutlass.Float32(state_in[seq_idx, v_head, row, c])
+    tmp = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), cutlass.Float32)
+    for i in cutlass.range_constexpr(D // 4):
+        state_tile = cute.local_tile(
+            state_in, (1, 1, 1, 4), (seq_idx, v_head, row, i),
+        )
+        cute.autovec_copy(state_tile, tmp)
+        for c in cutlass.range_constexpr(4):
+            sr[i * 4 + c] = tmp[c]
 
     smem = cutlass.utils.SmemAllocator()
     sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 16)
@@ -279,9 +299,14 @@ def _gdn_prefill_dev(
 
         cute.arch.barrier()  # before next token reuses sQ/sK.
 
-    # Persist final state.
-    for c in cutlass.range_constexpr(D):
-        state_out[seq_idx, v_head, row, c] = sr[c]
+    # Persist final state — vectorized stg.128 × 32 tiles.
+    for i in cutlass.range_constexpr(D // 4):
+        for c in cutlass.range_constexpr(4):
+            tmp[c] = sr[i * 4 + c]
+        state_tile = cute.local_tile(
+            state_out, (1, 1, 1, 4), (seq_idx, v_head, row, i),
+        )
+        cute.autovec_copy(tmp, state_tile)
 
 
 @cute.jit
