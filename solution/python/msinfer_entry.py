@@ -134,7 +134,7 @@ def _gdn_decode_dev(
     g = cute.exp(-cute.exp(cutlass.Float32(A_log[v_head]), fastmath=True) * sp, fastmath=True)
     beta = _sigmoid_stable(cutlass.Float32(b_in[batch, 0, v_head]))
 
-    cute.arch.barrier()  # With 1 warp, degenerates to __syncwarp.
+    cute.arch.sync_warp()  # bar.warp.sync — 1-warp block doesn't need bar.sync 0.
 
     # qk = q · k (block scalar). Warp-only butterfly reduce — every lane ends
     # up with full qk. Each lane contributes 4 of the 128 elements.
@@ -269,7 +269,7 @@ def _gdn_prefill_dev(
         g = cute.exp(-cute.exp(A_log_val, fastmath=True) * sp, fastmath=True)
         beta = _sigmoid_stable(cutlass.Float32(b_in[t, v_head]))
 
-        cute.arch.barrier()  # 1-warp block ⇒ __syncwarp.
+        cute.arch.sync_warp()  # bar.warp.sync on K/Q smem writes.
 
         # qk warp-reduce — every lane ends up with full qk.
         qk = cutlass.Float32(0.0)
@@ -297,7 +297,7 @@ def _gdn_prefill_dev(
 
         out[t, v_head, row] = cutlass.BFloat16(cutlass.Float32(scale) * out_acc)
 
-        cute.arch.barrier()  # before next token reuses sQ/sK.
+        cute.arch.sync_warp()  # before next token reuses sQ/sK buffer.
 
     # Persist final state — vectorized stg.128 × 32 tiles.
     for i in cutlass.range_constexpr(D // 4):
