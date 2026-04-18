@@ -1,10 +1,19 @@
 [solution]
-name = "gdn-cute-decode-v1"            # Solution name
-definition = "gdn_decode_qk4_v8_d128_k_last"   # Benchmark definition name
-author = "team"                        # Team/author name
+name = "gdn-cute-prefill-v1"                  # Solution name
+definition = "gdn_prefill_qk4_v8_d128_k_last"  # Benchmark definition name
+author = "team"                                # Team/author name
 
 [build]
-language = "python"                    # python | triton | cuda
-entry_point = "msinfer_entry.py::run"  # <file>::<symbol> — run_prefill for prefill track
-dependencies = ["nvidia-cutlass-dsl", "cuda-python>=12.8"]
+language = "python"                            # python | triton | cuda
+entry_point = "msinfer_entry.py::run_prefill"  # swap to "::run" for decode
+# Runtime pin — matches the Modal scoring image (flashinfer/flashinfer-ci-cu132),
+# CUDA 13.1, Python 3.12, nvidia-cutlass-dsl 4.4.2, cuda-python 13.2.0.
+# Versions captured from the container at 2026-04-18.  Keep these equal between
+# Modal and the bare scoring runner; see docs/runtime-pin.md for the full
+# inventory and the reproducibility rationale.
+dependencies = [
+    "nvidia-cutlass-dsl==4.4.2",
+    "cuda-python==13.2.0",
+    "apache-tvm-ffi==0.1.10",
+]
 destination_passing_style = true

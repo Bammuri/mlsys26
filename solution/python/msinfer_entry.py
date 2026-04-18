@@ -222,8 +222,9 @@ def _gdn_prefill_dev(
     qk_head = v_head // (HV // HQ)
     row = tid
 
-    seq_start = cu_seqlens[seq_idx]
-    seq_end = cu_seqlens[seq_idx + 1]
+    # cu_seqlens is int64; the DSL dynamic-range loop requires Int32 bounds.
+    seq_start = cutlass.Int32(cu_seqlens[seq_idx])
+    seq_end = cutlass.Int32(cu_seqlens[seq_idx + 1])
 
     A_log_val = cutlass.Float32(A_log[v_head])
     dt_bias_val = cutlass.Float32(dt_bias[v_head])
