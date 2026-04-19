@@ -20,7 +20,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import modal
 
-app = modal.App("flashinfer-bench-v2")
+app = modal.App(os.environ.get("MODAL_APP_NAME", "flashinfer-bench-v3"))
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
@@ -210,22 +210,28 @@ def print_results(results: dict):
 
 @app.local_entrypoint()
 def main(
+    kernel_dir: str = "",
     max_workloads: int = 0,
     max_seq_len: int = 0,
     min_seq_len: int = 0,
     dump_sass: bool = False,
     sass_out: str = "out/sass-dump.tar.gz",
 ):
-    """Pack solution and run benchmark on Modal."""
+    """Pack solution and run benchmark on Modal.
+
+    kernel_dir: which per-kernel subdir to pack (e.g. "gdn_decode", "gdn_prefill").
+                If empty, inferred when only one subdir under the repo has a config.toml.
+    """
+    kdir = kernel_dir or None
     # Attempt flashinfer-bench-based packing first; fall back to a minimal
     # local JSON packer when the library isn't installed locally (e.g. macOS).
     try:
         from scripts.pack_solution import pack_solution
         print("Packing solution from source files (flashinfer-bench)...")
-        solution_path = pack_solution()
+        solution_path = pack_solution(kernel_dir=kdir)
     except ImportError:
         print("flashinfer-bench not available locally; using minimal JSON packer...")
-        solution_path = _minimal_pack()
+        solution_path = _minimal_pack(kdir)
 
     solution_json = solution_path.read_text()
     import json as _json
@@ -261,8 +267,11 @@ def main(
     print_results(results)
 
 
-def _minimal_pack() -> Path:
-    """Minimal solution.json writer with no flashinfer-bench dependency."""
+def _minimal_pack(kernel_dir: str | None = None) -> Path:
+    """Minimal solution.json writer with no flashinfer-bench dependency.
+
+    Reads per-kernel `config.toml` from a subdirectory of the repo root.
+    """
     import json
 
     try:
@@ -270,12 +279,25 @@ def _minimal_pack() -> Path:
     except ImportError:
         import tomli as tomllib  # type: ignore
 
-    with open(PROJECT_ROOT / "config.toml", "rb") as f:
+    if kernel_dir:
+        kdir = (PROJECT_ROOT / kernel_dir).resolve() if not Path(kernel_dir).is_absolute() else Path(kernel_dir)
+    else:
+        candidates = [
+            p for p in PROJECT_ROOT.iterdir()
+            if p.is_dir() and not p.name.startswith(".") and (p / "config.toml").exists()
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError(
+                f"Cannot infer kernel dir; candidates={[p.name for p in candidates]}"
+            )
+        kdir = candidates[0]
+
+    with open(kdir / "config.toml", "rb") as f:
         cfg = tomllib.load(f)
     s = cfg["solution"]
     b = cfg["build"]
     lang = b["language"]
-    src_dir = PROJECT_ROOT / "solution" / ("cuda" if lang == "cuda" else "triton")
+    src_dir = kdir / "solution" / lang
 
     sources = []
     for p in sorted(src_dir.iterdir()):
@@ -291,13 +313,13 @@ def _minimal_pack() -> Path:
             "language": lang,
             "target_hardware": ["cuda"],
             "entry_point": b["entry_point"],
-            "dependencies": [],
+            "dependencies": b.get("dependencies", []),
             "destination_passing_style": b.get("destination_passing_style", True),
             "binding": b.get("binding", None),
         },
         "sources": sources,
         "description": "",
     }
-    out_path = PROJECT_ROOT / "solution.json"
+    out_path = kdir / "solution.json"
     out_path.write_text(json.dumps(out, indent=2))
     return out_path
