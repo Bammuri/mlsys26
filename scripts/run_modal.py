@@ -10,6 +10,8 @@ Setup (one-time):
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
 """
 
+from __future__ import annotations
+
 import os
 import sys
 from pathlib import Path
