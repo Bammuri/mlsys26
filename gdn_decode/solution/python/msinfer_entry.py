@@ -166,13 +166,17 @@ def _gdn_decode_dev(
     #   moves + vectorized gmem/smem reads on the inner axis.
     sr = cute.make_rmem_tensor(cute.make_layout((D // 4, 4), stride=(4, 1)), cutlass.Float32)
     tmp = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), cutlass.Float32)
+    # EVICT_FIRST on state gmem↔reg: each float4 tile is used once and never
+    # re-read — demote from L1 first so next block's state prologue lands in a
+    # colder line and K/Q smem fills aren't evicted by state churn.
+    ev_first = cute.nvgpu.CacheEvictionPriority.EVICT_FIRST
     ov = cutlass.Float32(0.0)
     qs = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(D // 4):  # 32 tiles × 4 elems
         state_tile = cute.local_tile(
             state_in, (1, 1, 1, 4), (batch, v_head, row, i),
         )
-        cute.autovec_copy(state_tile, tmp)
+        cute.autovec_copy(state_tile, tmp, l1c_evict_priority=ev_first)
         for c in cutlass.range_constexpr(4):
             s = tmp[c] * g
             sr[i, c] = s
@@ -190,7 +194,7 @@ def _gdn_decode_dev(
         state_tile = cute.local_tile(
             state_out, (1, 1, 1, 4), (batch, v_head, row, i),
         )
-        cute.autovec_copy(tmp, state_tile)
+        cute.autovec_copy(tmp, state_tile, l1c_evict_priority=ev_first)
 
     out[batch, 0, v_head, row] = cutlass.BFloat16(cutlass.Float32(scale) * out_acc)
 
@@ -261,11 +265,14 @@ def _gdn_prefill_dev(
     # still via local_tile + autovec_copy on a (4,) staging reg.
     sr = cute.make_rmem_tensor(cute.make_layout((D,), stride=(1,)), cutlass.Float32)
     tmp = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), cutlass.Float32)
+    # EVICT_FIRST on state gmem↔reg: prologue load is consumed once into regs
+    # and final writeback is dead-on-arrive — keep L1 cold for K/Q traffic.
+    ev_first = cute.nvgpu.CacheEvictionPriority.EVICT_FIRST
     for i in cutlass.range_constexpr(D // 4):
         state_tile = cute.local_tile(
             state_in, (1, 1, 1, 4), (seq_idx, v_head, row, i),
         )
-        cute.autovec_copy(state_tile, tmp)
+        cute.autovec_copy(state_tile, tmp, l1c_evict_priority=ev_first)
         for c in cutlass.range_constexpr(4):
             sr[i * 4 + c] = tmp[c]
 
@@ -323,7 +330,7 @@ def _gdn_prefill_dev(
         state_tile = cute.local_tile(
             state_out, (1, 1, 1, 4), (seq_idx, v_head, row, i),
         )
-        cute.autovec_copy(tmp, state_tile)
+        cute.autovec_copy(tmp, state_tile, l1c_evict_priority=ev_first)
 
 
 @cute.jit

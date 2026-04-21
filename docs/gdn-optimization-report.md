@@ -164,9 +164,13 @@ This also eliminates Q reads in the second pass — only K is touched — halvin
 | v2 | 17cf8b2 | 4-way V-split, 32-thread warp block, warp-only qk reduce | 0.0248 ms (-30%) | 0.0380 ms (-29%) |
 | v3 | c23802c | Vectorized state via `cute.local_tile` + `cute.autovec_copy` (emits LDG/STG.128) | 0.0193 ms (-22%) | 0.0372 ms (-2%) |
 | v4 | fd3a81b | `cute.arch.sync_warp()` in place of `barrier()` (bar.warp.sync vs bar.sync 0) | 0.025 ms† | 0.0364 ms (-2%) |
+| v5 | 9e216ee | Decode `sr` (32,4) 2D reshape + SASS-dump instrumentation (no prefill change) | 0.025 ms | 0.0364 ms |
+| **v6** | *this change* | `l1c_evict_priority=EVICT_FIRST` on all state gmem↔reg `autovec_copy` sites (decode + prefill) | **0.0153 ms (-4.4%)** | **0.0414 ms (-19.7%)** |
 | ref | static CUDA | v17 decode / v7 prefill, hand-tuned nvcc | 0.012 ms | 0.0304 ms |
 
 †Modal run-to-run variance on Python reference latency is ~30–70% (cold-start scheduling). Kernel latency between v3 and v4 runs is within noise; the sync_warp swap is semantically correct for 1-warp blocks and at worst neutral.
+
+**v6 notes** — 4 sites modified (2 per kernel: state prologue load, state writeback). Prefill wins big because the state prologue holds L1 cache lines across the whole token loop; marking them `EVICT_FIRST` lets K/Q bf16 cooperative-smem fills keep their L1 footprint. Decode is a small win on a small kernel — per-site Δ is within 1 μs latency resolution, but mean across 20 workloads is consistent. Measured on Modal B200 with `--max-workloads 20` (smallest seqs; 20 decode workloads batch ∈ {1,4,8,16}, 20 prefill workloads total_seq_len ≤ 276). All 40 workloads PASSED at atol/rtol=1e-2; max abs_err ≤ 3.81e-6.
 
 All 35 tested workloads (30 decode × batch ∈ {1,4,8,16} + 5 prefill seq_len ≤ 30) PASSED within contest tolerance (abs_err ≤ 1e-6, rel_err ≤ 1e-1).
 
