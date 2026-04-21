@@ -277,15 +277,16 @@ def _gdn_prefill_dev(
             sr[i * 4 + c] = tmp[c]
 
     smem = cutlass.utils.SmemAllocator()
-    sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 16)
-    sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 16)
+    # bf16 smem: halves per-token smem write BW vs Float32; lazy-convert at use.
+    sQ = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((D,)), 16)
+    sK = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((D,)), 16)
 
     for t in range(seq_start, seq_end):
         # Cooperative load of Q[t], K[t] into smem — 32 lanes × 4 elems.
         for j in cutlass.range_constexpr(D // kWarpThreads):
             idx = tid + j * kWarpThreads
-            sQ[idx] = cutlass.Float32(q[t, qk_head, idx])
-            sK[idx] = cutlass.Float32(k[t, qk_head, idx])
+            sQ[idx] = q[t, qk_head, idx]
+            sK[idx] = k[t, qk_head, idx]
 
         # Gate scalars (redundant per lane).
         a_val = cutlass.Float32(a_in[t, v_head]) + dt_bias_val
@@ -299,7 +300,7 @@ def _gdn_prefill_dev(
         qk = cutlass.Float32(0.0)
         for j in cutlass.range_constexpr(D // kWarpThreads):
             idx = tid + j * kWarpThreads
-            qk += sQ[idx] * sK[idx]
+            qk += cutlass.Float32(sQ[idx]) * cutlass.Float32(sK[idx])
         for offset in [16, 8, 4, 2, 1]:
             qk += cute.arch.shuffle_sync_bfly(qk, offset=offset, mask=-1, mask_and_clamp=31)
 
@@ -308,8 +309,8 @@ def _gdn_prefill_dev(
         qs = cutlass.Float32(0.0)
         for c in cutlass.range_constexpr(D):
             sr[c] = sr[c] * g
-            ov += sK[c] * sr[c]
-            qs += sQ[c] * sr[c]
+            ov += cutlass.Float32(sK[c]) * sr[c]
+            qs += cutlass.Float32(sQ[c]) * sr[c]
 
         v_val = cutlass.Float32(v[t, v_head, row])
         delta = beta * (v_val - ov)
@@ -317,7 +318,7 @@ def _gdn_prefill_dev(
 
         # Pass 2: sr ← sr + K·delta (now = new_state), store output.
         for c in cutlass.range_constexpr(D):
-            sr[c] = sr[c] + sK[c] * delta
+            sr[c] = sr[c] + cutlass.Float32(sK[c]) * delta
 
         out[t, v_head, row] = cutlass.BFloat16(cutlass.Float32(scale) * out_acc)
 
