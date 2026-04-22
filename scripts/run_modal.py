@@ -56,6 +56,7 @@ def run_benchmark(
     max_seq_len: int = 0,
     min_seq_len: int = 0,
     dump_sass: bool = False,
+    workload_offset: int = 0,
 ) -> dict:
     """Run benchmark on Modal B200 and return results.
 
@@ -113,11 +114,14 @@ def run_benchmark(
             f"No workloads remain after filters max_seq_len={max_seq_len}, min_seq_len={min_seq_len}"
         )
 
+    workloads = sorted(workloads, key=_len_key)
+    if workload_offset > 0:
+        workloads = workloads[workload_offset:]
+        print(f"Skipped first {workload_offset} workloads (offset)")
     if max_workloads > 0 and len(workloads) > max_workloads:
-        # Sort by total_seq_len asc, pick smallest N.
-        workloads = sorted(workloads, key=_len_key)[:max_workloads]
+        workloads = workloads[:max_workloads]
         max_len = _len_key(workloads[-1]) if workloads else 0
-        print(f"Subsampled to {len(workloads)} smallest workloads (max_seq_len={max_len})")
+        print(f"Subsampled to {max_workloads} workloads (offset={workload_offset}, max_seq_len={max_len})")
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -218,6 +222,7 @@ def main(
     min_seq_len: int = 0,
     dump_sass: bool = False,
     sass_out: str = "out/sass-dump.tar.gz",
+    workload_offset: int = 0,
 ):
     """Pack solution and run benchmark on Modal.
 
@@ -251,6 +256,7 @@ def main(
         max_seq_len=max_seq_len,
         min_seq_len=min_seq_len,
         dump_sass=dump_sass,
+        workload_offset=workload_offset,
     )
 
     # If SASS dumping was requested, peel off the tarball before print_results.
