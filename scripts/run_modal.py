@@ -12,8 +12,11 @@ Setup (one-time):
     modal volume put mlsys26-contest /path/to/mlsys26-contest /data/
 """
 
+import json
+import os
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -23,6 +26,107 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import modal
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
+
+try:
+    from scripts.benchmark_results import (
+        filter_workloads_by_uuid,
+        load_results_rows,
+        save_results_json,
+        select_workloads_evenly,
+        summarize_trace_entries,
+    )
+except ModuleNotFoundError:
+    SUCCESS_STATUSES = {"OK", "PASSED"}
+
+    def filter_workloads_by_uuid(workloads: list, workload_uuids: list[str] | None) -> list:
+        if not workload_uuids:
+            return workloads
+        requested = set(workload_uuids)
+        return [workload for workload in workloads if workload.workload.uuid in requested]
+
+    def select_workloads_evenly(workloads: list, max_workloads: int) -> list:
+        if max_workloads <= 0 or len(workloads) <= max_workloads:
+            return workloads
+        if max_workloads == 1:
+            return [workloads[0]]
+        last = len(workloads) - 1
+        indices = []
+        for i in range(max_workloads):
+            idx = round(i * last / (max_workloads - 1))
+            if idx not in indices:
+                indices.append(idx)
+        return [workloads[idx] for idx in indices]
+
+    def summarize_trace_entries(traces: dict[str, dict]) -> dict[str, list | dict]:
+        statuses: dict[str, int] = {}
+        latency_values: list[float] = []
+        speedup_values: list[float] = []
+        abs_errors: list[float] = []
+        rel_errors: list[float] = []
+        for result in traces.values():
+            status = result.get("status", "UNKNOWN")
+            statuses[status] = statuses.get(status, 0) + 1
+            if status in SUCCESS_STATUSES:
+                if result.get("latency_ms") is not None:
+                    latency_values.append(result["latency_ms"])
+                if result.get("speedup_factor") is not None:
+                    speedup_values.append(result["speedup_factor"])
+            if result.get("max_abs_error") is not None:
+                abs_errors.append(result["max_abs_error"])
+            if result.get("max_rel_error") is not None:
+                rel_errors.append(result["max_rel_error"])
+        return {
+            "statuses": statuses,
+            "latency_values": latency_values,
+            "speedup_values": speedup_values,
+            "abs_errors": abs_errors,
+            "rel_errors": rel_errors,
+        }
+
+    def save_results_json(
+        output_path: str | Path,
+        results: dict,
+        *,
+        source: str,
+        solution=None,
+        config=None,
+        trace_set_path: str | None = None,
+        extra_metadata: dict | None = None,
+    ) -> Path:
+        payload = {
+            "metadata": {
+                "source": source,
+                "solution": {
+                    "name": getattr(solution, "name", None),
+                    "definition": getattr(solution, "definition", None),
+                },
+                "config": getattr(config, "model_dump", lambda **_: None)(mode="json")
+                if config is not None
+                else None,
+                "trace_set_path": trace_set_path,
+            },
+            "results": results,
+        }
+        if extra_metadata:
+            payload["metadata"].update(extra_metadata)
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        return path
+
+    def load_results_rows(path: str | Path):
+        payload = json.loads(Path(path).read_text())
+        results = payload["results"] if isinstance(payload, dict) and "results" in payload else payload
+        rows = []
+        for definition, workloads in results.items():
+            for workload_uuid, entry in workloads.items():
+                row = {"definition": definition, "uuid": workload_uuid}
+                if isinstance(entry, dict):
+                    row.update(entry)
+                else:
+                    row["value"] = entry
+                rows.append(row)
+        return payload, results, rows
 
 SUCCESS_STATUSES = {"OK", "PASSED"}
 
@@ -38,6 +142,11 @@ image = (
     .pip_install("flashinfer-bench", "flashinfer-python", "torch", "triton", "numpy")
 )
 
+PERSISTENT_POLICY_ENV = "MSINFER_GDN_PERSISTENT_POLICY"
+PERSISTENT_AUTO_MAX_BATCH_ENV = "MSINFER_PERSISTENT_AUTO_MAX_BATCH"
+PERSISTENT_AUTO_MAX_SEQ_LEN_ENV = "MSINFER_PERSISTENT_AUTO_MAX_SEQ_LEN"
+TRACE_PHASES_ENV = "MSINFER_GDN_PROFILE_PHASES"
+
 
 def log_event(message: str):
     """Print a timestamped progress message."""
@@ -49,35 +158,67 @@ def format_elapsed(seconds: float) -> str:
     return f"{seconds:.2f}s"
 
 
-def select_workloads(workloads: list, max_workloads: int) -> list:
-    """Select an evenly spaced subset of workloads."""
-    if max_workloads <= 0 or len(workloads) <= max_workloads:
-        return workloads
+def default_modal_config() -> BenchmarkConfig:
+    """Return the standard Modal benchmark config."""
+    return BenchmarkConfig(
+        warmup_runs=1,
+        iterations=5,
+        num_trials=3,
+        use_isolated_runner=True,
+        timeout_seconds=300,
+    )
 
-    if max_workloads == 1:
-        return [workloads[0]]
 
-    last = len(workloads) - 1
-    indices = []
-    for i in range(max_workloads):
-        idx = round(i * last / (max_workloads - 1))
-        if idx not in indices:
-            indices.append(idx)
+def build_runtime_env(
+    *,
+    persistent_policy: str = "",
+    persistent_auto_max_batch: int = 0,
+    persistent_auto_max_seq_len: int = 0,
+    wrapper_phases: bool = False,
+) -> dict[str, str]:
+    """Build runtime env overrides for the remote benchmark process."""
+    runtime_env: dict[str, str] = {}
+    if persistent_policy:
+        runtime_env[PERSISTENT_POLICY_ENV] = persistent_policy
+    if persistent_auto_max_batch > 0:
+        runtime_env[PERSISTENT_AUTO_MAX_BATCH_ENV] = str(persistent_auto_max_batch)
+    if persistent_auto_max_seq_len > 0:
+        runtime_env[PERSISTENT_AUTO_MAX_SEQ_LEN_ENV] = str(persistent_auto_max_seq_len)
+    if wrapper_phases:
+        runtime_env[TRACE_PHASES_ENV] = "1"
+    return runtime_env
 
-    return [workloads[idx] for idx in indices]
+
+@contextmanager
+def temporary_env(overrides: dict[str, str] | None):
+    """Temporarily apply environment variables for the benchmark lifetime."""
+    if not overrides:
+        yield
+        return
+    previous = {key: os.environ.get(key) for key in overrides}
+    try:
+        for key, value in overrides.items():
+            os.environ[key] = value
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={VOLUME_MOUNT_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_workloads: int = 0) -> dict:
+def run_benchmark(
+    solution: Solution,
+    config: BenchmarkConfig = None,
+    max_workloads: int = 0,
+    workload_uuids: list[str] | None = None,
+    runtime_env: dict[str, str] | None = None,
+) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
-        config = BenchmarkConfig(
-            warmup_runs=1,
-            iterations=5,
-            num_trials=3,
-            use_isolated_runner=True,
-            timeout_seconds=300,
-        )
+        config = default_modal_config()
 
     started_at = time.perf_counter()
     log_event(f"Remote benchmark start: solution={solution.name}, definition={solution.definition}")
@@ -86,6 +227,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_worklo
         f"warmup_runs={config.warmup_runs}, iterations={config.iterations}, num_trials={config.num_trials}"
         ")"
     )
+    if runtime_env:
+        log_event(f"Runtime env overrides: {runtime_env}")
 
     trace_load_started = time.perf_counter()
     log_event(f"Loading trace set from {TRACE_SET_PATH}")
@@ -97,7 +240,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_worklo
 
     definition = trace_set.definitions[solution.definition]
     workloads = trace_set.workloads.get(solution.definition, [])
-    workloads = select_workloads(workloads, max_workloads)
+    workloads = filter_workloads_by_uuid(workloads, workload_uuids)
+    workloads = select_workloads_evenly(workloads, max_workloads)
 
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
@@ -112,8 +256,9 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_worklo
 
     benchmark_started = time.perf_counter()
     log_event(f"Running benchmark across {len(workloads)} workloads")
-    benchmark = Benchmark(bench_trace_set, config)
-    result_trace_set = benchmark.run_all(dump_traces=True)
+    with temporary_env(runtime_env):
+        benchmark = Benchmark(bench_trace_set, config)
+        result_trace_set = benchmark.run_all(dump_traces=True)
     log_event(f"Benchmark completed in {format_elapsed(time.perf_counter() - benchmark_started)}")
 
     traces = result_trace_set.traces.get(definition.name, [])
@@ -144,23 +289,12 @@ def print_results(results: dict, summary_only: bool = False):
     """Print benchmark results in a formatted way."""
     for def_name, traces in results.items():
         total = len(traces)
-        statuses = {}
-        latency_values = []
-        speedup_values = []
-        abs_errors = []
-        rel_errors = []
-
-        for result in traces.values():
-            status = result.get("status", "UNKNOWN")
-            statuses[status] = statuses.get(status, 0) + 1
-            if result.get("latency_ms") is not None:
-                latency_values.append(result["latency_ms"])
-            if result.get("speedup_factor") is not None:
-                speedup_values.append(result["speedup_factor"])
-            if result.get("max_abs_error") is not None:
-                abs_errors.append(result["max_abs_error"])
-            if result.get("max_rel_error") is not None:
-                rel_errors.append(result["max_rel_error"])
+        summary = summarize_trace_entries(traces)
+        statuses = summary["statuses"]
+        latency_values = summary["latency_values"]
+        speedup_values = summary["speedup_values"]
+        abs_errors = summary["abs_errors"]
+        rel_errors = summary["rel_errors"]
 
         print(f"\n{def_name}:")
         print(f"  workloads: {total}")
@@ -231,14 +365,34 @@ def main(
     solution_path: str = "",
     summary_only: bool = False,
     max_workloads: int = 0,
+    workload_uuids: str = "",
+    persistent_policy: str = "",
+    persistent_auto_max_batch: int = 0,
+    persistent_auto_max_seq_len: int = 0,
+    wrapper_phases: bool = False,
     quick: bool = False,
     decision_gate: bool = False,
+    save_json: str = "",
+    load_json: str = "",
 ):
     """Load the solution and run benchmark on Modal."""
     started_at = time.perf_counter()
-    solution = load_solution(Path(solution_path) if solution_path else None)
+    if load_json:
+        _, results, _ = load_results_rows(load_json)
+        log_event(f"Loaded benchmark JSON from {load_json}")
+        print_results(results, summary_only=summary_only)
+        return
 
-    config = None
+    solution = load_solution(Path(solution_path) if solution_path else None)
+    workload_uuid_list = [uuid.strip() for uuid in workload_uuids.split(",") if uuid.strip()]
+    runtime_env = build_runtime_env(
+        persistent_policy=persistent_policy,
+        persistent_auto_max_batch=persistent_auto_max_batch,
+        persistent_auto_max_seq_len=persistent_auto_max_seq_len,
+        wrapper_phases=wrapper_phases,
+    )
+
+    config = default_modal_config()
     if decision_gate:
         config = BenchmarkConfig(
             warmup_runs=1,
@@ -266,7 +420,7 @@ def main(
 
     log_event("Dispatching benchmark to Modal B200...")
     remote_started = time.perf_counter()
-    results = run_benchmark.remote(solution, config, max_workloads)
+    results = run_benchmark.remote(solution, config, max_workloads, workload_uuid_list, runtime_env)
     log_event(f"Received benchmark results in {format_elapsed(time.perf_counter() - remote_started)}")
 
     if not results:
@@ -274,4 +428,21 @@ def main(
         return
 
     print_results(results, summary_only=summary_only)
+    if save_json:
+        save_results_json(
+            Path(save_json),
+            results,
+            source="scripts/run_modal.py",
+            solution=solution,
+            config=config,
+            trace_set_path=TRACE_SET_PATH,
+            extra_metadata={
+                "max_workloads": max_workloads,
+                "workload_uuids": workload_uuid_list,
+                "quick": quick,
+                "decision_gate": decision_gate,
+                "runtime_env": runtime_env,
+            },
+        )
+        log_event(f"Saved benchmark JSON to {save_json}")
     log_event(f"Local entrypoint finished in {format_elapsed(time.perf_counter() - started_at)}")
