@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from scripts.profile_workload import _resolve_trace_set_path
 from scripts.ncu_scorecard import (
     build_scorecard_payload,
     build_manifest_template,
+    compare_capture_metrics,
     detect_sections,
     load_report_manifest,
     parse_ncu_metrics,
@@ -304,8 +306,9 @@ class NcuTrackingArtifactsTest(unittest.TestCase):
                 }
                 """
             )
-            grouped = load_report_manifest(manifest_path)
+            grouped, base_dir = load_report_manifest(manifest_path)
         self.assertEqual(len(grouped["fast-a"]), 2)
+        self.assertEqual(base_dir, manifest_path.parent)
 
     def test_build_scorecard_payload_uses_manifest(self) -> None:
         canonical_lanes = {
@@ -322,13 +325,70 @@ class NcuTrackingArtifactsTest(unittest.TestCase):
             candidate.write_text("SchedulerStats\nIssue Slots Busy 80.0%\n")
             manifest = {
                 "deadbeef-0000-0000-0000-000000000000": [
-                    {"uuid": "deadbeef-0000-0000-0000-000000000000", "label": "baseline", "report_path": str(baseline)},
-                    {"uuid": "deadbeef-0000-0000-0000-000000000000", "label": "candidate", "report_path": str(candidate)},
+                    {
+                        "uuid": "deadbeef-0000-0000-0000-000000000000",
+                        "label": "baseline",
+                        "report_path": str(baseline),
+                        "latency_ms": 0.9,
+                    },
+                    {
+                        "uuid": "deadbeef-0000-0000-0000-000000000000",
+                        "label": "candidate",
+                        "report_path": str(candidate),
+                        "latency_ms": 0.8,
+                    },
                 ]
             }
             payload = build_scorecard_payload(canonical_lanes, report_manifest=manifest)
         captures = payload["scorecards"][0]["captures"]
         self.assertEqual([capture["label"] for capture in captures], ["baseline", "candidate"])
+        self.assertEqual(captures[0]["metrics"]["issue_efficiency"], 70.0)
+        self.assertEqual(captures[1]["metrics"]["issue_efficiency"], 80.0)
+        self.assertEqual(payload["scorecards"][0]["comparison"]["scheduler_health"]["verdict"], "improved")
+        self.assertEqual(
+            payload["scorecards"][0]["secondary"]["paired_latency_ms"]["verdict"],
+            "improved",
+        )
+
+    def test_build_scorecard_payload_uses_manifest_relative_paths(self) -> None:
+        canonical_lanes = {
+            "metadata": {"definition": "demo"},
+            "lanes": {
+                "tail": [{"uuid": "deadbeef-0000-0000-0000-000000000000", "latency_ms": 0.9}],
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            report_dir = base / "reports"
+            report_dir.mkdir()
+            (report_dir / "baseline.txt").write_text("SchedulerStats\nIssue Slots Busy 70.0%\n")
+            (report_dir / "candidate.txt").write_text("SchedulerStats\nIssue Slots Busy 80.0%\n")
+            manifest_path = base / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "reports": [
+                            {
+                                "uuid": "deadbeef-0000-0000-0000-000000000000",
+                                "label": "baseline",
+                                "report_path": "reports/baseline.txt",
+                            },
+                            {
+                                "uuid": "deadbeef-0000-0000-0000-000000000000",
+                                "label": "candidate",
+                                "report_path": "reports/candidate.txt",
+                            },
+                        ]
+                    }
+                )
+            )
+            manifest, manifest_base_dir = load_report_manifest(manifest_path)
+            payload = build_scorecard_payload(
+                canonical_lanes,
+                report_manifest=manifest,
+                report_manifest_base_dir=manifest_base_dir,
+            )
+        captures = payload["scorecards"][0]["captures"]
         self.assertEqual(captures[0]["metrics"]["issue_efficiency"], 70.0)
         self.assertEqual(captures[1]["metrics"]["issue_efficiency"], 80.0)
 
@@ -348,6 +408,52 @@ class NcuTrackingArtifactsTest(unittest.TestCase):
         payload = build_scorecard_payload(canonical_lanes, report_manifest=manifest)
         scorecard = payload["scorecards"][0]
         self.assertIn("duplicate_capture_label=baseline", scorecard["notes"])
+
+    def test_compare_capture_metrics(self) -> None:
+        comparison = compare_capture_metrics(
+            [
+                {
+                    "label": "baseline",
+                    "metrics": {
+                        "issue_efficiency": 70.0,
+                        "skipped_issue_slots": 10.0,
+                        "achieved_occupancy_pct": 40.0,
+                        "occupancy_gap_pct": 20.0,
+                        "classification": "memory_bound",
+                    },
+                    "latency_ms": 0.9,
+                    "trial_phase": "steady",
+                },
+                {
+                    "label": "candidate",
+                    "metrics": {
+                        "issue_efficiency": 80.0,
+                        "skipped_issue_slots": 8.0,
+                        "achieved_occupancy_pct": 48.0,
+                        "occupancy_gap_pct": 12.0,
+                        "classification": "compute_bound",
+                    },
+                    "latency_ms": 0.8,
+                    "trial_phase": "steady",
+                },
+            ]
+        )
+        assert comparison is not None
+        self.assertEqual(comparison["scheduler_health"]["verdict"], "improved")
+        self.assertEqual(comparison["occupancy_effectiveness"]["verdict"], "improved")
+        self.assertEqual(comparison["bound_classification"]["verdict"], "changed")
+        self.assertEqual(comparison["secondary"]["paired_latency_ms"]["verdict"], "improved")
+
+    def test_compare_capture_metrics_accepts_integer_latency(self) -> None:
+        comparison = compare_capture_metrics(
+            [
+                {"label": "baseline", "metrics": {}, "latency_ms": 2},
+                {"label": "candidate", "metrics": {}, "latency_ms": 1},
+            ]
+        )
+        assert comparison is not None
+        self.assertEqual(comparison["secondary"]["paired_latency_ms"]["delta"], -1.0)
+        self.assertEqual(comparison["secondary"]["paired_latency_ms"]["verdict"], "improved")
 
 
 if __name__ == "__main__":

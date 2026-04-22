@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import numbers
 import re
 import sys
 from pathlib import Path
@@ -27,6 +28,7 @@ KNOWN_SECTIONS = [
 ]
 
 DEFAULT_CAPTURE_LABELS = ("baseline", "candidate")
+COMPARISON_LABELS = {"baseline", "candidate"}
 
 METRIC_PATTERNS = {
     "issue_efficiency": [
@@ -213,7 +215,7 @@ def build_manifest_template(
     }
 
 
-def load_report_manifest(manifest_path: Path) -> dict[str, list[dict[str, Any]]]:
+def load_report_manifest(manifest_path: Path) -> tuple[dict[str, list[dict[str, Any]]], Path]:
     payload = json.loads(manifest_path.read_text())
     if not isinstance(payload, dict) or not isinstance(payload.get("reports"), list):
         raise ValueError("Manifest must be a JSON object with a 'reports' list")
@@ -223,7 +225,7 @@ def load_report_manifest(manifest_path: Path) -> dict[str, list[dict[str, Any]]]
         if not isinstance(uuid, str):
             raise ValueError("Each manifest entry must include a string uuid")
         grouped.setdefault(uuid, []).append(entry)
-    return grouped
+    return grouped, manifest_path.parent
 
 
 def _capture_from_raw_text(label: str, report_name: str, raw_text: str) -> dict[str, Any]:
@@ -233,6 +235,138 @@ def _capture_from_raw_text(label: str, report_name: str, raw_text: str) -> dict[
         "detected_sections": detect_sections(raw_text),
         "metrics": parse_ncu_metrics(raw_text),
         "notes": [],
+        "latency_ms": None,
+        "trial_phase": None,
+    }
+
+
+def _metric_delta(
+    baseline: float | None,
+    candidate: float | None,
+    *,
+    higher_is_better: bool,
+) -> dict[str, Any]:
+    if not isinstance(baseline, numbers.Real) or not isinstance(candidate, numbers.Real):
+        return {
+            "baseline": baseline,
+            "candidate": candidate,
+            "delta": None,
+            "verdict": "unknown",
+            "higher_is_better": higher_is_better,
+        }
+    baseline = float(baseline)
+    candidate = float(candidate)
+    delta = candidate - baseline
+    if delta == 0:
+        verdict = "neutral"
+    elif (delta > 0 and higher_is_better) or (delta < 0 and not higher_is_better):
+        verdict = "improved"
+    else:
+        verdict = "regressed"
+    return {
+        "baseline": baseline,
+        "candidate": candidate,
+        "delta": delta,
+        "verdict": verdict,
+        "higher_is_better": higher_is_better,
+    }
+
+
+def compare_capture_metrics(captures: list[dict[str, Any]]) -> dict[str, Any] | None:
+    indexed = {capture["label"]: capture for capture in captures if capture.get("label") in COMPARISON_LABELS}
+    if "baseline" not in indexed or "candidate" not in indexed:
+        return None
+
+    baseline_capture = indexed["baseline"]
+    candidate_capture = indexed["candidate"]
+    baseline_metrics = baseline_capture.get("metrics", {})
+    candidate_metrics = candidate_capture.get("metrics", {})
+
+    scheduler = {
+        "issue_efficiency": _metric_delta(
+            baseline_metrics.get("issue_efficiency"),
+            candidate_metrics.get("issue_efficiency"),
+            higher_is_better=True,
+        ),
+        "skipped_issue_slots": _metric_delta(
+            baseline_metrics.get("skipped_issue_slots"),
+            candidate_metrics.get("skipped_issue_slots"),
+            higher_is_better=False,
+        ),
+        "eligible_warps_per_scheduler": _metric_delta(
+            baseline_metrics.get("eligible_warps_per_scheduler"),
+            candidate_metrics.get("eligible_warps_per_scheduler"),
+            higher_is_better=True,
+        ),
+        "issued_warps_per_scheduler": _metric_delta(
+            baseline_metrics.get("issued_warps_per_scheduler"),
+            candidate_metrics.get("issued_warps_per_scheduler"),
+            higher_is_better=True,
+        ),
+    }
+    occupancy = {
+        "theoretical_occupancy_pct": _metric_delta(
+            baseline_metrics.get("theoretical_occupancy_pct"),
+            candidate_metrics.get("theoretical_occupancy_pct"),
+            higher_is_better=True,
+        ),
+        "achieved_occupancy_pct": _metric_delta(
+            baseline_metrics.get("achieved_occupancy_pct"),
+            candidate_metrics.get("achieved_occupancy_pct"),
+            higher_is_better=True,
+        ),
+        "occupancy_gap_pct": _metric_delta(
+            baseline_metrics.get("occupancy_gap_pct"),
+            candidate_metrics.get("occupancy_gap_pct"),
+            higher_is_better=False,
+        ),
+    }
+    latency = _metric_delta(
+        baseline_capture.get("latency_ms"),
+        candidate_capture.get("latency_ms"),
+        higher_is_better=False,
+    )
+
+    scheduler_verdicts = {item["verdict"] for item in scheduler.values()}
+    occupancy_verdicts = {item["verdict"] for item in occupancy.values()}
+
+    def summarize(verdicts: set[str]) -> str:
+        known = {verdict for verdict in verdicts if verdict != "unknown"}
+        if not known:
+            return "unknown"
+        if "regressed" in known and "improved" in known:
+            return "mixed"
+        if known == {"regressed"}:
+            return "regressed"
+        if "improved" in known:
+            return "improved"
+        if known == {"neutral"}:
+            return "neutral"
+        return "mixed"
+
+    return {
+        "scheduler_health": {
+            "metrics": scheduler,
+            "verdict": summarize(scheduler_verdicts),
+        },
+        "occupancy_effectiveness": {
+            "metrics": occupancy,
+            "verdict": summarize(occupancy_verdicts),
+        },
+        "bound_classification": {
+            "baseline": baseline_metrics.get("classification", "unknown"),
+            "candidate": candidate_metrics.get("classification", "unknown"),
+            "verdict": "changed"
+            if baseline_metrics.get("classification") != candidate_metrics.get("classification")
+            else "unchanged",
+        },
+        "secondary": {
+            "paired_latency_ms": latency,
+            "trial_phase": {
+                "baseline": baseline_capture.get("trial_phase"),
+                "candidate": candidate_capture.get("trial_phase"),
+            },
+        },
     }
 
 
@@ -241,6 +375,7 @@ def build_capture_entries(
     *,
     report_dir: Path | None = None,
     report_manifest: dict[str, list[dict[str, Any]]] | None = None,
+    report_manifest_base_dir: Path | None = None,
 ) -> tuple[list[dict[str, Any]], str | None, list[str], dict[str, Any], list[str]]:
     captures: list[dict[str, Any]] = []
     notes: list[str] = []
@@ -264,12 +399,17 @@ def build_capture_entries(
                         "detected_sections": [],
                         "metrics": {},
                         "notes": ["missing_report_path"],
+                        "latency_ms": entry.get("latency_ms"),
+                        "trial_phase": entry.get("trial_phase"),
                     }
                 )
                 continue
             path = Path(report_path)
-            if report_dir is not None and not path.is_absolute():
-                path = report_dir / path
+            if not path.is_absolute():
+                if report_manifest_base_dir is not None:
+                    path = report_manifest_base_dir / path
+                elif report_dir is not None:
+                    path = report_dir / path
             if not path.exists():
                 captures.append(
                     {
@@ -278,11 +418,17 @@ def build_capture_entries(
                         "detected_sections": [],
                         "metrics": {},
                         "notes": ["missing_report_file"],
+                        "latency_ms": entry.get("latency_ms"),
+                        "trial_phase": entry.get("trial_phase"),
                     }
                 )
                 continue
             raw_text = path.read_text(encoding="utf-8", errors="ignore")
-            captures.append(_capture_from_raw_text(label, str(path), raw_text))
+            capture = _capture_from_raw_text(label, str(path), raw_text)
+            capture["latency_ms"] = entry.get("latency_ms")
+            capture["trial_phase"] = entry.get("trial_phase")
+            capture["notes"].extend(entry.get("notes", []))
+            captures.append(capture)
         return captures, None, [], {}, notes
 
     report_text = {}
@@ -306,6 +452,7 @@ def build_scorecard_payload(
     *,
     report_dir: Path | None = None,
     report_manifest: dict[str, list[dict[str, Any]]] | None = None,
+    report_manifest_base_dir: Path | None = None,
 ) -> dict[str, Any]:
     scorecards = []
 
@@ -315,6 +462,7 @@ def build_scorecard_payload(
                 entry["uuid"],
                 report_dir=report_dir,
                 report_manifest=report_manifest,
+                report_manifest_base_dir=report_manifest_base_dir,
             )
             scorecard = build_scorecard_entry(
                 lane_name,
@@ -325,6 +473,13 @@ def build_scorecard_payload(
                 notes=notes,
             )
             scorecard["captures"] = captures
+            comparison = compare_capture_metrics(captures)
+            scorecard["comparison"] = comparison
+            if comparison is not None:
+                scorecard["primary"]["scheduler_health"]["verdict"] = comparison["scheduler_health"]["verdict"]
+                scorecard["primary"]["occupancy_effectiveness"]["verdict"] = comparison["occupancy_effectiveness"]["verdict"]
+                scorecard["primary"]["bound_classification"]["verdict"] = comparison["bound_classification"]["verdict"]
+                scorecard["secondary"]["paired_latency_ms"] = comparison["secondary"]["paired_latency_ms"]
             scorecards.append(scorecard)
 
     return {
@@ -380,6 +535,25 @@ def render_markdown(payload: dict[str, Any]) -> str:
         lines.extend(
             [
                 "",
+                "### Comparison summary",
+            ]
+        )
+        comparison = scorecard.get("comparison")
+        if comparison is not None:
+            lines.append(f"- scheduler_health: {comparison['scheduler_health']['verdict']}")
+            lines.append(f"- occupancy_effectiveness: {comparison['occupancy_effectiveness']['verdict']}")
+            lines.append(
+                f"- bound_classification: {comparison['bound_classification']['baseline']} -> {comparison['bound_classification']['candidate']} ({comparison['bound_classification']['verdict']})"
+            )
+            paired_latency = comparison["secondary"]["paired_latency_ms"]
+            lines.append(
+                f"- paired_latency_ms: baseline={paired_latency['baseline']} candidate={paired_latency['candidate']} delta={paired_latency['delta']} verdict={paired_latency['verdict']}"
+            )
+        else:
+            lines.append("- (no baseline/candidate comparison available)")
+        lines.extend(
+            [
+                "",
                 "### Primary criteria",
             ]
         )
@@ -422,8 +596,16 @@ def main() -> None:
         manifest_template = build_manifest_template(canonical_lanes)
         args.output_manifest_template.parent.mkdir(parents=True, exist_ok=True)
         args.output_manifest_template.write_text(json.dumps(manifest_template, indent=2, sort_keys=True) + "\n")
-    report_manifest = load_report_manifest(args.manifest_json) if args.manifest_json is not None else None
-    payload = build_scorecard_payload(canonical_lanes, report_dir=args.report_dir, report_manifest=report_manifest)
+    report_manifest = None
+    report_manifest_base_dir = None
+    if args.manifest_json is not None:
+        report_manifest, report_manifest_base_dir = load_report_manifest(args.manifest_json)
+    payload = build_scorecard_payload(
+        canonical_lanes,
+        report_dir=args.report_dir,
+        report_manifest=report_manifest,
+        report_manifest_base_dir=report_manifest_base_dir,
+    )
     markdown = render_markdown(payload)
     print(markdown, end="")
     if args.output_json is not None:
