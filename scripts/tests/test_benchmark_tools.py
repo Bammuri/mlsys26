@@ -24,6 +24,11 @@ from scripts.ncu_scorecard import (
     resolve_report_match,
     scorecard_gate_verdict,
 )
+from scripts.modal_surrogate_scorecard import (
+    evaluate_surrogate_policy,
+    evaluate_surface,
+    load_surface_manifest,
+)
 from scripts.segment_benchmark_results import (
     auto_cluster_boundaries,
     segment_definition_rows,
@@ -493,6 +498,137 @@ class NcuTrackingArtifactsTest(unittest.TestCase):
             ]
         )
         self.assertEqual(summary["overall_gate"], "reject")
+
+
+class ModalSurrogateScorecardTest(unittest.TestCase):
+    def _canonical_lanes(self) -> dict:
+        return {
+            "metadata": {
+                "definition": "demo",
+                "source_cohort_json": ".omx/results/demo.cohorts.json",
+            },
+            "lanes": {
+                "fast_floor": [{"uuid": "fast-a", "latency_ms": 0.10}],
+                "mid_transition": [{"uuid": "mid-a", "latency_ms": 0.20}],
+                "tail": [{"uuid": "tail-a", "latency_ms": 0.90}],
+            },
+        }
+
+    def _write_results(self, path: Path, mapping: dict[str, float]) -> None:
+        payload = {
+            "results": {
+                "demo": {
+                    uuid: {"status": "PASSED", "latency_ms": latency}
+                    for uuid, latency in mapping.items()
+                }
+            }
+        }
+        path.write_text(json.dumps(payload))
+
+    def test_load_surface_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "surfaces.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "surfaces": [
+                            {
+                                "label": "quick",
+                                "role": "quick_broad",
+                                "baseline_json": "base.json",
+                                "candidate_json": "cand.json",
+                            }
+                        ]
+                    }
+                )
+            )
+            surfaces = load_surface_manifest(path)
+        self.assertEqual(surfaces[0]["role"], "quick_broad")
+
+    def test_evaluate_surface_rejects_fast_floor_damage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            baseline = base / "baseline.json"
+            candidate = base / "candidate.json"
+            self._write_results(baseline, {"fast-a": 0.10, "mid-a": 0.20, "tail-a": 0.90})
+            self._write_results(candidate, {"fast-a": 0.12, "mid-a": 0.19, "tail-a": 0.80})
+            surface = evaluate_surface(
+                surface_label="quick",
+                surface_role="quick_broad",
+                baseline_json=baseline,
+                candidate_json=candidate,
+                canonical_lanes=self._canonical_lanes(),
+                relative_tolerance=0.05,
+                absolute_tolerance_ms=0.005,
+            )
+        self.assertEqual(surface["lane_summaries"]["fast_floor"]["verdict"], "reject")
+        self.assertEqual(surface["surface_gate"], "reject")
+
+    def test_evaluate_surrogate_policy_recommends_selective(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            quick_base = base / "quick-base.json"
+            quick_cand = base / "quick-cand.json"
+            off_base = base / "off-base.json"
+            off_cand = base / "off-cand.json"
+            tail_base = base / "tail-base.json"
+            tail_cand = base / "tail-cand.json"
+
+            self._write_results(quick_base, {"fast-a": 0.10, "mid-a": 0.20, "tail-a": 0.90})
+            self._write_results(quick_cand, {"fast-a": 0.10, "mid-a": 0.20, "tail-a": 0.82})
+            self._write_results(off_base, {"fast-a": 0.10, "mid-a": 0.20, "tail-a": 0.90})
+            self._write_results(off_cand, {"fast-a": 0.10, "mid-a": 0.19, "tail-a": 0.84})
+            self._write_results(tail_base, {"fast-a": 0.10, "mid-a": 0.20, "tail-a": 0.90})
+            self._write_results(tail_cand, {"fast-a": 0.10, "mid-a": 0.20, "tail-a": 0.78})
+
+            payload = evaluate_surrogate_policy(
+                canonical_lanes=self._canonical_lanes(),
+                surfaces=[
+                    {
+                        "label": "quick",
+                        "role": "quick_broad",
+                        "baseline_json": str(quick_base),
+                        "candidate_json": str(quick_cand),
+                    },
+                    {
+                        "label": "official",
+                        "role": "official_like",
+                        "baseline_json": str(off_base),
+                        "candidate_json": str(off_cand),
+                    },
+                    {
+                        "label": "tail",
+                        "role": "targeted_tail",
+                        "baseline_json": str(tail_base),
+                        "candidate_json": str(tail_cand),
+                    },
+                ],
+                relative_tolerance=0.05,
+                absolute_tolerance_ms=0.005,
+            )
+        self.assertEqual(payload["aggregate"]["recommendation"], "pursue_selective")
+
+    def test_evaluate_surrogate_policy_holds_when_surface_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            baseline = base / "baseline.json"
+            candidate = base / "candidate.json"
+            self._write_results(baseline, {"fast-a": 0.10, "mid-a": 0.20, "tail-a": 0.90})
+            self._write_results(candidate, {"fast-a": 0.10, "mid-a": 0.20, "tail-a": 0.80})
+            payload = evaluate_surrogate_policy(
+                canonical_lanes=self._canonical_lanes(),
+                surfaces=[
+                    {
+                        "label": "quick",
+                        "role": "quick_broad",
+                        "baseline_json": str(baseline),
+                        "candidate_json": str(candidate),
+                    }
+                ],
+                relative_tolerance=0.05,
+                absolute_tolerance_ms=0.005,
+            )
+        self.assertEqual(payload["aggregate"]["recommendation"], "hold")
 
 
 if __name__ == "__main__":
