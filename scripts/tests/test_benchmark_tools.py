@@ -14,7 +14,9 @@ from scripts.freeze_canonical_workloads import build_canonical_lane_payload
 from scripts.profile_workload import _resolve_trace_set_path
 from scripts.ncu_scorecard import (
     build_scorecard_payload,
+    build_manifest_template,
     detect_sections,
+    load_report_manifest,
     parse_ncu_metrics,
     resolve_report_match,
 )
@@ -243,6 +245,7 @@ class NcuTrackingArtifactsTest(unittest.TestCase):
             scorecard["primary"]["occupancy_effectiveness"]["metrics"]["occupancy_gap_pct"],
             20.0,
         )
+        self.assertEqual(scorecard["captures"][0]["label"], "report_dir_match")
 
     def test_resolve_report_match_rejects_ambiguous_matches(self) -> None:
         report_text = {
@@ -273,6 +276,78 @@ class NcuTrackingArtifactsTest(unittest.TestCase):
         self.assertIsNone(scorecard["source_report"])
         self.assertEqual(scorecard["detected_sections"], [])
         self.assertTrue(scorecard["notes"])
+
+    def test_build_manifest_template(self) -> None:
+        canonical_lanes = {
+            "metadata": {"definition": "demo"},
+            "lanes": {
+                "fast_floor": [{"uuid": "fast-a", "latency_ms": 0.1}],
+                "tail": [{"uuid": "tail-b", "latency_ms": 0.9}],
+            },
+        }
+        manifest = build_manifest_template(canonical_lanes)
+        self.assertEqual(len(manifest["reports"]), 4)
+        labels = {(entry["uuid"], entry["label"]) for entry in manifest["reports"]}
+        self.assertIn(("fast-a", "baseline"), labels)
+        self.assertIn(("tail-b", "candidate"), labels)
+
+    def test_load_report_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "manifest.json"
+            manifest_path.write_text(
+                """
+                {
+                  "reports": [
+                    {"uuid": "fast-a", "label": "baseline", "report_path": "baseline.txt"},
+                    {"uuid": "fast-a", "label": "candidate", "report_path": "candidate.txt"}
+                  ]
+                }
+                """
+            )
+            grouped = load_report_manifest(manifest_path)
+        self.assertEqual(len(grouped["fast-a"]), 2)
+
+    def test_build_scorecard_payload_uses_manifest(self) -> None:
+        canonical_lanes = {
+            "metadata": {"definition": "demo"},
+            "lanes": {
+                "tail": [{"uuid": "deadbeef-0000-0000-0000-000000000000", "latency_ms": 0.9}],
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            baseline = base / "baseline.txt"
+            candidate = base / "candidate.txt"
+            baseline.write_text("SchedulerStats\nIssue Slots Busy 70.0%\n")
+            candidate.write_text("SchedulerStats\nIssue Slots Busy 80.0%\n")
+            manifest = {
+                "deadbeef-0000-0000-0000-000000000000": [
+                    {"uuid": "deadbeef-0000-0000-0000-000000000000", "label": "baseline", "report_path": str(baseline)},
+                    {"uuid": "deadbeef-0000-0000-0000-000000000000", "label": "candidate", "report_path": str(candidate)},
+                ]
+            }
+            payload = build_scorecard_payload(canonical_lanes, report_manifest=manifest)
+        captures = payload["scorecards"][0]["captures"]
+        self.assertEqual([capture["label"] for capture in captures], ["baseline", "candidate"])
+        self.assertEqual(captures[0]["metrics"]["issue_efficiency"], 70.0)
+        self.assertEqual(captures[1]["metrics"]["issue_efficiency"], 80.0)
+
+    def test_build_scorecard_payload_manifest_duplicate_labels_fail_closed(self) -> None:
+        canonical_lanes = {
+            "metadata": {"definition": "demo"},
+            "lanes": {
+                "tail": [{"uuid": "deadbeef-0000-0000-0000-000000000000", "latency_ms": 0.9}],
+            },
+        }
+        manifest = {
+            "deadbeef-0000-0000-0000-000000000000": [
+                {"uuid": "deadbeef-0000-0000-0000-000000000000", "label": "baseline", "report_path": None},
+                {"uuid": "deadbeef-0000-0000-0000-000000000000", "label": "baseline", "report_path": None},
+            ]
+        }
+        payload = build_scorecard_payload(canonical_lanes, report_manifest=manifest)
+        scorecard = payload["scorecards"][0]
+        self.assertIn("duplicate_capture_label=baseline", scorecard["notes"])
 
 
 if __name__ == "__main__":

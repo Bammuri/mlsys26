@@ -26,6 +26,8 @@ KNOWN_SECTIONS = [
     "Roofline",
 ]
 
+DEFAULT_CAPTURE_LABELS = ("baseline", "candidate")
+
 METRIC_PATTERNS = {
     "issue_efficiency": [
         r"Issue(?:\s+Slots)?\s+Busy\s+([0-9]+(?:\.[0-9]+)?)\s*%",
@@ -163,6 +165,7 @@ def build_scorecard_entry(
             "trial_1_vs_steady_state": "unknown",
             "broad_regression_screen": "unknown",
         },
+        "captures": [],
         "notes": list(notes or []),
     }
 
@@ -186,38 +189,143 @@ def resolve_report_match(report_text: dict[str, str], uuid: str) -> tuple[str | 
     return None, None, []
 
 
-def build_scorecard_payload(
+def build_manifest_template(
     canonical_lanes: dict[str, Any],
     *,
-    report_dir: Path | None = None,
+    capture_labels: tuple[str, ...] = DEFAULT_CAPTURE_LABELS,
 ) -> dict[str, Any]:
-    scorecards = []
+    reports = []
+    for lane_name, entries in canonical_lanes["lanes"].items():
+        for entry in entries:
+            for label in capture_labels:
+                reports.append(
+                    {
+                        "uuid": entry["uuid"],
+                        "lane": lane_name,
+                        "label": label,
+                        "report_path": None,
+                        "notes": [],
+                    }
+                )
+    return {
+        "metadata": canonical_lanes["metadata"],
+        "reports": reports,
+    }
+
+
+def load_report_manifest(manifest_path: Path) -> dict[str, list[dict[str, Any]]]:
+    payload = json.loads(manifest_path.read_text())
+    if not isinstance(payload, dict) or not isinstance(payload.get("reports"), list):
+        raise ValueError("Manifest must be a JSON object with a 'reports' list")
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for entry in payload["reports"]:
+        uuid = entry.get("uuid")
+        if not isinstance(uuid, str):
+            raise ValueError("Each manifest entry must include a string uuid")
+        grouped.setdefault(uuid, []).append(entry)
+    return grouped
+
+
+def _capture_from_raw_text(label: str, report_name: str, raw_text: str) -> dict[str, Any]:
+    return {
+        "label": label,
+        "source_report": report_name,
+        "detected_sections": detect_sections(raw_text),
+        "metrics": parse_ncu_metrics(raw_text),
+        "notes": [],
+    }
+
+
+def build_capture_entries(
+    uuid: str,
+    *,
+    report_dir: Path | None = None,
+    report_manifest: dict[str, list[dict[str, Any]]] | None = None,
+) -> tuple[list[dict[str, Any]], str | None, list[str], dict[str, Any], list[str]]:
+    captures: list[dict[str, Any]] = []
+    notes: list[str] = []
+    if report_manifest is not None:
+        manifest_entries = report_manifest.get(uuid, [])
+        if not manifest_entries:
+            return captures, None, [], {}, notes
+        seen_labels: set[str] = set()
+        for entry in manifest_entries:
+            label = entry.get("label", "capture")
+            if label in seen_labels:
+                notes.append(f"duplicate_capture_label={label}")
+                continue
+            seen_labels.add(label)
+            report_path = entry.get("report_path")
+            if not report_path:
+                captures.append(
+                    {
+                        "label": label,
+                        "source_report": None,
+                        "detected_sections": [],
+                        "metrics": {},
+                        "notes": ["missing_report_path"],
+                    }
+                )
+                continue
+            path = Path(report_path)
+            if report_dir is not None and not path.is_absolute():
+                path = report_dir / path
+            if not path.exists():
+                captures.append(
+                    {
+                        "label": label,
+                        "source_report": str(path),
+                        "detected_sections": [],
+                        "metrics": {},
+                        "notes": ["missing_report_file"],
+                    }
+                )
+                continue
+            raw_text = path.read_text(encoding="utf-8", errors="ignore")
+            captures.append(_capture_from_raw_text(label, str(path), raw_text))
+        return captures, None, [], {}, notes
+
     report_text = {}
     if report_dir is not None and report_dir.exists():
         for report_path in report_dir.glob("*.txt"):
             report_text[report_path.name] = report_path.read_text(encoding="utf-8", errors="ignore")
+    if not report_text:
+        return captures, None, [], {}, notes
+
+    source_report, raw_text, notes = resolve_report_match(report_text, uuid)
+    if raw_text is None:
+        return captures, source_report, [], {}, notes
+    detected = detect_sections(raw_text)
+    parsed_metrics = parse_ncu_metrics(raw_text)
+    captures.append(_capture_from_raw_text("report_dir_match", source_report or uuid, raw_text))
+    return captures, source_report, detected, parsed_metrics, notes
+
+
+def build_scorecard_payload(
+    canonical_lanes: dict[str, Any],
+    *,
+    report_dir: Path | None = None,
+    report_manifest: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    scorecards = []
 
     for lane_name, entries in canonical_lanes["lanes"].items():
         for entry in entries:
-            source_report = None
-            detected = []
-            parsed_metrics = {}
-            notes: list[str] = []
-            if report_text:
-                source_report, raw_text, notes = resolve_report_match(report_text, entry["uuid"])
-                if raw_text is not None:
-                    detected = detect_sections(raw_text)
-                    parsed_metrics = parse_ncu_metrics(raw_text)
-            scorecards.append(
-                build_scorecard_entry(
-                    lane_name,
-                    entry,
-                    source_report=source_report,
-                    detected_sections=detected,
-                    parsed_metrics=parsed_metrics,
-                    notes=notes,
-                )
+            captures, source_report, detected, parsed_metrics, notes = build_capture_entries(
+                entry["uuid"],
+                report_dir=report_dir,
+                report_manifest=report_manifest,
             )
+            scorecard = build_scorecard_entry(
+                lane_name,
+                entry,
+                source_report=source_report,
+                detected_sections=detected,
+                parsed_metrics=parsed_metrics,
+                notes=notes,
+            )
+            scorecard["captures"] = captures
+            scorecards.append(scorecard)
 
     return {
         "metadata": canonical_lanes["metadata"],
@@ -240,6 +348,37 @@ def render_markdown(payload: dict[str, Any]) -> str:
                 f"- axes: {scorecard.get('axes')}",
                 f"- source report: {scorecard.get('source_report')}",
                 f"- detected sections: {', '.join(scorecard.get('detected_sections', [])) or '(none)'}",
+                "",
+                "### Capture entries",
+            ]
+        )
+        captures = scorecard.get("captures", [])
+        if captures:
+            for capture in captures:
+                lines.append(
+                    f"- {capture['label']}: source={capture.get('source_report')} sections={', '.join(capture.get('detected_sections', [])) or '(none)'}"
+                )
+                metrics = capture.get("metrics", {})
+                if metrics:
+                    for key in [
+                        "issue_efficiency",
+                        "skipped_issue_slots",
+                        "eligible_warps_per_scheduler",
+                        "issued_warps_per_scheduler",
+                        "theoretical_occupancy_pct",
+                        "achieved_occupancy_pct",
+                        "occupancy_gap_pct",
+                        "compute_utilization_pct",
+                        "memory_utilization_pct",
+                        "classification",
+                    ]:
+                        lines.append(f"  - {key}: {metrics.get(key)}")
+                for note in capture.get("notes", []):
+                    lines.append(f"  - note: {note}")
+        else:
+            lines.append("- (none)")
+        lines.extend(
+            [
                 "",
                 "### Primary criteria",
             ]
@@ -269,6 +408,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate NCU scorecard templates from canonical lanes")
     parser.add_argument("canonical_lane_json", type=Path)
     parser.add_argument("--report-dir", type=Path, default=None, help="Optional directory of saved NCU text reports")
+    parser.add_argument("--manifest-json", type=Path, default=None, help="Optional explicit manifest mapping UUIDs to baseline/candidate report paths")
+    parser.add_argument("--output-manifest-template", type=Path, default=None, help="Optional path to save a baseline/candidate manifest template")
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--output-markdown", type=Path, default=None)
     return parser.parse_args()
@@ -277,7 +418,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     canonical_lanes = json.loads(args.canonical_lane_json.read_text())
-    payload = build_scorecard_payload(canonical_lanes, report_dir=args.report_dir)
+    if args.output_manifest_template is not None:
+        manifest_template = build_manifest_template(canonical_lanes)
+        args.output_manifest_template.parent.mkdir(parents=True, exist_ok=True)
+        args.output_manifest_template.write_text(json.dumps(manifest_template, indent=2, sort_keys=True) + "\n")
+    report_manifest = load_report_manifest(args.manifest_json) if args.manifest_json is not None else None
+    payload = build_scorecard_payload(canonical_lanes, report_dir=args.report_dir, report_manifest=report_manifest)
     markdown = render_markdown(payload)
     print(markdown, end="")
     if args.output_json is not None:
