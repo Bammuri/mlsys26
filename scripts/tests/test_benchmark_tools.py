@@ -16,11 +16,13 @@ from scripts.profile_workload import _resolve_trace_set_path
 from scripts.ncu_scorecard import (
     build_scorecard_payload,
     build_manifest_template,
+    build_scorecard_summary,
     compare_capture_metrics,
     detect_sections,
     load_report_manifest,
     parse_ncu_metrics,
     resolve_report_match,
+    scorecard_gate_verdict,
 )
 from scripts.segment_benchmark_results import (
     auto_cluster_boundaries,
@@ -454,6 +456,43 @@ class NcuTrackingArtifactsTest(unittest.TestCase):
         assert comparison is not None
         self.assertEqual(comparison["secondary"]["paired_latency_ms"]["delta"], -1.0)
         self.assertEqual(comparison["secondary"]["paired_latency_ms"]["verdict"], "improved")
+
+    def test_scorecard_gate_verdicts(self) -> None:
+        fast_scorecard = {
+            "lane": "fast_floor",
+            "comparison": {
+                "scheduler_health": {"verdict": "regressed"},
+                "occupancy_effectiveness": {"verdict": "improved"},
+            },
+        }
+        tail_scorecard = {
+            "lane": "tail",
+            "comparison": {
+                "scheduler_health": {"verdict": "improved"},
+                "occupancy_effectiveness": {"verdict": "improved"},
+            },
+        }
+        self.assertEqual(scorecard_gate_verdict(fast_scorecard), "reject")
+        self.assertEqual(scorecard_gate_verdict(tail_scorecard), "pass")
+
+    def test_build_scorecard_summary(self) -> None:
+        summary = build_scorecard_summary(
+            [
+                {"uuid": "fast-a", "lane": "fast_floor", "comparison": {"scheduler_health": {"verdict": "neutral"}, "occupancy_effectiveness": {"verdict": "neutral"}}},
+                {"uuid": "tail-a", "lane": "tail", "comparison": {"scheduler_health": {"verdict": "improved"}, "occupancy_effectiveness": {"verdict": "improved"}}},
+            ]
+        )
+        self.assertEqual(summary["overall_gate"], "pursue_selective")
+        self.assertEqual(summary["lane_summary"]["tail"]["counts"]["pass"], 1)
+
+    def test_build_scorecard_summary_rejects_mid_transition_regression(self) -> None:
+        summary = build_scorecard_summary(
+            [
+                {"uuid": "mid-a", "lane": "mid_transition", "comparison": {"scheduler_health": {"verdict": "regressed"}, "occupancy_effectiveness": {"verdict": "neutral"}}},
+                {"uuid": "tail-a", "lane": "tail", "comparison": {"scheduler_health": {"verdict": "improved"}, "occupancy_effectiveness": {"verdict": "improved"}}},
+            ]
+        )
+        self.assertEqual(summary["overall_gate"], "reject")
 
 
 if __name__ == "__main__":

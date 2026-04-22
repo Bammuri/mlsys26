@@ -370,6 +370,72 @@ def compare_capture_metrics(captures: list[dict[str, Any]]) -> dict[str, Any] | 
     }
 
 
+def scorecard_gate_verdict(scorecard: dict[str, Any]) -> str:
+    comparison = scorecard.get("comparison")
+    if comparison is None:
+        return "unknown"
+
+    scheduler_verdict = comparison["scheduler_health"]["verdict"]
+    occupancy_verdict = comparison["occupancy_effectiveness"]["verdict"]
+    lane = scorecard.get("lane")
+
+    if lane == "fast_floor":
+        if "regressed" in {scheduler_verdict, occupancy_verdict}:
+            return "reject"
+        if "improved" in {scheduler_verdict, occupancy_verdict}:
+            return "pass"
+        if scheduler_verdict == occupancy_verdict == "neutral":
+            return "pass"
+        return "mixed"
+
+    if lane == "tail":
+        if "regressed" in {scheduler_verdict, occupancy_verdict}:
+            return "reject"
+        if "improved" in {scheduler_verdict, occupancy_verdict}:
+            return "pass"
+        return "mixed" if "mixed" in {scheduler_verdict, occupancy_verdict} else "unknown"
+
+    if lane == "mid_transition":
+        if "regressed" in {scheduler_verdict, occupancy_verdict}:
+            return "reject"
+        if "improved" in {scheduler_verdict, occupancy_verdict}:
+            return "pass"
+        return "mixed" if "mixed" in {scheduler_verdict, occupancy_verdict} else "unknown"
+
+    return "unknown"
+
+
+def build_scorecard_summary(scorecards: list[dict[str, Any]]) -> dict[str, Any]:
+    lane_summary: dict[str, dict[str, Any]] = {}
+    for scorecard in scorecards:
+        lane = scorecard.get("lane", "unknown")
+        lane_summary.setdefault(lane, {"counts": {}, "uuids": []})
+        verdict = scorecard_gate_verdict(scorecard)
+        lane_summary[lane]["counts"][verdict] = lane_summary[lane]["counts"].get(verdict, 0) + 1
+        lane_summary[lane]["uuids"].append(
+            {"uuid": scorecard["uuid"], "gate_verdict": verdict}
+        )
+
+    fast_counts = lane_summary.get("fast_floor", {}).get("counts", {})
+    mid_counts = lane_summary.get("mid_transition", {}).get("counts", {})
+    tail_counts = lane_summary.get("tail", {}).get("counts", {})
+    if fast_counts.get("reject", 0) > 0 or mid_counts.get("reject", 0) > 0 or tail_counts.get("reject", 0) > 0:
+        overall = "reject"
+    elif tail_counts.get("pass", 0) > 0:
+        overall = "pursue_selective"
+    elif tail_counts.get("mixed", 0) > 0 or fast_counts.get("mixed", 0) > 0 or mid_counts.get("mixed", 0) > 0:
+        overall = "mixed"
+    elif fast_counts or tail_counts:
+        overall = "hold"
+    else:
+        overall = "unknown"
+
+    return {
+        "lane_summary": lane_summary,
+        "overall_gate": overall,
+    }
+
+
 def build_capture_entries(
     uuid: str,
     *,
@@ -480,10 +546,12 @@ def build_scorecard_payload(
                 scorecard["primary"]["occupancy_effectiveness"]["verdict"] = comparison["occupancy_effectiveness"]["verdict"]
                 scorecard["primary"]["bound_classification"]["verdict"] = comparison["bound_classification"]["verdict"]
                 scorecard["secondary"]["paired_latency_ms"] = comparison["secondary"]["paired_latency_ms"]
+            scorecard["gate_verdict"] = scorecard_gate_verdict(scorecard)
             scorecards.append(scorecard)
 
     return {
         "metadata": canonical_lanes["metadata"],
+        "summary": build_scorecard_summary(scorecards),
         "scorecards": scorecards,
     }
 
@@ -495,6 +563,19 @@ def render_markdown(payload: dict[str, Any]) -> str:
         "Use this sheet to evaluate bare-metal NCU captures lane-by-lane.",
         "",
     ]
+    summary = payload.get("summary")
+    if summary:
+        lines.extend(
+            [
+                "## Overall structural gate",
+                f"- overall_gate: {summary.get('overall_gate')}",
+                "",
+                "## Lane summary",
+            ]
+        )
+        for lane, lane_payload in summary.get("lane_summary", {}).items():
+            lines.append(f"- {lane}: {lane_payload.get('counts', {})}")
+        lines.append("")
     for scorecard in payload["scorecards"]:
         lines.extend(
             [
@@ -503,6 +584,7 @@ def render_markdown(payload: dict[str, Any]) -> str:
                 f"- axes: {scorecard.get('axes')}",
                 f"- source report: {scorecard.get('source_report')}",
                 f"- detected sections: {', '.join(scorecard.get('detected_sections', [])) or '(none)'}",
+                f"- gate_verdict: {scorecard.get('gate_verdict')}",
                 "",
                 "### Capture entries",
             ]
