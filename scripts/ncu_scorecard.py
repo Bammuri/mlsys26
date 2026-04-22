@@ -26,6 +26,37 @@ KNOWN_SECTIONS = [
     "Roofline",
 ]
 
+METRIC_PATTERNS = {
+    "issue_efficiency": [
+        r"Issue(?:\s+Slots)?\s+Busy\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"Scheduler\s+Issue\s+Efficiency\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+    ],
+    "skipped_issue_slots": [
+        r"Skipped\s+Issue\s+Slots\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"No\s+Eligible\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+    ],
+    "eligible_warps_per_scheduler": [
+        r"Eligible\s+Warps\s+Per\s+Scheduler\s+([0-9]+(?:\.[0-9]+)?)",
+    ],
+    "issued_warps_per_scheduler": [
+        r"Issued\s+Warps\s+Per\s+Scheduler\s+([0-9]+(?:\.[0-9]+)?)",
+    ],
+    "theoretical_occupancy_pct": [
+        r"Theoretical\s+Occupancy\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+    ],
+    "achieved_occupancy_pct": [
+        r"Achieved\s+Occupancy\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+    ],
+    "compute_utilization_pct": [
+        r"Compute\s+\(SM\)\s+Throughput\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"SM\s+Throughput\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+    ],
+    "memory_utilization_pct": [
+        r"Memory\s+Throughput\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"DRAM\s+Throughput\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+    ],
+}
+
 
 def detect_sections(raw_text: str) -> list[str]:
     found = []
@@ -36,13 +67,52 @@ def detect_sections(raw_text: str) -> list[str]:
     return found
 
 
+def _extract_first_float(raw_text: str, patterns: list[str]) -> float | None:
+    for pattern in patterns:
+        match = re.search(pattern, raw_text, flags=re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+    return None
+
+
+def parse_ncu_metrics(raw_text: str) -> dict[str, float | str | None]:
+    metrics = {
+        name: _extract_first_float(raw_text, patterns)
+        for name, patterns in METRIC_PATTERNS.items()
+    }
+    achieved = metrics.get("achieved_occupancy_pct")
+    theoretical = metrics.get("theoretical_occupancy_pct")
+    metrics["occupancy_gap_pct"] = (
+        theoretical - achieved
+        if isinstance(theoretical, float) and isinstance(achieved, float)
+        else None
+    )
+
+    compute = metrics.get("compute_utilization_pct")
+    memory = metrics.get("memory_utilization_pct")
+    if isinstance(compute, float) and isinstance(memory, float):
+        if memory >= compute + 10.0:
+            classification = "memory_bound"
+        elif compute >= memory + 10.0:
+            classification = "compute_bound"
+        else:
+            classification = "balanced_or_mixed"
+    else:
+        classification = "unknown"
+    metrics["classification"] = classification
+    return metrics
+
+
 def build_scorecard_entry(
     lane_name: str,
     workload_entry: dict[str, Any],
     *,
     source_report: str | None = None,
     detected_sections: list[str] | None = None,
+    parsed_metrics: dict[str, Any] | None = None,
+    notes: list[str] | None = None,
 ) -> dict[str, Any]:
+    parsed_metrics = parsed_metrics or {}
     return {
         "lane": lane_name,
         "uuid": workload_entry["uuid"],
@@ -54,10 +124,10 @@ def build_scorecard_entry(
             "scheduler_health": {
                 "section": "SchedulerStats / WarpStateStats",
                 "metrics": {
-                    "issue_efficiency": None,
-                    "skipped_issue_slots": None,
-                    "eligible_warps_per_scheduler": None,
-                    "issued_warps_per_scheduler": None,
+                    "issue_efficiency": parsed_metrics.get("issue_efficiency"),
+                    "skipped_issue_slots": parsed_metrics.get("skipped_issue_slots"),
+                    "eligible_warps_per_scheduler": parsed_metrics.get("eligible_warps_per_scheduler"),
+                    "issued_warps_per_scheduler": parsed_metrics.get("issued_warps_per_scheduler"),
                 },
                 "interpretation": "Focus on stalls only if schedulers fail to issue consistently.",
                 "verdict": "unknown",
@@ -65,9 +135,9 @@ def build_scorecard_entry(
             "occupancy_effectiveness": {
                 "section": "Occupancy / LaunchStats",
                 "metrics": {
-                    "theoretical_occupancy_pct": None,
-                    "achieved_occupancy_pct": None,
-                    "occupancy_gap_pct": None,
+                    "theoretical_occupancy_pct": parsed_metrics.get("theoretical_occupancy_pct"),
+                    "achieved_occupancy_pct": parsed_metrics.get("achieved_occupancy_pct"),
+                    "occupancy_gap_pct": parsed_metrics.get("occupancy_gap_pct"),
                 },
                 "interpretation": "Low occupancy hurts latency hiding; large theory-vs-achieved gap implies imbalance.",
                 "verdict": "unknown",
@@ -75,10 +145,10 @@ def build_scorecard_entry(
             "bound_classification": {
                 "section": "SpeedOfLight / MemoryWorkloadAnalysis / Roofline",
                 "metrics": {
-                    "compute_utilization_pct": None,
-                    "memory_utilization_pct": None,
+                    "compute_utilization_pct": parsed_metrics.get("compute_utilization_pct"),
+                    "memory_utilization_pct": parsed_metrics.get("memory_utilization_pct"),
                 },
-                "classification": "unknown",
+                "classification": parsed_metrics.get("classification", "unknown"),
                 "interpretation": "Use roofline + SOL to identify whether the kernel is memory- or compute/scheduler-limited.",
                 "verdict": "unknown",
             },
@@ -93,8 +163,27 @@ def build_scorecard_entry(
             "trial_1_vs_steady_state": "unknown",
             "broad_regression_screen": "unknown",
         },
-        "notes": [],
+        "notes": list(notes or []),
     }
+
+
+def resolve_report_match(report_text: dict[str, str], uuid: str) -> tuple[str | None, str | None, list[str]]:
+    full_matches = sorted(name for name in report_text if uuid in name)
+    if len(full_matches) == 1:
+        report_name = full_matches[0]
+        return report_name, report_text[report_name], []
+    if len(full_matches) > 1:
+        return None, None, [f"ambiguous_report_matches={full_matches}"]
+
+    prefix = uuid[:8]
+    prefix_matches = sorted(name for name in report_text if prefix in name)
+    if len(prefix_matches) == 1:
+        report_name = prefix_matches[0]
+        return report_name, report_text[report_name], []
+    if len(prefix_matches) > 1:
+        return None, None, [f"ambiguous_report_matches={prefix_matches}"]
+
+    return None, None, []
 
 
 def build_scorecard_payload(
@@ -112,17 +201,21 @@ def build_scorecard_payload(
         for entry in entries:
             source_report = None
             detected = []
+            parsed_metrics = {}
+            notes: list[str] = []
             if report_text:
-                matches = [name for name in report_text if entry["uuid"][:8] in name or entry["uuid"] in name]
-                if matches:
-                    source_report = matches[0]
-                    detected = detect_sections(report_text[source_report])
+                source_report, raw_text, notes = resolve_report_match(report_text, entry["uuid"])
+                if raw_text is not None:
+                    detected = detect_sections(raw_text)
+                    parsed_metrics = parse_ncu_metrics(raw_text)
             scorecards.append(
                 build_scorecard_entry(
                     lane_name,
                     entry,
                     source_report=source_report,
                     detected_sections=detected,
+                    parsed_metrics=parsed_metrics,
+                    notes=notes,
                 )
             )
 

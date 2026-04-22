@@ -12,7 +12,12 @@ from scripts.benchmark_results import (
 )
 from scripts.freeze_canonical_workloads import build_canonical_lane_payload
 from scripts.profile_workload import _resolve_trace_set_path
-from scripts.ncu_scorecard import build_scorecard_payload, detect_sections
+from scripts.ncu_scorecard import (
+    build_scorecard_payload,
+    detect_sections,
+    parse_ncu_metrics,
+    resolve_report_match,
+)
 from scripts.segment_benchmark_results import (
     auto_cluster_boundaries,
     segment_definition_rows,
@@ -191,6 +196,83 @@ class NcuTrackingArtifactsTest(unittest.TestCase):
         with unittest.mock.patch.dict("os.environ", {"FIB_DATASET_PATH": "/tmp/dataset"}, clear=False):
             self.assertEqual(_resolve_trace_set_path(None), "/tmp/dataset")
         self.assertEqual(_resolve_trace_set_path("/explicit/path"), "/explicit/path")
+
+    def test_parse_ncu_metrics(self) -> None:
+        raw_text = """
+        SchedulerStats
+        Issue Slots Busy 72.5%
+        Skipped Issue Slots 12.0%
+        Eligible Warps Per Scheduler 1.75
+        Issued Warps Per Scheduler 0.95
+        Occupancy
+        Theoretical Occupancy 62.5%
+        Achieved Occupancy 37.5%
+        SpeedOfLight
+        Compute (SM) Throughput 41.0%
+        Memory Throughput 78.0%
+        Roofline
+        """
+        metrics = parse_ncu_metrics(raw_text)
+        self.assertEqual(metrics["classification"], "memory_bound")
+        self.assertEqual(metrics["occupancy_gap_pct"], 25.0)
+        self.assertEqual(metrics["issue_efficiency"], 72.5)
+
+    def test_build_scorecard_payload_ingests_report_metrics(self) -> None:
+        canonical_lanes = {
+            "metadata": {"definition": "demo"},
+            "lanes": {
+                "tail": [{"uuid": "deadbeef-0000-0000-0000-000000000000", "latency_ms": 0.9}],
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_dir = Path(tmpdir)
+            report_path = report_dir / "deadbeef-report.txt"
+            report_path.write_text(
+                "SchedulerStats\nIssue Slots Busy 70.0%\n"
+                "Occupancy\nTheoretical Occupancy 60.0%\nAchieved Occupancy 40.0%\n"
+                "SpeedOfLight\nCompute (SM) Throughput 65.0%\nMemory Throughput 20.0%\n"
+            )
+            payload = build_scorecard_payload(canonical_lanes, report_dir=report_dir)
+        scorecard = payload["scorecards"][0]
+        self.assertEqual(scorecard["source_report"], "deadbeef-report.txt")
+        self.assertEqual(
+            scorecard["primary"]["bound_classification"]["classification"],
+            "compute_bound",
+        )
+        self.assertEqual(
+            scorecard["primary"]["occupancy_effectiveness"]["metrics"]["occupancy_gap_pct"],
+            20.0,
+        )
+
+    def test_resolve_report_match_rejects_ambiguous_matches(self) -> None:
+        report_text = {
+            "deadbeef-baseline.txt": "SchedulerStats",
+            "deadbeef-candidate.txt": "SchedulerStats",
+        }
+        report_name, raw_text, notes = resolve_report_match(
+            report_text,
+            "deadbeef-0000-0000-0000-000000000000",
+        )
+        self.assertIsNone(report_name)
+        self.assertIsNone(raw_text)
+        self.assertTrue(notes)
+
+    def test_build_scorecard_payload_leaves_ambiguous_report_uningested(self) -> None:
+        canonical_lanes = {
+            "metadata": {"definition": "demo"},
+            "lanes": {
+                "tail": [{"uuid": "deadbeef-0000-0000-0000-000000000000", "latency_ms": 0.9}],
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_dir = Path(tmpdir)
+            (report_dir / "deadbeef-baseline.txt").write_text("SchedulerStats\nIssue Slots Busy 70.0%\n")
+            (report_dir / "deadbeef-candidate.txt").write_text("SchedulerStats\nIssue Slots Busy 80.0%\n")
+            payload = build_scorecard_payload(canonical_lanes, report_dir=report_dir)
+        scorecard = payload["scorecards"][0]
+        self.assertIsNone(scorecard["source_report"])
+        self.assertEqual(scorecard["detected_sections"], [])
+        self.assertTrue(scorecard["notes"])
 
 
 if __name__ == "__main__":
