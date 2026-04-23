@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
+import os
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +30,9 @@ DEFAULT_SECTIONS = (
     "MemoryWorkloadAnalysis",
     "LaunchStats",
 )
+PERSISTENT_POLICY_ENV = "MSINFER_GDN_PERSISTENT_POLICY"
+PERSISTENT_AUTO_MAX_BATCH_ENV = "MSINFER_PERSISTENT_AUTO_MAX_BATCH"
+PERSISTENT_AUTO_MAX_SEQ_LEN_ENV = "MSINFER_PERSISTENT_AUTO_MAX_SEQ_LEN"
 
 app = modal.App("flashinfer-prefill-ncu")
 trace_volume = modal.Volume.from_name(TRACE_VOLUME_NAME, create_if_missing=True)
@@ -49,6 +55,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--trace-set-path", type=Path, default=None)
     parser.add_argument("--definition", default="gdn_prefill_qk4_v8_d128_k_last")
     parser.add_argument("--workload-uuids", default="", help="Comma-separated workload UUIDs (empty means all)")
+    parser.add_argument(
+        "--representative-groups-json",
+        type=Path,
+        default=None,
+        help="Optional structural groups JSON; selects the first UUID from each group",
+    )
     parser.add_argument("--limit", type=int, default=0, help="Optional cap after workload selection (0 means all)")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--kernel-pattern", default=DEFAULT_KERNEL_PATTERN)
@@ -58,6 +70,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--output-dir", type=Path, default=Path(".omx/profiles/full-prefill-ncu"))
     parser.add_argument("--manifest-json", type=Path, default=None)
+    parser.add_argument("--label", default="baseline", help="Capture label written to the manifest")
+    parser.add_argument("--persistent-policy", default="", help="Optional MSINFER_GDN_PERSISTENT_POLICY override")
+    parser.add_argument("--persistent-auto-max-batch", type=int, default=0)
+    parser.add_argument("--persistent-auto-max-seq-len", type=int, default=0)
     return parser.parse_args(argv)
 
 
@@ -71,6 +87,35 @@ def _load_solution_payload() -> dict[str, Any]:
     solution_path = pack_solution(PROJECT_ROOT / "solution.json")
     solution = Solution.model_validate_json(solution_path.read_text())
     return solution.model_dump(mode="json")
+
+
+def _build_runtime_env(args: argparse.Namespace) -> dict[str, str]:
+    runtime_env: dict[str, str] = {}
+    if args.persistent_policy:
+        runtime_env[PERSISTENT_POLICY_ENV] = args.persistent_policy
+    if args.persistent_auto_max_batch > 0:
+        runtime_env[PERSISTENT_AUTO_MAX_BATCH_ENV] = str(args.persistent_auto_max_batch)
+    if args.persistent_auto_max_seq_len > 0:
+        runtime_env[PERSISTENT_AUTO_MAX_SEQ_LEN_ENV] = str(args.persistent_auto_max_seq_len)
+    return runtime_env
+
+
+@contextmanager
+def _temporary_env(overrides: dict[str, str]):
+    if not overrides:
+        yield
+        return
+
+    previous = {key: os.environ.get(key) for key in overrides}
+    try:
+        os.environ.update(overrides)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _resolve_workload_uuids(definition: str, trace_set_path: Path | None, explicit_uuids: list[str], limit: int) -> list[str]:
@@ -87,11 +132,26 @@ def _resolve_workload_uuids(definition: str, trace_set_path: Path | None, explic
     return workloads
 
 
-def _manifest_row(result: dict[str, Any], report_filename: str) -> dict[str, Any]:
+def _load_representative_uuids(groups_json: Path) -> list[str]:
+    payload = json.loads(groups_json.read_text(encoding="utf-8"))
+    groups = payload.get("groups", [])
+    if not isinstance(groups, list):
+        raise ValueError("Representative groups JSON must contain a 'groups' list")
+
+    representative_uuids: list[str] = []
+    for group in groups:
+        uuids = group.get("uuids") if isinstance(group, dict) else None
+        if not isinstance(uuids, list) or not uuids or not isinstance(uuids[0], str):
+            raise ValueError("Each group must contain at least one UUID")
+        representative_uuids.append(uuids[0])
+    return representative_uuids
+
+
+def _manifest_row(result: dict[str, Any], report_filename: str, *, label: str = "baseline") -> dict[str, Any]:
     notes = list(result.get("notes", []))
     return {
         "uuid": result["uuid"],
-        "label": "baseline",
+        "label": label,
         "report_path": report_filename,
         "status": result["status"],
         "notes": notes,
@@ -110,6 +170,7 @@ def _capture_single_workload(
     launch_skip: int,
     launch_count: int,
     timeout_seconds: int,
+    runtime_env: dict[str, str],
 ) -> dict[str, Any]:
     from flashinfer_bench import Solution
 
@@ -143,7 +204,8 @@ def _capture_single_workload(
                 "--trace-set-path",
                 TRACE_SET_PATH,
             ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
+            with _temporary_env(runtime_env):
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
             report_text = proc.stdout + proc.stderr
             notes: list[str] = []
             if "No kernels were profiled" in report_text:
@@ -178,15 +240,16 @@ def _capture_single_workload(
 
 @app.function(image=image, gpu="B200:1", timeout=14400, volumes={"/data": trace_volume})
 def capture_prefill_ncu_workload(
-    solution_payload: dict[str, Any],
-    definition_name: str,
-    workload_uuid: str,
-    kernel_pattern: str,
-    sections: list[str],
-    launch_skip: int,
-    launch_count: int,
-    timeout_seconds: int,
-) -> dict[str, Any]:
+    solution_payload,
+    definition_name,
+    workload_uuid,
+    kernel_pattern,
+    sections,
+    launch_skip,
+    launch_count,
+    timeout_seconds,
+    runtime_env,
+):
     from flashinfer_bench import TraceSet
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
@@ -214,6 +277,7 @@ def capture_prefill_ncu_workload(
         launch_skip=launch_skip,
         launch_count=launch_count,
         timeout_seconds=timeout_seconds,
+        runtime_env=runtime_env,
     )
 
 
@@ -222,40 +286,55 @@ def _collect_workload_results(
     *,
     batch_size: int,
     spawn_fn,
+    result_callback=None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for batch in _chunked(workload_uuids, max(1, batch_size)):
         calls = [(uuid, spawn_fn(uuid)) for uuid in batch]
-        for uuid, call in calls:
-            try:
-                result = call.get()
-            except Exception as exc:  # pragma: no cover - exercised by mocks/local failures
-                result = {
-                    "uuid": uuid,
-                    "status": "exception",
-                    "notes": [f"{type(exc).__name__}: {exc}"],
-                    "report_text": "",
-                    "kernel_pattern": None,
-                }
-            results.append(result)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(calls)) as executor:
+            futures = {executor.submit(call.get): uuid for uuid, call in calls}
+            for future in concurrent.futures.as_completed(futures):
+                uuid = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:  # pragma: no cover - exercised by mocks/local failures
+                    result = {
+                        "uuid": uuid,
+                        "status": "exception",
+                        "notes": [f"{type(exc).__name__}: {exc}"],
+                        "report_text": "",
+                        "kernel_pattern": None,
+                    }
+                results.append(result)
+                if result_callback is not None:
+                    result_callback(result)
     return results
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     explicit_uuids = [uuid.strip() for uuid in args.workload_uuids.split(",") if uuid.strip()]
+    if not explicit_uuids and args.representative_groups_json is not None:
+        explicit_uuids = _load_representative_uuids(args.representative_groups_json)
     workload_uuids = _resolve_workload_uuids(args.definition, args.trace_set_path, explicit_uuids, args.limit)
     if not workload_uuids:
         raise SystemExit("No workloads selected")
 
     solution_payload = _load_solution_payload()
+    runtime_env = _build_runtime_env(args)
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_rows: list[dict[str, Any]] = []
     sections = [section.strip() for section in args.sections_csv.split(",") if section.strip()]
 
+    def handle_result(result: dict[str, Any]) -> None:
+        report_filename = f"{result['uuid']}.txt"
+        (output_dir / report_filename).write_text(result.get("report_text", ""), encoding="utf-8")
+        manifest_rows.append(_manifest_row(result, report_filename, label=args.label))
+        print(f"[{result['status']}] {result['uuid']}", flush=True)
+
     with app.run():
-        batch_results = _collect_workload_results(
+        _collect_workload_results(
             workload_uuids,
             batch_size=args.batch_size,
             spawn_fn=lambda uuid: capture_prefill_ncu_workload.spawn(
@@ -267,22 +346,21 @@ def main(argv: list[str] | None = None) -> int:
                 args.launch_skip,
                 args.launch_count,
                 args.timeout,
+                runtime_env,
             ),
+            result_callback=handle_result,
         )
-        for result in batch_results:
-            report_filename = f"{result['uuid']}.txt"
-            (output_dir / report_filename).write_text(result.get("report_text", ""), encoding="utf-8")
-            manifest_rows.append(_manifest_row(result, report_filename))
-            print(f"[{result['status']}] {result['uuid']}")
 
     manifest_path = args.manifest_json or output_dir / "manifest.json"
     manifest_payload = {
         "metadata": {
             "definition": args.definition,
             "kernel_pattern": args.kernel_pattern,
+            "label": args.label,
             "sections": sections,
             "launch_skip": args.launch_skip,
             "launch_count": args.launch_count,
+            "runtime_env": runtime_env,
             "workload_count": len(workload_uuids),
         },
         "reports": manifest_rows,
@@ -290,6 +368,66 @@ def main(argv: list[str] | None = None) -> int:
     manifest_path.write_text(json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"saved_manifest={manifest_path}")
     return 0
+
+
+@app.local_entrypoint()
+def modal_main(
+    trace_set_path: str = "",
+    definition: str = "gdn_prefill_qk4_v8_d128_k_last",
+    workload_uuids: str = "",
+    representative_groups_json: str = "",
+    limit: int = 0,
+    batch_size: int = 8,
+    kernel_pattern: str = DEFAULT_KERNEL_PATTERN,
+    launch_skip: int = 1,
+    launch_count: int = 1,
+    sections_csv: str = ",".join(DEFAULT_SECTIONS),
+    timeout: int = 1800,
+    output_dir: str = ".omx/profiles/full-prefill-ncu",
+    manifest_json: str = "",
+    label: str = "baseline",
+    persistent_policy: str = "",
+    persistent_auto_max_batch: int = 0,
+    persistent_auto_max_seq_len: int = 0,
+):
+    argv = [
+        "--definition",
+        definition,
+        "--workload-uuids",
+        workload_uuids,
+        "--limit",
+        str(limit),
+        "--batch-size",
+        str(batch_size),
+        "--kernel-pattern",
+        kernel_pattern,
+        "--launch-skip",
+        str(launch_skip),
+        "--launch-count",
+        str(launch_count),
+        "--sections-csv",
+        sections_csv,
+        "--timeout",
+        str(timeout),
+        "--output-dir",
+        output_dir,
+        "--label",
+        label,
+    ]
+    if trace_set_path:
+        argv.extend(["--trace-set-path", trace_set_path])
+    if representative_groups_json:
+        argv.extend(["--representative-groups-json", representative_groups_json])
+    if manifest_json:
+        argv.extend(["--manifest-json", manifest_json])
+    if persistent_policy:
+        argv.extend(["--persistent-policy", persistent_policy])
+    if persistent_auto_max_batch > 0:
+        argv.extend(["--persistent-auto-max-batch", str(persistent_auto_max_batch)])
+    if persistent_auto_max_seq_len > 0:
+        argv.extend(["--persistent-auto-max-seq-len", str(persistent_auto_max_seq_len)])
+
+    raise SystemExit(main(argv))
 
 
 if __name__ == "__main__":

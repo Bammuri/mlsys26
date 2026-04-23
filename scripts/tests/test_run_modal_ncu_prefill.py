@@ -5,7 +5,16 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scripts.run_modal_ncu_prefill import _capture_single_workload, _chunked, _collect_workload_results, _manifest_row, _resolve_workload_uuids
+from scripts.run_modal_ncu_prefill import (
+    PERSISTENT_POLICY_ENV,
+    _build_runtime_env,
+    _capture_single_workload,
+    _chunked,
+    _collect_workload_results,
+    _load_representative_uuids,
+    _manifest_row,
+    _resolve_workload_uuids,
+)
 
 
 class ModalNcuPrefillHelpersTest(unittest.TestCase):
@@ -27,6 +36,20 @@ class ModalNcuPrefillHelpersTest(unittest.TestCase):
         self.assertEqual(row["report_path"], "abc.txt")
         self.assertEqual(row["status"], "ok")
 
+    def test_manifest_row_accepts_candidate_label(self) -> None:
+        row = _manifest_row(
+            {
+                "uuid": "abc",
+                "status": "ok",
+                "notes": [],
+                "axes": {},
+                "kernel_pattern": "regex:kernel.*",
+            },
+            "abc.txt",
+            label="candidate",
+        )
+        self.assertEqual(row["label"], "candidate")
+
     def test_resolve_workload_uuids_filters_and_limits(self) -> None:
         fake_trace = mock.Mock()
         fake_trace.workloads = {
@@ -40,6 +63,18 @@ class ModalNcuPrefillHelpersTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmpdir:
                 uuids = _resolve_workload_uuids("demo", Path(tmpdir), ["u2", "u3"], 1)
         self.assertEqual(uuids, ["u2"])
+
+    def test_load_representative_uuids_reads_first_uuid_per_group(self) -> None:
+        payload = {
+            "groups": [
+                {"selector_key": "a", "uuids": ["u1", "u2"]},
+                {"selector_key": "b", "uuids": ["u3"]},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "groups.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(_load_representative_uuids(path), ["u1", "u3"])
 
     def test_capture_single_workload_timeout_is_localized(self) -> None:
         definition = mock.Mock()
@@ -72,10 +107,59 @@ class ModalNcuPrefillHelpersTest(unittest.TestCase):
                 launch_skip=1,
                 launch_count=1,
                 timeout_seconds=5,
+                runtime_env={},
             )
 
         self.assertEqual(result["status"], "timeout")
         self.assertEqual(result["uuid"], "u-timeout")
+
+    def test_capture_single_workload_applies_runtime_env_to_ncu_subprocess(self) -> None:
+        definition = mock.Mock()
+        definition.model_dump_json.return_value = "{}"
+        workload = mock.Mock()
+        workload.uuid = "u-env"
+        workload.axes = {"total_seq_len": 32}
+        workload.model_dump_json.return_value = "{}"
+
+        def _fake_run(*args, **kwargs):
+            self.assertEqual(__import__("os").environ.get(PERSISTENT_POLICY_ENV), "adaptive")
+            return mock.Mock(returncode=0, stdout="Occupancy\n", stderr="")
+
+        with mock.patch("scripts.run_modal_ncu_prefill.subprocess.run", side_effect=_fake_run):
+            result = _capture_single_workload(
+                solution_payload={
+                    "name": "demo",
+                    "definition": "demo",
+                    "author": "x",
+                    "spec": {
+                        "language": "python",
+                        "target_hardware": ["cuda"],
+                        "entry_point": "main.py::run",
+                        "dependencies": [],
+                        "destination_passing_style": True,
+                    },
+                    "sources": [{"path": "main.py", "content": "def run():\n    pass\n"}],
+                },
+                definition=definition,
+                workload=workload,
+                kernel_pattern="regex:kernel.*",
+                section_args=[],
+                launch_skip=1,
+                launch_count=1,
+                timeout_seconds=5,
+                runtime_env={PERSISTENT_POLICY_ENV: "adaptive"},
+            )
+
+        self.assertEqual(result["status"], "ok")
+
+    def test_build_runtime_env_records_persistent_policy(self) -> None:
+        args = mock.Mock(
+            persistent_policy="adaptive",
+            persistent_auto_max_batch=0,
+            persistent_auto_max_seq_len=0,
+        )
+
+        self.assertEqual(_build_runtime_env(args), {PERSISTENT_POLICY_ENV: "adaptive"})
 
     def test_collect_workload_results_localizes_call_failures(self) -> None:
         class _Call:
@@ -93,15 +177,18 @@ class ModalNcuPrefillHelpersTest(unittest.TestCase):
             "u2": _Call(exc=RuntimeError("boom")),
             "u3": _Call({"uuid": "u3", "status": "ok", "notes": [], "report_text": "", "kernel_pattern": "k"}),
         }
+        streamed = []
         results = _collect_workload_results(
             ["u1", "u2", "u3"],
             batch_size=2,
             spawn_fn=lambda uuid: calls[uuid],
+            result_callback=streamed.append,
         )
         by_uuid = {item["uuid"]: item for item in results}
         self.assertEqual(by_uuid["u1"]["status"], "ok")
         self.assertEqual(by_uuid["u3"]["status"], "ok")
         self.assertEqual(by_uuid["u2"]["status"], "exception")
+        self.assertEqual({item["uuid"] for item in streamed}, {"u1", "u2", "u3"})
 
 
 if __name__ == "__main__":

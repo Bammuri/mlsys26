@@ -26,7 +26,19 @@ _LEGACY_TRACE_PHASES_ENV = "MSINFER_TRACE_PHASES"
 _DEFAULT_PERSISTENT_POLICY = "never"
 _DEFAULT_PERSISTENT_AUTO_MAX_BATCH = 2
 _DEFAULT_PERSISTENT_AUTO_MAX_SEQ_LEN = 128
-_VALID_PERSISTENT_POLICIES = frozenset({"never", "always", "auto"})
+_VALID_PERSISTENT_POLICIES = frozenset({"never", "always", "auto", "adaptive"})
+
+_ADAPTIVE_BATCH_SMALL_MAX = 1
+_ADAPTIVE_BATCH_MEDIUM_MAX = 3
+_ADAPTIVE_MAX_SEQ_SMALL_MAX = 61
+_ADAPTIVE_MAX_SEQ_MEDIUM_MAX = 890
+_ADAPTIVE_TOTAL_SEQ_SMALL_MAX = 76
+_ADAPTIVE_TOTAL_SEQ_MEDIUM_MAX = 959
+_ADAPTIVE_PERSISTENT_SELECTOR_KEYS = frozenset(
+    {
+        "varlen:batch=medium:maxseq=large:totalseq=large",
+    }
+)
 
 
 def _normalize_scale(scale: Any, head_dim: int) -> float:
@@ -170,24 +182,62 @@ def _normalize_positive_int(value: str | None, *, default: int, env_name: str) -
     return parsed
 
 
+def _shape_bucket(value: int, *, small_max: int, medium_max: int) -> str:
+    if value <= small_max:
+        return "small"
+    if value <= medium_max:
+        return "medium"
+    return "large"
+
+
+def _adaptive_selector_key(problem_size: tuple[int, int, int, int, int, int], *, varlen: bool) -> str:
+    if not varlen:
+        return "fixed"
+
+    batch_size, max_seq_len, total_seq_len, *_ = problem_size
+    batch_bucket = _shape_bucket(
+        batch_size,
+        small_max=_ADAPTIVE_BATCH_SMALL_MAX,
+        medium_max=_ADAPTIVE_BATCH_MEDIUM_MAX,
+    )
+    max_seq_bucket = _shape_bucket(
+        max_seq_len,
+        small_max=_ADAPTIVE_MAX_SEQ_SMALL_MAX,
+        medium_max=_ADAPTIVE_MAX_SEQ_MEDIUM_MAX,
+    )
+    total_seq_bucket = _shape_bucket(
+        total_seq_len,
+        small_max=_ADAPTIVE_TOTAL_SEQ_SMALL_MAX,
+        medium_max=_ADAPTIVE_TOTAL_SEQ_MEDIUM_MAX,
+    )
+    return f"varlen:batch={batch_bucket}:maxseq={max_seq_bucket}:totalseq={total_seq_bucket}"
+
+
+def _select_adaptive_persistent_mode(problem_size: tuple[int, int, int, int, int, int], *, varlen: bool) -> bool:
+    return _adaptive_selector_key(problem_size, varlen=varlen) in _ADAPTIVE_PERSISTENT_SELECTOR_KEYS
+
+
 def _select_persistent_mode(
     problem_size: tuple[int, int, int, int, int, int],
     *,
     policy: str,
     auto_max_batch: int = _DEFAULT_PERSISTENT_AUTO_MAX_BATCH,
     auto_max_seq_len: int = _DEFAULT_PERSISTENT_AUTO_MAX_SEQ_LEN,
+    varlen: bool = True,
 ) -> bool:
     normalized_policy = _normalize_persistent_policy(policy)
     if normalized_policy == "never":
         return False
     if normalized_policy == "always":
         return True
+    if normalized_policy == "adaptive":
+        return _select_adaptive_persistent_mode(problem_size, varlen=varlen)
 
     batch_size, max_seq_len, *_ = problem_size
     return batch_size <= auto_max_batch and max_seq_len <= auto_max_seq_len
 
 
-def _resolve_persistent_mode(problem_size: tuple[int, int, int, int, int, int]) -> bool:
+def _resolve_persistent_mode(problem_size: tuple[int, int, int, int, int, int], *, varlen: bool = True) -> bool:
     policy = _normalize_persistent_policy(
         os.getenv(_PERSISTENT_POLICY_ENV, os.getenv(_LEGACY_PERSISTENT_POLICY_ENV))
     )
@@ -206,6 +256,7 @@ def _resolve_persistent_mode(problem_size: tuple[int, int, int, int, int, int]) 
         policy=policy,
         auto_max_batch=auto_max_batch,
         auto_max_seq_len=auto_max_seq_len,
+        varlen=varlen,
     )
 
 
@@ -296,7 +347,7 @@ def run(
 
         with _phase_scope("msinfer_entry.problem_size"):
             problem_size = _get_problem_size_cached(q_runtime, v_runtime, cu_seqlens)
-        is_persistent = _resolve_persistent_mode(problem_size)
+        is_persistent = _resolve_persistent_mode(problem_size, varlen=varlen)
 
         with _phase_scope("msinfer_entry.compile_lookup"):
             compiled_gdn = _get_compiled_runner(

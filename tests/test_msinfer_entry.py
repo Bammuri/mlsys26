@@ -58,9 +58,11 @@ class PersistentPolicyTests(unittest.TestCase):
     def test_persistent_policy_variants(self):
         small_problem = (1, 128, 128, 8, 16, 128)
         large_problem = (4, 1024, 4096, 8, 32, 128)
+        stable_target_problem = (3, 1200, 2048, 8, 16, 128)
 
         self.assertFalse(msinfer_entry._select_persistent_mode(small_problem, policy="never"))
         self.assertTrue(msinfer_entry._select_persistent_mode(large_problem, policy="always"))
+        self.assertTrue(msinfer_entry._select_persistent_mode(stable_target_problem, policy="adaptive"))
         self.assertTrue(
             msinfer_entry._select_persistent_mode(
                 small_problem,
@@ -76,6 +78,26 @@ class PersistentPolicyTests(unittest.TestCase):
                 auto_max_batch=1,
                 auto_max_seq_len=128,
             )
+        )
+
+    def test_adaptive_policy_matches_ncu_stable_shape_groups(self):
+        provisional_mixed_tail = (32, 2300, 8192, 8, 16, 128)
+        stable_tail = (3, 1200, 2048, 8, 16, 128)
+        stable_mid = (3, 512, 512, 8, 16, 128)
+        scheduler_regressed_small_seq = (3, 32, 512, 8, 16, 128)
+        fast_floor = (1, 30, 30, 8, 16, 128)
+        fixed_shape = (2, 512, 512, 8, 16, 128)
+
+        self.assertFalse(msinfer_entry._select_persistent_mode(provisional_mixed_tail, policy="adaptive"))
+        self.assertTrue(msinfer_entry._select_persistent_mode(stable_tail, policy="adaptive"))
+        self.assertFalse(msinfer_entry._select_persistent_mode(stable_mid, policy="adaptive"))
+        self.assertFalse(msinfer_entry._select_persistent_mode(scheduler_regressed_small_seq, policy="adaptive"))
+        self.assertFalse(msinfer_entry._select_persistent_mode(fast_floor, policy="adaptive"))
+        self.assertFalse(msinfer_entry._select_persistent_mode(fixed_shape, policy="adaptive", varlen=False))
+
+        self.assertEqual(
+            msinfer_entry._adaptive_selector_key(stable_tail, varlen=True),
+            "varlen:batch=medium:maxseq=large:totalseq=large",
         )
 
     def test_invalid_persistent_policy_raises(self):
@@ -105,6 +127,15 @@ class PersistentPolicyTests(unittest.TestCase):
             clear=False,
         ):
             self.assertTrue(msinfer_entry._resolve_persistent_mode(problem_size))
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                msinfer_entry._PERSISTENT_POLICY_ENV: "adaptive",
+            },
+            clear=False,
+        ):
+            self.assertFalse(msinfer_entry._resolve_persistent_mode(problem_size))
 
     def test_invalid_auto_threshold_raises(self):
         with self.assertRaisesRegex(ValueError, "positive integer"):
