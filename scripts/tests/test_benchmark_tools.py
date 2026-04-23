@@ -228,6 +228,27 @@ class NcuTrackingArtifactsTest(unittest.TestCase):
         self.assertEqual(metrics["occupancy_gap_pct"], 25.0)
         self.assertEqual(metrics["issue_efficiency"], 72.5)
 
+    def test_parse_ncu_metrics_table_layout(self) -> None:
+        raw_text = """
+        Scheduler Statistics
+        No Eligible                            %        77.59
+        Eligible Warps Per Scheduler        warp         0.23
+        Issued Warp Per Scheduler                        0.22
+        Occupancy
+        Theoretical Occupancy                     %        12.50
+        Achieved Occupancy                        %        12.17
+        SpeedOfLight
+        Compute (SM) Throughput           %        17.17
+        Memory Throughput                 %        24.31
+        """
+        metrics = parse_ncu_metrics(raw_text)
+        self.assertEqual(metrics["skipped_issue_slots"], 77.59)
+        self.assertEqual(metrics["eligible_warps_per_scheduler"], 0.23)
+        self.assertEqual(metrics["issued_warps_per_scheduler"], 0.22)
+        self.assertEqual(metrics["theoretical_occupancy_pct"], 12.5)
+        self.assertEqual(metrics["achieved_occupancy_pct"], 12.17)
+        self.assertEqual(metrics["classification"], "balanced_or_mixed")
+
     def test_build_scorecard_payload_ingests_report_metrics(self) -> None:
         canonical_lanes = {
             "metadata": {"definition": "demo"},
@@ -355,6 +376,42 @@ class NcuTrackingArtifactsTest(unittest.TestCase):
         self.assertEqual(
             payload["scorecards"][0]["secondary"]["paired_latency_ms"]["verdict"],
             "improved",
+        )
+
+    def test_build_scorecard_payload_uses_baseline_manifest_for_primary_metrics(self) -> None:
+        canonical_lanes = {
+            "metadata": {"definition": "demo"},
+            "lanes": {
+                "tail": [{"uuid": "deadbeef-0000-0000-0000-000000000000", "latency_ms": 0.9}],
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            baseline = base / "baseline.txt"
+            baseline.write_text(
+                "SchedulerStats\nIssue Slots Busy 70.0%\n"
+                "Occupancy\nTheoretical Occupancy 60.0%\nAchieved Occupancy 40.0%\n"
+                "SpeedOfLight\nCompute (SM) Throughput 55.0%\nMemory Throughput 20.0%\n"
+            )
+            manifest = {
+                "deadbeef-0000-0000-0000-000000000000": [
+                    {
+                        "uuid": "deadbeef-0000-0000-0000-000000000000",
+                        "label": "baseline",
+                        "report_path": str(baseline),
+                    }
+                ]
+            }
+            payload = build_scorecard_payload(canonical_lanes, report_manifest=manifest)
+        scorecard = payload["scorecards"][0]
+        self.assertEqual(scorecard["source_report"], str(baseline))
+        self.assertEqual(
+            scorecard["primary"]["scheduler_health"]["metrics"]["issue_efficiency"],
+            70.0,
+        )
+        self.assertEqual(
+            scorecard["primary"]["bound_classification"]["classification"],
+            "compute_bound",
         )
 
     def test_build_scorecard_payload_uses_manifest_relative_paths(self) -> None:

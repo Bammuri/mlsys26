@@ -33,31 +33,42 @@ COMPARISON_LABELS = {"baseline", "candidate"}
 METRIC_PATTERNS = {
     "issue_efficiency": [
         r"Issue(?:\s+Slots)?\s+Busy\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"Issue(?:\s+Slots)?\s+Busy\s+%\s+([0-9]+(?:\.[0-9]+)?)",
         r"Scheduler\s+Issue\s+Efficiency\s+([0-9]+(?:\.[0-9]+)?)\s*%",
     ],
     "skipped_issue_slots": [
         r"Skipped\s+Issue\s+Slots\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"Skipped\s+Issue\s+Slots\s+%\s+([0-9]+(?:\.[0-9]+)?)",
         r"No\s+Eligible\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"No\s+Eligible\s+%\s+([0-9]+(?:\.[0-9]+)?)",
     ],
     "eligible_warps_per_scheduler": [
         r"Eligible\s+Warps\s+Per\s+Scheduler\s+([0-9]+(?:\.[0-9]+)?)",
+        r"Eligible\s+Warps\s+Per\s+Scheduler\s+warp\s+([0-9]+(?:\.[0-9]+)?)",
     ],
     "issued_warps_per_scheduler": [
         r"Issued\s+Warps\s+Per\s+Scheduler\s+([0-9]+(?:\.[0-9]+)?)",
+        r"Issued\s+Warp\s+Per\s+Scheduler\s+([0-9]+(?:\.[0-9]+)?)",
     ],
     "theoretical_occupancy_pct": [
         r"Theoretical\s+Occupancy\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"Theoretical\s+Occupancy\s+%\s+([0-9]+(?:\.[0-9]+)?)",
     ],
     "achieved_occupancy_pct": [
         r"Achieved\s+Occupancy\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"Achieved\s+Occupancy\s+%\s+([0-9]+(?:\.[0-9]+)?)",
     ],
     "compute_utilization_pct": [
         r"Compute\s+\(SM\)\s+Throughput\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"Compute\s+\(SM\)\s+Throughput\s+%\s+([0-9]+(?:\.[0-9]+)?)",
         r"SM\s+Throughput\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"SM\s+Throughput\s+%\s+([0-9]+(?:\.[0-9]+)?)",
     ],
     "memory_utilization_pct": [
         r"Memory\s+Throughput\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"Memory\s+Throughput\s+%\s+([0-9]+(?:\.[0-9]+)?)",
         r"DRAM\s+Throughput\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"DRAM\s+Throughput\s+%\s+([0-9]+(?:\.[0-9]+)?)",
     ],
 }
 
@@ -530,6 +541,14 @@ def build_scorecard_payload(
                 report_manifest=report_manifest,
                 report_manifest_base_dir=report_manifest_base_dir,
             )
+            if not parsed_metrics and captures:
+                preferred_capture = next(
+                    (capture for capture in captures if capture.get("label") == "baseline"),
+                    captures[0],
+                )
+                parsed_metrics = preferred_capture.get("metrics", {})
+                detected = preferred_capture.get("detected_sections", [])
+                source_report = source_report or preferred_capture.get("source_report")
             scorecard = build_scorecard_entry(
                 lane_name,
                 entry,
