@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import ctypes
 import os
+from pathlib import Path
 from contextlib import ExitStack, contextmanager
 from typing import Any, Iterator, NamedTuple
 
 import torch
 import torch.nn.functional as F
+
+try:
+    import cuda.bindings.driver as _cuda_driver
+    from .nvrtc_loader import compile_and_load as _compile_and_load_nvrtc
+except Exception:  # pragma: no cover - optional short-sequence fast path
+    _cuda_driver = None
+    _compile_and_load_nvrtc = None
 
 from .gdn_block_policy import choose_default_or_tuned_block_tile
 from .main import run as _reference_run
@@ -18,6 +27,12 @@ _PROBLEM_SIZE_CACHE_VALUE = None
 _RUNNER_CACHE: dict[tuple[Any, ...], Any] = {}
 _ADAPTIVE_SELECTOR_KEYS_CACHE_KEY = None
 _ADAPTIVE_SELECTOR_KEYS_CACHE_VALUE = None
+_SEQUENTIAL_KERNEL = None
+_CACHED_CUDA_STREAM = None
+_HYBRID_META_CACHE: dict[tuple[Any, ...], Any] = {}
+_HYBRID_LONG_OUTPUT_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
+_HYBRID_LONG_STATE_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
+_HYBRID_NOT_CACHED = object()
 
 _PERSISTENT_POLICY_ENV = "MSINFER_GDN_PERSISTENT_POLICY"
 _LEGACY_PERSISTENT_POLICY_ENV = "MSINFER_PERSISTENT_POLICY"
@@ -34,6 +49,14 @@ _DEFAULT_PERSISTENT_POLICY = "never"
 _DEFAULT_PERSISTENT_AUTO_MAX_BATCH = 2
 _DEFAULT_PERSISTENT_AUTO_MAX_SEQ_LEN = 128
 _DEFAULT_KERNEL_CHUNK_SIZE = 128
+_SEQUENTIAL_SHORT_THRESHOLD = 192
+_SEQUENTIAL_SHORT_DISABLE_ENV = "MSINFER_GDN_DISABLE_SEQUENTIAL_SHORT"
+_HYBRID_ENABLE_ENV = "MSINFER_GDN_ENABLE_HYBRID_SPLIT"
+_HYBRID_DISABLE_ENV = "MSINFER_GDN_DISABLE_HYBRID_SPLIT"
+_LEGACY_HYBRID_DISABLE_ENV = "GDN_HYBRID_DISABLE"
+_HYBRID_SHORT_LEN = 128
+_HYBRID_MIN_SHORT = 4
+_HYBRID_MIN_TOTAL_SEQ_LEN = 4200
 # tcgen05 may support internal MMA M-mode 64/128, but this GDN Python
 # kernel path is still 128-specialized. Keep GDN chunk-size support narrow
 # until a dedicated 64/128 composed path is implemented and verified.
@@ -46,6 +69,16 @@ class _KernelSchedule(NamedTuple):
     internal_kernel_chunk_size: int
     internal_launch_segments: tuple[int, ...]
     experimental_policy_enabled: bool
+
+
+class _HybridMeta(NamedTuple):
+    short_idx: torch.Tensor
+    long_idx: torch.Tensor
+    long_row_idx: torch.Tensor
+    cu_seqlens_long: torch.Tensor
+    total_long: int
+    num_long: int
+    max_seq_long: int
 
 _ADAPTIVE_BATCH_SMALL_MAX = 1
 _ADAPTIVE_BATCH_MEDIUM_MAX = 3
@@ -71,6 +104,56 @@ _DEFAULT_ADAPTIVE_PERSISTENT_SELECTOR_KEYS = frozenset(
         _LARGE_LARGE_LARGE_R1_SELECTOR_KEY,
     }
 )
+
+_c_uint64 = ctypes.c_uint64
+_c_int32 = ctypes.c_int32
+_c_float = ctypes.c_float
+_c_void_p = ctypes.c_void_p
+_c_longlong = ctypes.c_longlong
+_addressof = ctypes.addressof
+_data_ptr = torch.Tensor.data_ptr
+_CU_SEQLENS_HOST_CAPACITY = 1024
+_CU_SEQLENS_HOST = (_c_longlong * _CU_SEQLENS_HOST_CAPACITY)()
+_CU_SEQLENS_HOST_PTR = _addressof(_CU_SEQLENS_HOST)
+
+
+class _SequentialKernelArgs:
+    __slots__ = ("p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "p10", "p11", "p12", "p13", "arr")
+
+    def __init__(self):
+        self.p0 = _c_uint64(0)
+        self.p1 = _c_uint64(0)
+        self.p2 = _c_uint64(0)
+        self.p3 = _c_uint64(0)
+        self.p4 = _c_uint64(0)
+        self.p5 = _c_uint64(0)
+        self.p6 = _c_uint64(0)
+        self.p7 = _c_uint64(0)
+        self.p8 = _c_uint64(0)
+        self.p9 = _c_float(0)
+        self.p10 = _c_uint64(0)
+        self.p11 = _c_uint64(0)
+        self.p12 = _c_int32(0)
+        self.p13 = _c_uint64(0)
+        self.arr = (_c_void_p * 14)(
+            _addressof(self.p0),
+            _addressof(self.p1),
+            _addressof(self.p2),
+            _addressof(self.p3),
+            _addressof(self.p4),
+            _addressof(self.p5),
+            _addressof(self.p6),
+            _addressof(self.p7),
+            _addressof(self.p8),
+            _addressof(self.p9),
+            _addressof(self.p10),
+            _addressof(self.p11),
+            _addressof(self.p12),
+            _addressof(self.p13),
+        )
+
+
+_SEQUENTIAL_KERNEL_ARGS = _SequentialKernelArgs()
 
 
 def _normalize_scale(scale: Any, head_dim: int) -> float:
@@ -528,6 +611,379 @@ def _resolve_persistent_mode(problem_size: tuple[int, int, int, int, int, int], 
     )
 
 
+def _is_sequential_short_candidate(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state: torch.Tensor | None,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    output: torch.Tensor,
+    new_state: torch.Tensor,
+) -> bool:
+    if _normalize_bool_env(os.getenv(_SEQUENTIAL_SHORT_DISABLE_ENV)):
+        return False
+    if _cuda_driver is None or _compile_and_load_nvrtc is None:
+        return False
+    if state is None or cu_seqlens is None:
+        return False
+    if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+        return False
+    if not (
+        q.is_cuda
+        and k.is_cuda
+        and v.is_cuda
+        and state.is_cuda
+        and A_log.is_cuda
+        and a.is_cuda
+        and dt_bias.is_cuda
+        and b.is_cuda
+        and cu_seqlens.is_cuda
+        and output.is_cuda
+        and new_state.is_cuda
+    ):
+        return False
+    if q.shape[0] > _SEQUENTIAL_SHORT_THRESHOLD:
+        return False
+    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
+        return False
+    if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
+        return False
+    if A_log.dtype != torch.float32 or dt_bias.dtype != torch.float32:
+        return False
+    if cu_seqlens.dtype != torch.int64:
+        return False
+    if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous() and state.is_contiguous()):
+        return False
+    if not (a.is_contiguous() and b.is_contiguous() and cu_seqlens.is_contiguous()):
+        return False
+    if not (output.is_contiguous() and new_state.is_contiguous()):
+        return False
+    if q.shape[1:] != (4, 128) or k.shape[1:] != (4, 128) or v.shape[1:] != (8, 128):
+        return False
+    if a.shape != (q.shape[0], 8) or b.shape != (q.shape[0], 8):
+        return False
+    num_seqs = cu_seqlens.numel() - 1
+    if num_seqs <= 0:
+        return False
+    if state.shape != (num_seqs, 8, 128, 128) or new_state.shape != state.shape:
+        return False
+    return output.shape == (q.shape[0], 8, 128)
+
+
+def _hybrid_split_enabled() -> bool:
+    if not _normalize_bool_env(os.getenv(_HYBRID_ENABLE_ENV)):
+        return False
+    return not (
+        _normalize_bool_env(os.getenv(_HYBRID_DISABLE_ENV))
+        or _normalize_bool_env(os.getenv(_LEGACY_HYBRID_DISABLE_ENV))
+    )
+
+
+def _is_hybrid_candidate_inputs(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state: torch.Tensor | None,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    output: torch.Tensor,
+    new_state: torch.Tensor,
+) -> bool:
+    if not _hybrid_split_enabled():
+        return False
+    if _normalize_bool_env(os.getenv(_EXPERIMENTAL_BLOCK_POLICY_ENV)):
+        return False
+    if _cuda_driver is None or _compile_and_load_nvrtc is None:
+        return False
+    if state is None or cu_seqlens is None:
+        return False
+    if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+        return False
+    if q.shape[0] < _HYBRID_MIN_TOTAL_SEQ_LEN:
+        return False
+    if not (
+        q.is_cuda
+        and k.is_cuda
+        and v.is_cuda
+        and state.is_cuda
+        and A_log.is_cuda
+        and a.is_cuda
+        and dt_bias.is_cuda
+        and b.is_cuda
+        and cu_seqlens.is_cuda
+        and output.is_cuda
+        and new_state.is_cuda
+    ):
+        return False
+    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
+        return False
+    if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
+        return False
+    if A_log.dtype != torch.float32 or dt_bias.dtype != torch.float32:
+        return False
+    if cu_seqlens.dtype != torch.int64:
+        return False
+    if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous() and state.is_contiguous()):
+        return False
+    if not (a.is_contiguous() and b.is_contiguous() and cu_seqlens.is_contiguous()):
+        return False
+    if not (output.is_contiguous() and new_state.is_contiguous()):
+        return False
+    if q.shape[1:] != (4, 128) or k.shape[1:] != (4, 128) or v.shape[1:] != (8, 128):
+        return False
+    if a.shape != (q.shape[0], 8) or b.shape != (q.shape[0], 8):
+        return False
+    num_seqs = cu_seqlens.numel() - 1
+    if num_seqs <= 1:
+        return False
+    if state.shape != (num_seqs, 8, 128, 128) or new_state.shape != state.shape:
+        return False
+    return output.shape == (q.shape[0], 8, 128)
+
+
+def _get_sequential_kernel():
+    global _SEQUENTIAL_KERNEL
+    if _SEQUENTIAL_KERNEL is not None:
+        return _SEQUENTIAL_KERNEL
+    if _compile_and_load_nvrtc is None:
+        raise RuntimeError("NVRTC loader unavailable for sequential short path")
+    kernel_path = Path(__file__).parent / "nvrtc_kernels" / "sequential_kernel.cu"
+    functions = _compile_and_load_nvrtc(kernel_path.read_text(), ["gdn_prefill_sequential"])
+    _SEQUENTIAL_KERNEL = functions["gdn_prefill_sequential"]
+    return _SEQUENTIAL_KERNEL
+
+
+def _current_driver_stream():
+    global _CACHED_CUDA_STREAM
+    if _CACHED_CUDA_STREAM is None:
+        if _cuda_driver is None:
+            raise RuntimeError("CUDA driver unavailable")
+        _CACHED_CUDA_STREAM = _cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+    return _CACHED_CUDA_STREAM
+
+
+def _copy_cu_seqlens_to_host(cu_seqlens: torch.Tensor, num_seqs: int) -> tuple[int, ...]:
+    expected = num_seqs + 1
+    if expected > _CU_SEQLENS_HOST_CAPACITY:
+        return tuple(int(value) for value in cu_seqlens.detach().cpu().tolist())
+    if _cuda_driver is None:
+        return tuple(int(value) for value in cu_seqlens.detach().cpu().tolist())
+    _cuda_driver.cuMemcpyDtoH(_CU_SEQLENS_HOST_PTR, _data_ptr(cu_seqlens), expected * ctypes.sizeof(_c_longlong))
+    return tuple(int(_CU_SEQLENS_HOST[idx]) for idx in range(expected))
+
+
+def _build_hybrid_meta(lens_tuple: tuple[int, ...], cu_seqlens_host: tuple[int, ...], device: torch.device):
+    short_idx = [idx for idx, seq_len in enumerate(lens_tuple) if seq_len <= _HYBRID_SHORT_LEN]
+    long_idx = [idx for idx, seq_len in enumerate(lens_tuple) if seq_len > _HYBRID_SHORT_LEN]
+    if len(short_idx) < _HYBRID_MIN_SHORT or not long_idx:
+        return None
+
+    cu_long_host = [0]
+    for seq_idx in long_idx:
+        cu_long_host.append(cu_long_host[-1] + lens_tuple[seq_idx])
+    total_long = cu_long_host[-1]
+    max_seq_long = max(lens_tuple[seq_idx] for seq_idx in long_idx)
+
+    long_rows: list[int] = []
+    for seq_idx in long_idx:
+        long_rows.extend(range(cu_seqlens_host[seq_idx], cu_seqlens_host[seq_idx + 1]))
+
+    return _HybridMeta(
+        short_idx=torch.tensor(short_idx, dtype=torch.int32, device=device),
+        long_idx=torch.tensor(long_idx, dtype=torch.int64, device=device),
+        long_row_idx=torch.tensor(long_rows, dtype=torch.int64, device=device),
+        cu_seqlens_long=torch.tensor(cu_long_host, dtype=torch.int64, device=device),
+        total_long=total_long,
+        num_long=len(long_idx),
+        max_seq_long=max_seq_long,
+    )
+
+
+def _get_hybrid_long_output(total_long: int, output: torch.Tensor) -> torch.Tensor:
+    cache_key = (output.device, output.dtype, total_long, output.shape[1], output.shape[2])
+    cached = _HYBRID_LONG_OUTPUT_CACHE.get(cache_key)
+    if cached is None:
+        cached = torch.empty((total_long, output.shape[1], output.shape[2]), dtype=output.dtype, device=output.device)
+        _HYBRID_LONG_OUTPUT_CACHE[cache_key] = cached
+    return cached
+
+
+def _get_hybrid_long_state(num_long: int, new_state: torch.Tensor) -> torch.Tensor:
+    cache_key = (new_state.device, new_state.dtype, num_long, tuple(new_state.shape[1:]))
+    cached = _HYBRID_LONG_STATE_CACHE.get(cache_key)
+    if cached is None:
+        cached = torch.empty((num_long, *new_state.shape[1:]), dtype=new_state.dtype, device=new_state.device)
+        _HYBRID_LONG_STATE_CACHE[cache_key] = cached
+    return cached
+
+
+def _launch_sequential_kernel(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+    output: torch.Tensor,
+    new_state: torch.Tensor,
+    *,
+    num_seq_blocks: int,
+    seq_idx_map: torch.Tensor | None = None,
+) -> None:
+    args = _SEQUENTIAL_KERNEL_ARGS
+    args.p0.value = _data_ptr(q)
+    args.p1.value = _data_ptr(k)
+    args.p2.value = _data_ptr(v)
+    args.p3.value = _data_ptr(state)
+    args.p4.value = _data_ptr(A_log)
+    args.p5.value = _data_ptr(a)
+    args.p6.value = _data_ptr(dt_bias)
+    args.p7.value = _data_ptr(b)
+    args.p8.value = _data_ptr(cu_seqlens)
+    args.p9.value = scale
+    args.p10.value = _data_ptr(output)
+    args.p11.value = _data_ptr(new_state)
+    args.p12.value = num_seq_blocks
+    args.p13.value = 0 if seq_idx_map is None else _data_ptr(seq_idx_map)
+
+    _cuda_driver.cuLaunchKernel(
+        _get_sequential_kernel(),
+        num_seq_blocks * 128,
+        1,
+        1,
+        128,
+        1,
+        1,
+        0,
+        _current_driver_stream(),
+        args.arr,
+        0,
+    )
+
+
+def _try_run_sequential_short_path(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state: torch.Tensor | None,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    scale: float,
+    output: torch.Tensor,
+    new_state: torch.Tensor,
+) -> bool:
+    if not _is_sequential_short_candidate(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, output, new_state):
+        return False
+
+    assert state is not None and cu_seqlens is not None
+    _launch_sequential_kernel(
+        q,
+        k,
+        v,
+        state,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        cu_seqlens,
+        scale,
+        output,
+        new_state,
+        num_seq_blocks=cu_seqlens.numel() - 1,
+    )
+    return True
+
+
+def _try_run_hybrid_split_path(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state: torch.Tensor | None,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    scale: float,
+    output: torch.Tensor,
+    new_state: torch.Tensor,
+) -> bool:
+    if not _is_hybrid_candidate_inputs(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, output, new_state):
+        return False
+
+    assert state is not None and cu_seqlens is not None
+    num_seqs = cu_seqlens.numel() - 1
+    cu_seqlens_host = _copy_cu_seqlens_to_host(cu_seqlens, num_seqs)
+    lens_tuple = tuple(cu_seqlens_host[idx + 1] - cu_seqlens_host[idx] for idx in range(num_seqs))
+    cache_key = (q.device, q.shape[0], num_seqs, lens_tuple)
+    meta = _HYBRID_META_CACHE.get(cache_key, _HYBRID_NOT_CACHED)
+    if meta is _HYBRID_NOT_CACHED:
+        meta = _build_hybrid_meta(lens_tuple, cu_seqlens_host, q.device)
+        _HYBRID_META_CACHE[cache_key] = meta
+    if meta is None:
+        return False
+
+    _launch_sequential_kernel(
+        q,
+        k,
+        v,
+        state,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        cu_seqlens,
+        scale,
+        output,
+        new_state,
+        num_seq_blocks=meta.short_idx.shape[0],
+        seq_idx_map=meta.short_idx,
+    )
+
+    q_long = q.index_select(0, meta.long_row_idx)
+    k_long = k.index_select(0, meta.long_row_idx)
+    v_long = v.index_select(0, meta.long_row_idx)
+    a_long = a.index_select(0, meta.long_row_idx)
+    b_long = b.index_select(0, meta.long_row_idx)
+    state_long = state.index_select(0, meta.long_idx)
+    output_long = _get_hybrid_long_output(meta.total_long, output)
+    new_state_long = _get_hybrid_long_state(meta.num_long, new_state)
+
+    g_long, beta_long = _get_gate_beta(A_log, a_long, dt_bias, b_long)
+    _run_compiled_gdn_segment(
+        q_long,
+        k_long,
+        v_long,
+        g_long,
+        beta_long,
+        state_long,
+        meta.cu_seqlens_long,
+        scale,
+        output_long,
+        new_state_long,
+        varlen=True,
+        chunk_size=_DEFAULT_KERNEL_CHUNK_SIZE,
+    )
+
+    output.index_copy_(0, meta.long_row_idx, output_long)
+    new_state.index_copy_(0, meta.long_idx, new_state_long)
+    return True
+
+
 def _get_compiled_runner(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -733,10 +1189,19 @@ def _run_single_chunk(
     output: torch.Tensor,
     new_state: torch.Tensor,
 ) -> None:
+    scale_value = _normalize_scale(scale, q.shape[-1])
+    if _hybrid_split_enabled() and _try_run_hybrid_split_path(
+        q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale_value, output, new_state
+    ):
+        return
+    if q.dim() == 3 and q.shape[0] <= _SEQUENTIAL_SHORT_THRESHOLD and _try_run_sequential_short_path(
+        q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale_value, output, new_state
+    ):
+        return
+
     with _phase_scope("msinfer_entry.prepare_gate_beta"):
         g, beta = _get_gate_beta(A_log, a, dt_bias, b)
 
-    scale_value = _normalize_scale(scale, q.shape[-1])
     varlen = cu_seqlens is not None and q.dim() == 3
 
     q_runtime = q.unsqueeze(0) if varlen else q

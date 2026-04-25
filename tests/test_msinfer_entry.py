@@ -583,6 +583,98 @@ class CompositeScheduleExecutionTests(unittest.TestCase):
         self.assertTrue(torch.equal(new_state, torch.full_like(new_state, 2.0)))
 
 
+class Round4PortDispatchTests(unittest.TestCase):
+    def test_hybrid_split_is_opt_in_with_disable_escape_hatch(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(msinfer_entry._hybrid_split_enabled())
+
+        with mock.patch.dict(os.environ, {msinfer_entry._HYBRID_ENABLE_ENV: "1"}, clear=True):
+            self.assertTrue(msinfer_entry._hybrid_split_enabled())
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                msinfer_entry._HYBRID_ENABLE_ENV: "1",
+                msinfer_entry._HYBRID_DISABLE_ENV: "1",
+            },
+            clear=True,
+        ):
+            self.assertFalse(msinfer_entry._hybrid_split_enabled())
+
+    def test_short_sequential_launcher_passes_identity_seq_map(self):
+        q = torch.empty((1, 1), dtype=torch.float32)
+        k = torch.empty_like(q)
+        v = torch.empty_like(q)
+        state = torch.empty((2, 1), dtype=torch.float32)
+        A_log = torch.empty((1,), dtype=torch.float32)
+        a = torch.empty_like(q)
+        dt_bias = torch.empty((1,), dtype=torch.float32)
+        b = torch.empty_like(q)
+        cu_seqlens = torch.tensor([0, 1, 2], dtype=torch.int64)
+        output = torch.empty_like(q)
+        new_state = torch.empty_like(state)
+        fake_driver = mock.Mock()
+
+        with mock.patch.object(msinfer_entry, "_is_sequential_short_candidate", return_value=True):
+            with mock.patch.object(msinfer_entry, "_get_sequential_kernel", return_value="kernel"):
+                with mock.patch.object(msinfer_entry, "_current_driver_stream", return_value="stream"):
+                    with mock.patch.object(msinfer_entry, "_cuda_driver", fake_driver):
+                        self.assertTrue(
+                            msinfer_entry._try_run_sequential_short_path(
+                                q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, 0.125, output, new_state
+                            )
+                        )
+
+        launch_args = fake_driver.cuLaunchKernel.call_args.args
+        self.assertEqual(launch_args[:8], ("kernel", 256, 1, 1, 128, 1, 1, 0))
+        self.assertEqual(launch_args[8], "stream")
+        self.assertEqual(msinfer_entry._SEQUENTIAL_KERNEL_ARGS.p12.value, 2)
+        self.assertEqual(msinfer_entry._SEQUENTIAL_KERNEL_ARGS.p13.value, 0)
+
+    def test_hybrid_split_routes_short_map_and_scatters_long_outputs(self):
+        total = 5128
+        q = torch.zeros((total, 4, 128), dtype=torch.bfloat16)
+        k = torch.zeros_like(q)
+        v = torch.zeros((total, 8, 128), dtype=torch.bfloat16)
+        state = torch.zeros((5, 8, 128, 128), dtype=torch.float32)
+        A_log = torch.zeros((8,), dtype=torch.float32)
+        a = torch.zeros((total, 8), dtype=torch.bfloat16)
+        dt_bias = torch.zeros((8,), dtype=torch.float32)
+        b = torch.zeros((total, 8), dtype=torch.bfloat16)
+        cu_seqlens = torch.tensor([0, 64, 5064, 5096, 5112, 5128], dtype=torch.int64)
+        output = torch.zeros_like(v)
+        new_state = torch.zeros_like(state)
+        fake_driver = mock.Mock()
+
+        def fake_compiled_segment(*args, **kwargs):
+            output_long = args[8]
+            new_state_long = args[9]
+            output_long.fill_(7)
+            new_state_long.fill_(3)
+
+        msinfer_entry._HYBRID_META_CACHE.clear()
+        msinfer_entry._HYBRID_LONG_OUTPUT_CACHE.clear()
+        msinfer_entry._HYBRID_LONG_STATE_CACHE.clear()
+        with mock.patch.object(msinfer_entry, "_is_hybrid_candidate_inputs", return_value=True):
+            with mock.patch.object(msinfer_entry, "_get_sequential_kernel", return_value="kernel"):
+                with mock.patch.object(msinfer_entry, "_current_driver_stream", return_value="stream"):
+                    with mock.patch.object(msinfer_entry, "_cuda_driver", fake_driver):
+                        with mock.patch.object(msinfer_entry, "_copy_cu_seqlens_to_host", return_value=tuple(cu_seqlens.tolist())):
+                            with mock.patch.object(msinfer_entry, "_run_compiled_gdn_segment", side_effect=fake_compiled_segment):
+                                self.assertTrue(
+                                    msinfer_entry._try_run_hybrid_split_path(
+                                        q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, 0.125, output, new_state
+                                    )
+                                )
+
+        launch_args = fake_driver.cuLaunchKernel.call_args.args
+        self.assertEqual(launch_args[:8], ("kernel", 512, 1, 1, 128, 1, 1, 0))
+        self.assertEqual(msinfer_entry._SEQUENTIAL_KERNEL_ARGS.p12.value, 4)
+        self.assertNotEqual(msinfer_entry._SEQUENTIAL_KERNEL_ARGS.p13.value, 0)
+        self.assertTrue(torch.equal(output[64:5064], torch.full_like(output[64:5064], 7)))
+        self.assertTrue(torch.equal(new_state[1], torch.full_like(new_state[1], 3)))
+
+
 class TracingFlagTests(unittest.TestCase):
     def test_tracing_env_defaults_off(self):
         with mock.patch.dict(os.environ, {}, clear=True):
