@@ -584,8 +584,29 @@ class CompositeScheduleExecutionTests(unittest.TestCase):
 
 
 class Round4PortDispatchTests(unittest.TestCase):
-    def test_short_sequential_threshold_is_ncu_first_boundary(self):
-        self.assertEqual(msinfer_entry._SEQUENTIAL_SHORT_THRESHOLD, 48)
+    def test_short_sequential_selector_targets_average_latency_lanes(self):
+        self.assertEqual(msinfer_entry._SEQUENTIAL_SHORT_THRESHOLD, 256)
+
+        self.assertTrue(
+            msinfer_entry._should_try_sequential_fast_path(
+                torch.empty((192, 4, 128)), torch.tensor([0, 192], dtype=torch.int64)
+            )
+        )
+        self.assertTrue(
+            msinfer_entry._should_try_sequential_fast_path(
+                torch.empty((202, 4, 128)), torch.tensor([0, 64, 128, 202], dtype=torch.int64)
+            )
+        )
+        self.assertTrue(
+            msinfer_entry._should_try_sequential_fast_path(
+                torch.empty((248, 4, 128)), torch.tensor([0, 120, 248], dtype=torch.int64)
+            )
+        )
+        self.assertFalse(
+            msinfer_entry._should_try_sequential_fast_path(
+                torch.empty((294, 4, 128)), torch.tensor([0, 64, 128, 294], dtype=torch.int64)
+            )
+        )
 
     def test_hybrid_split_is_opt_in_with_disable_escape_hatch(self):
         with mock.patch.dict(os.environ, {}, clear=True):

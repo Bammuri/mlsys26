@@ -49,7 +49,7 @@ _DEFAULT_PERSISTENT_POLICY = "never"
 _DEFAULT_PERSISTENT_AUTO_MAX_BATCH = 2
 _DEFAULT_PERSISTENT_AUTO_MAX_SEQ_LEN = 128
 _DEFAULT_KERNEL_CHUNK_SIZE = 128
-_SEQUENTIAL_SHORT_THRESHOLD = 48
+_SEQUENTIAL_SHORT_THRESHOLD = 256
 _SEQUENTIAL_SHORT_DISABLE_ENV = "MSINFER_GDN_DISABLE_SEQUENTIAL_SHORT"
 _HYBRID_ENABLE_ENV = "MSINFER_GDN_ENABLE_HYBRID_SPLIT"
 _HYBRID_DISABLE_ENV = "MSINFER_GDN_DISABLE_HYBRID_SPLIT"
@@ -611,6 +611,21 @@ def _resolve_persistent_mode(problem_size: tuple[int, int, int, int, int, int], 
     )
 
 
+def _should_try_sequential_fast_path(q: torch.Tensor, cu_seqlens: torch.Tensor | None) -> bool:
+    """Shape-only gate for the NVRTC sequential prefill fast path.
+
+    Workload-level evidence points to the short/underfilled regime as the
+    arithmetic-mean latency lever: the sequential kernel may spend more NCU
+    ``Duration = Elapsed Cycles / SM Frequency`` than the main CUTLASS body
+    on some shapes, but it removes gate/beta preparation and launch residual
+    cost.  Keep the gate shape-only to avoid a host sync while limiting the
+    residual-cost trade to the <=256-token lane verified by quick100 sweeps.
+    """
+    if q.dim() != 3 or cu_seqlens is None:
+        return False
+    return int(q.shape[0]) <= _SEQUENTIAL_SHORT_THRESHOLD
+
+
 def _is_sequential_short_candidate(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -646,7 +661,7 @@ def _is_sequential_short_candidate(
         and new_state.is_cuda
     ):
         return False
-    if q.shape[0] > _SEQUENTIAL_SHORT_THRESHOLD:
+    if not _should_try_sequential_fast_path(q, cu_seqlens):
         return False
     if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
         return False
@@ -1194,7 +1209,7 @@ def _run_single_chunk(
         q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale_value, output, new_state
     ):
         return
-    if q.dim() == 3 and q.shape[0] <= _SEQUENTIAL_SHORT_THRESHOLD and _try_run_sequential_short_path(
+    if _should_try_sequential_fast_path(q, cu_seqlens) and _try_run_sequential_short_path(
         q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale_value, output, new_state
     ):
         return
