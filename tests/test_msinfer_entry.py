@@ -584,6 +584,9 @@ class CompositeScheduleExecutionTests(unittest.TestCase):
 
 
 class Round4PortDispatchTests(unittest.TestCase):
+    def test_short_sequential_threshold_is_ncu_first_boundary(self):
+        self.assertEqual(msinfer_entry._SEQUENTIAL_SHORT_THRESHOLD, 48)
+
     def test_hybrid_split_is_opt_in_with_disable_escape_hatch(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertFalse(msinfer_entry._hybrid_split_enabled())
