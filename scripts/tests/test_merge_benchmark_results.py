@@ -34,6 +34,30 @@ class MergeBenchmarkResultsTest(unittest.TestCase):
         self.assertEqual(merged['results']['demo']['u1']['latency_ms'], 1.0)
         self.assertEqual(merged['results']['demo']['u2']['latency_ms'], 2.0)
 
+    def test_cli_embeds_solution_provenance_when_solution_json_is_given(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            shard0 = base / 'shard0.json'
+            output = base / 'merged.json'
+            solution_json = base / 'solution.json'
+            save_results_json(shard0, {'demo': {'u1': {'status': 'PASSED', 'latency_ms': 1.0}}}, source='test')
+            solution_json.write_text(json.dumps({
+                'name': 'flashinfer_wrapper_123ca6',
+                'definition': 'gdn_prefill_qk4_v8_d128_k_last',
+                'author': 'flashinfer',
+                'spec': {
+                    'entry_point': 'main.py::run',
+                    'destination_passing_style': False,
+                },
+            }))
+            main([str(shard0), '--output-json', str(output), '--solution-json', str(solution_json)])
+            merged = json.loads(output.read_text())
+        provenance = merged['metadata']['solution_provenance']
+        self.assertEqual(provenance['solution_name'], 'flashinfer_wrapper_123ca6')
+        self.assertEqual(provenance['solution_author'], 'flashinfer')
+        self.assertEqual(provenance['entry_point'], 'main.py::run')
+        self.assertFalse(provenance['destination_passing_style'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -22,6 +22,7 @@ TRACE_VOLUME_NAME = "mlsys26-contest"
 TRACE_SET_PATH = "/data/data/mlsys26-contest"
 BASE_PATH = "/opt/nvidia/nsight-compute:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 DEFAULT_KERNEL_PATTERN = "regex:kernel_cutlass_kernel_fib_python_gdn_prefill_v1.*"
+DEFAULT_BASELINE_KERNEL_PATTERN = "regex:kernel_cutlass_kernel_fib.*"
 DEFAULT_SECTIONS = (
     "SpeedOfLight",
     "SchedulerStats",
@@ -33,6 +34,9 @@ DEFAULT_SECTIONS = (
 PERSISTENT_POLICY_ENV = "MSINFER_GDN_PERSISTENT_POLICY"
 PERSISTENT_AUTO_MAX_BATCH_ENV = "MSINFER_PERSISTENT_AUTO_MAX_BATCH"
 PERSISTENT_AUTO_MAX_SEQ_LEN_ENV = "MSINFER_PERSISTENT_AUTO_MAX_SEQ_LEN"
+ADAPTIVE_SELECTOR_KEYS_ENV = "MSINFER_GDN_ADAPTIVE_SELECTOR_KEYS"
+PACKED_SUBMIT_SOLUTION_SOURCE = "packed-submit"
+TRACE_SET_BASELINE_SOLUTION_SOURCE = "trace-set-baseline"
 
 app = modal.App("flashinfer-prefill-ncu")
 trace_volume = modal.Volume.from_name(TRACE_VOLUME_NAME, create_if_missing=True)
@@ -54,6 +58,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Capture targeted NCU reports for prefill workloads on Modal B200")
     parser.add_argument("--trace-set-path", type=Path, default=None)
     parser.add_argument("--definition", default="gdn_prefill_qk4_v8_d128_k_last")
+    parser.add_argument(
+        "--solution-source",
+        choices=(PACKED_SUBMIT_SOLUTION_SOURCE, TRACE_SET_BASELINE_SOLUTION_SOURCE),
+        default=PACKED_SUBMIT_SOLUTION_SOURCE,
+        help="Select whether to capture NCU for the local packed submit solution or the TraceSet baseline solution.",
+    )
+    parser.add_argument(
+        "--baseline-solution-index",
+        type=int,
+        default=0,
+        help="Index into TraceSet solutions[definition] when --solution-source=trace-set-baseline.",
+    )
     parser.add_argument("--workload-uuids", default="", help="Comma-separated workload UUIDs (empty means all)")
     parser.add_argument(
         "--representative-groups-json",
@@ -63,7 +79,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--limit", type=int, default=0, help="Optional cap after workload selection (0 means all)")
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--kernel-pattern", default=DEFAULT_KERNEL_PATTERN)
+    parser.add_argument(
+        "--kernel-pattern",
+        default="",
+        help="Optional kernel regex override. Empty selects a source-aware default.",
+    )
     parser.add_argument("--launch-skip", type=int, default=1)
     parser.add_argument("--launch-count", type=int, default=1)
     parser.add_argument("--sections-csv", default=",".join(DEFAULT_SECTIONS))
@@ -74,6 +94,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--persistent-policy", default="", help="Optional MSINFER_GDN_PERSISTENT_POLICY override")
     parser.add_argument("--persistent-auto-max-batch", type=int, default=0)
     parser.add_argument("--persistent-auto-max-seq-len", type=int, default=0)
+    parser.add_argument(
+        "--adaptive-selector-keys",
+        default="",
+        help="Optional MSINFER_GDN_ADAPTIVE_SELECTOR_KEYS override (comma-separated selector keys)",
+    )
     return parser.parse_args(argv)
 
 
@@ -81,12 +106,98 @@ def _chunked(values: list[str], size: int) -> list[list[str]]:
     return [values[idx : idx + size] for idx in range(0, len(values), size)]
 
 
-def _load_solution_payload() -> dict[str, Any]:
+def _trace_set_candidates(trace_set_path: Path | None) -> list[Path]:
+    candidates: list[Path] = []
+    if trace_set_path is not None:
+        candidates.append(trace_set_path)
+    else:
+        candidates.append(Path(TRACE_SET_PATH))
+    local_fallback = Path("/home/hyu/flashinfer/mlsys26-contest")
+    if local_fallback not in candidates:
+        candidates.append(local_fallback)
+    return [candidate for candidate in candidates if candidate.exists()]
+
+
+def _resolve_trace_set_root(trace_set_path: Path | None, *, definition: str) -> Path:
+    first_existing: Path | None = None
+    for candidate in _trace_set_candidates(trace_set_path):
+        if first_existing is None:
+            first_existing = candidate
+        trace_set = TraceSet.from_path(str(candidate))
+        if definition in trace_set.workloads or definition in trace_set.solutions:
+            return candidate
+    if first_existing is not None:
+        return first_existing
+    raise FileNotFoundError("No trace-set path exists for workload resolution")
+
+
+def _resolve_kernel_pattern(solution_source: str, kernel_pattern: str) -> str:
+    if kernel_pattern:
+        return kernel_pattern
+    if solution_source == TRACE_SET_BASELINE_SOLUTION_SOURCE:
+        return DEFAULT_BASELINE_KERNEL_PATTERN
+    return DEFAULT_KERNEL_PATTERN
+
+
+def _solution_provenance_payload(
+    solution: Solution,
+    *,
+    solution_source: str,
+    trace_set_path: Path | None,
+    baseline_solution_index: int,
+) -> dict[str, Any]:
+    return {
+        "solution_source": solution_source,
+        "solution_name": solution.name,
+        "solution_author": solution.author,
+        "entry_point": solution.spec.entry_point,
+        "destination_passing_style": solution.spec.destination_passing_style,
+        "trace_set_path": str(trace_set_path) if trace_set_path is not None else None,
+        "baseline_solution_index": baseline_solution_index
+        if solution_source == TRACE_SET_BASELINE_SOLUTION_SOURCE
+        else None,
+    }
+
+
+def _load_solution_payload(
+    *,
+    definition: str,
+    solution_source: str,
+    trace_set_path: Path | None,
+    baseline_solution_index: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     from scripts.pack_solution import pack_solution
 
-    solution_path = pack_solution(PROJECT_ROOT / "solution.json")
-    solution = Solution.model_validate_json(solution_path.read_text())
-    return solution.model_dump(mode="json")
+    if solution_source == PACKED_SUBMIT_SOLUTION_SOURCE:
+        solution_path = pack_solution(PROJECT_ROOT / "solution.json")
+        solution = Solution.model_validate_json(solution_path.read_text())
+        provenance = _solution_provenance_payload(
+            solution,
+            solution_source=solution_source,
+            trace_set_path=None,
+            baseline_solution_index=baseline_solution_index,
+        )
+        provenance["packed_solution_json"] = str(solution_path)
+        return solution.model_dump(mode="json"), provenance
+
+    if solution_source == TRACE_SET_BASELINE_SOLUTION_SOURCE:
+        resolved_path = _resolve_trace_set_root(trace_set_path, definition=definition)
+        trace_set = TraceSet.from_path(str(resolved_path))
+        solutions = trace_set.solutions.get(definition, [])
+        if baseline_solution_index < 0 or baseline_solution_index >= len(solutions):
+            raise ValueError(
+                f"baseline solution index {baseline_solution_index} out of range for definition "
+                f"{definition!r} (available={len(solutions)})"
+            )
+        solution = solutions[baseline_solution_index]
+        return solution.model_dump(mode="json"), _solution_provenance_payload(
+            solution,
+            solution_source=solution_source,
+            trace_set_path=resolved_path,
+            baseline_solution_index=baseline_solution_index,
+        )
+
+    raise ValueError(f"Unsupported solution_source: {solution_source}")
 
 
 def _build_runtime_env(args: argparse.Namespace) -> dict[str, str]:
@@ -97,6 +208,8 @@ def _build_runtime_env(args: argparse.Namespace) -> dict[str, str]:
         runtime_env[PERSISTENT_AUTO_MAX_BATCH_ENV] = str(args.persistent_auto_max_batch)
     if args.persistent_auto_max_seq_len > 0:
         runtime_env[PERSISTENT_AUTO_MAX_SEQ_LEN_ENV] = str(args.persistent_auto_max_seq_len)
+    if args.adaptive_selector_keys:
+        runtime_env[ADAPTIVE_SELECTOR_KEYS_ENV] = args.adaptive_selector_keys
     return runtime_env
 
 
@@ -119,9 +232,7 @@ def _temporary_env(overrides: dict[str, str]):
 
 
 def _resolve_workload_uuids(definition: str, trace_set_path: Path | None, explicit_uuids: list[str], limit: int) -> list[str]:
-    resolved_path = trace_set_path or Path(TRACE_SET_PATH)
-    if not resolved_path.exists():
-        resolved_path = Path("/home/hyu/flashinfer/mlsys26-contest")
+    resolved_path = _resolve_trace_set_root(trace_set_path, definition=definition)
     trace_set = TraceSet.from_path(str(resolved_path))
     workloads = [trace.workload.uuid for trace in trace_set.workloads.get(definition, [])]
     if explicit_uuids:
@@ -320,7 +431,13 @@ def main(argv: list[str] | None = None) -> int:
     if not workload_uuids:
         raise SystemExit("No workloads selected")
 
-    solution_payload = _load_solution_payload()
+    kernel_pattern = _resolve_kernel_pattern(args.solution_source, args.kernel_pattern)
+    solution_payload, solution_provenance = _load_solution_payload(
+        definition=args.definition,
+        solution_source=args.solution_source,
+        trace_set_path=args.trace_set_path,
+        baseline_solution_index=args.baseline_solution_index,
+    )
     runtime_env = _build_runtime_env(args)
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -341,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
                 solution_payload,
                 args.definition,
                 uuid,
-                args.kernel_pattern,
+                kernel_pattern,
                 sections,
                 args.launch_skip,
                 args.launch_count,
@@ -355,13 +472,14 @@ def main(argv: list[str] | None = None) -> int:
     manifest_payload = {
         "metadata": {
             "definition": args.definition,
-            "kernel_pattern": args.kernel_pattern,
+            "kernel_pattern": kernel_pattern,
             "label": args.label,
             "sections": sections,
             "launch_skip": args.launch_skip,
             "launch_count": args.launch_count,
             "runtime_env": runtime_env,
             "workload_count": len(workload_uuids),
+            "solution": solution_provenance,
         },
         "reports": manifest_rows,
     }
@@ -374,11 +492,13 @@ def main(argv: list[str] | None = None) -> int:
 def modal_main(
     trace_set_path: str = "",
     definition: str = "gdn_prefill_qk4_v8_d128_k_last",
+    solution_source: str = PACKED_SUBMIT_SOLUTION_SOURCE,
+    baseline_solution_index: int = 0,
     workload_uuids: str = "",
     representative_groups_json: str = "",
     limit: int = 0,
     batch_size: int = 8,
-    kernel_pattern: str = DEFAULT_KERNEL_PATTERN,
+    kernel_pattern: str = "",
     launch_skip: int = 1,
     launch_count: int = 1,
     sections_csv: str = ",".join(DEFAULT_SECTIONS),
@@ -389,18 +509,21 @@ def modal_main(
     persistent_policy: str = "",
     persistent_auto_max_batch: int = 0,
     persistent_auto_max_seq_len: int = 0,
+    adaptive_selector_keys: str = "",
 ):
     argv = [
         "--definition",
         definition,
+        "--solution-source",
+        solution_source,
+        "--baseline-solution-index",
+        str(baseline_solution_index),
         "--workload-uuids",
         workload_uuids,
         "--limit",
         str(limit),
         "--batch-size",
         str(batch_size),
-        "--kernel-pattern",
-        kernel_pattern,
         "--launch-skip",
         str(launch_skip),
         "--launch-count",
@@ -414,6 +537,8 @@ def modal_main(
         "--label",
         label,
     ]
+    if kernel_pattern:
+        argv.extend(["--kernel-pattern", kernel_pattern])
     if trace_set_path:
         argv.extend(["--trace-set-path", trace_set_path])
     if representative_groups_json:
@@ -426,6 +551,8 @@ def modal_main(
         argv.extend(["--persistent-auto-max-batch", str(persistent_auto_max_batch)])
     if persistent_auto_max_seq_len > 0:
         argv.extend(["--persistent-auto-max-seq-len", str(persistent_auto_max_seq_len)])
+    if adaptive_selector_keys:
+        argv.extend(["--adaptive-selector-keys", adaptive_selector_keys])
 
     raise SystemExit(main(argv))
 

@@ -6,13 +6,20 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.run_modal_ncu_prefill import (
+    ADAPTIVE_SELECTOR_KEYS_ENV,
+    DEFAULT_BASELINE_KERNEL_PATTERN,
+    DEFAULT_KERNEL_PATTERN,
+    PACKED_SUBMIT_SOLUTION_SOURCE,
     PERSISTENT_POLICY_ENV,
+    TRACE_SET_BASELINE_SOLUTION_SOURCE,
     _build_runtime_env,
     _capture_single_workload,
     _chunked,
     _collect_workload_results,
+    _load_solution_payload,
     _load_representative_uuids,
     _manifest_row,
+    _resolve_kernel_pattern,
     _resolve_workload_uuids,
 )
 
@@ -157,9 +164,69 @@ class ModalNcuPrefillHelpersTest(unittest.TestCase):
             persistent_policy="adaptive",
             persistent_auto_max_batch=0,
             persistent_auto_max_seq_len=0,
+            adaptive_selector_keys="",
         )
 
         self.assertEqual(_build_runtime_env(args), {PERSISTENT_POLICY_ENV: "adaptive"})
+
+    def test_build_runtime_env_records_adaptive_selector_keys(self) -> None:
+        args = mock.Mock(
+            persistent_policy="adaptive",
+            persistent_auto_max_batch=0,
+            persistent_auto_max_seq_len=0,
+            adaptive_selector_keys="key-a,key-b",
+        )
+
+        self.assertEqual(
+            _build_runtime_env(args),
+            {
+                PERSISTENT_POLICY_ENV: "adaptive",
+                ADAPTIVE_SELECTOR_KEYS_ENV: "key-a,key-b",
+            },
+        )
+
+    def test_resolve_kernel_pattern_uses_source_aware_defaults(self) -> None:
+        self.assertEqual(
+            _resolve_kernel_pattern(PACKED_SUBMIT_SOLUTION_SOURCE, ""),
+            DEFAULT_KERNEL_PATTERN,
+        )
+        self.assertEqual(
+            _resolve_kernel_pattern(TRACE_SET_BASELINE_SOLUTION_SOURCE, ""),
+            DEFAULT_BASELINE_KERNEL_PATTERN,
+        )
+        self.assertEqual(
+            _resolve_kernel_pattern(TRACE_SET_BASELINE_SOLUTION_SOURCE, "regex:custom.*"),
+            "regex:custom.*",
+        )
+
+    def test_load_solution_payload_uses_trace_set_baseline_solution(self) -> None:
+        fake_solution = mock.Mock()
+        fake_solution.name = "flashinfer_wrapper_123ca6"
+        fake_solution.author = "flashinfer"
+        fake_solution.spec = mock.Mock(entry_point="main.py::run", destination_passing_style=False)
+        fake_solution.model_dump.return_value = {"name": "flashinfer_wrapper_123ca6"}
+
+        fake_trace = mock.Mock()
+        fake_trace.workloads = {}
+        fake_trace.solutions = {"demo": [fake_solution]}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_set_path = Path(tmpdir)
+            with mock.patch("scripts.run_modal_ncu_prefill.TraceSet.from_path", return_value=fake_trace):
+                payload, provenance = _load_solution_payload(
+                    definition="demo",
+                    solution_source=TRACE_SET_BASELINE_SOLUTION_SOURCE,
+                    trace_set_path=trace_set_path,
+                    baseline_solution_index=0,
+                )
+
+        self.assertEqual(payload, {"name": "flashinfer_wrapper_123ca6"})
+        self.assertEqual(provenance["solution_source"], TRACE_SET_BASELINE_SOLUTION_SOURCE)
+        self.assertEqual(provenance["solution_name"], "flashinfer_wrapper_123ca6")
+        self.assertEqual(provenance["solution_author"], "flashinfer")
+        self.assertEqual(provenance["entry_point"], "main.py::run")
+        self.assertFalse(provenance["destination_passing_style"])
+        self.assertEqual(provenance["baseline_solution_index"], 0)
 
     def test_collect_workload_results_localizes_call_failures(self) -> None:
         class _Call:

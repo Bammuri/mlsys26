@@ -18,6 +18,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("inputs", nargs="+", type=Path)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--source", default="scripts/merge_benchmark_results.py")
+    parser.add_argument("--solution-json", type=Path, default=None)
     return parser.parse_args(argv)
 
 
@@ -47,15 +48,34 @@ def merge_results_payloads(input_paths: list[Path]) -> dict[str, Any]:
     }
 
 
+def load_solution_provenance(solution_json: Path | None) -> dict[str, Any] | None:
+    if solution_json is None:
+        return None
+    payload = json.loads(solution_json.read_text(encoding="utf-8"))
+    spec = payload.get("spec", {}) if isinstance(payload, dict) else {}
+    return {
+        "solution_json": str(solution_json),
+        "solution_name": payload.get("name"),
+        "solution_definition": payload.get("definition"),
+        "solution_author": payload.get("author"),
+        "entry_point": spec.get("entry_point") if isinstance(spec, dict) else None,
+        "destination_passing_style": spec.get("destination_passing_style") if isinstance(spec, dict) else None,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     payload = merge_results_payloads(args.inputs)
+    extra_metadata = {"inputs": payload["metadata"]["inputs"]}
+    solution_provenance = load_solution_provenance(args.solution_json)
+    if solution_provenance is not None:
+        extra_metadata["solution_provenance"] = solution_provenance
     save_results_json(
         args.output_json,
         payload["results"],
         source=args.source,
         trace_set_path=payload["metadata"].get("trace_set_path"),
-        extra_metadata={"inputs": payload["metadata"]["inputs"]},
+        extra_metadata=extra_metadata,
     )
     print(json.dumps({"output_json": str(args.output_json), "inputs": payload["metadata"]["inputs"]}, indent=2))
     return 0

@@ -18,6 +18,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run GDN prefill benchmark in workload shards via scripts/run_modal.py")
     parser.add_argument("--definition", default="gdn_prefill_qk4_v8_d128_k_last")
     parser.add_argument("--trace-set-path", type=Path, default=Path("/home/hyu/flashinfer/mlsys26-contest"))
+    parser.add_argument("--solution-path", type=Path, default=None)
     parser.add_argument("--shard-size", type=int, default=20)
     parser.add_argument("--output-dir", type=Path, default=Path(".omx/results/prefill-shards"))
     parser.add_argument("--merge-output", type=Path, default=Path(".omx/results/modal-official-full-100.json"))
@@ -35,7 +36,7 @@ def build_shards(workload_uuids: list[str], shard_size: int) -> list[list[str]]:
     return [workload_uuids[i : i + shard_size] for i in range(0, len(workload_uuids), shard_size)]
 
 
-def run_shard(*, shard_index: int, shard: list[str], output_path: Path) -> None:
+def run_shard(*, shard_index: int, shard: list[str], output_path: Path, solution_path: Path | None = None) -> None:
     cmd = [
         "modal",
         "run",
@@ -46,10 +47,12 @@ def run_shard(*, shard_index: int, shard: list[str], output_path: Path) -> None:
         "--save-json",
         str(output_path),
     ]
+    if solution_path is not None:
+        cmd.extend(["--solution-path", str(solution_path)])
     subprocess.run(cmd, check=True)
 
 
-def merge_shards(shard_paths: list[Path], merge_output: Path) -> None:
+def merge_shards(shard_paths: list[Path], merge_output: Path, solution_path: Path | None = None) -> None:
     cmd = [
         sys.executable,
         "scripts/merge_benchmark_results.py",
@@ -57,6 +60,8 @@ def merge_shards(shard_paths: list[Path], merge_output: Path) -> None:
         "--output-json",
         str(merge_output),
     ]
+    if solution_path is not None:
+        cmd.extend(["--solution-json", str(solution_path)])
     subprocess.run(cmd, check=True)
 
 
@@ -78,11 +83,16 @@ def main(argv: list[str] | None = None) -> int:
     shard_paths: list[Path] = []
     for offset, shard in enumerate(shards, start=shard_offset):
         output_path = args.output_dir / f"modal-official-shard-{offset}.json"
-        run_shard(shard_index=offset, shard=shard, output_path=output_path)
+        run_shard(
+            shard_index=offset,
+            shard=shard,
+            output_path=output_path,
+            solution_path=args.solution_path,
+        )
         shard_paths.append(output_path)
 
     if shard_paths:
-        merge_shards(shard_paths, args.merge_output)
+        merge_shards(shard_paths, args.merge_output, solution_path=args.solution_path)
     print(json.dumps({"shard_count": len(shard_paths), "merge_output": str(args.merge_output)}, indent=2))
     return 0
 

@@ -145,6 +145,11 @@ image = (
 PERSISTENT_POLICY_ENV = "MSINFER_GDN_PERSISTENT_POLICY"
 PERSISTENT_AUTO_MAX_BATCH_ENV = "MSINFER_PERSISTENT_AUTO_MAX_BATCH"
 PERSISTENT_AUTO_MAX_SEQ_LEN_ENV = "MSINFER_PERSISTENT_AUTO_MAX_SEQ_LEN"
+ADAPTIVE_SELECTOR_KEYS_ENV = "MSINFER_GDN_ADAPTIVE_SELECTOR_KEYS"
+EXPERIMENTAL_BLOCK_POLICY_ENV = "MSINFER_GDN_ENABLE_EXPERIMENTAL_BLOCK_POLICY"
+BLOCK_SHAPE_TUNING_ENV = "MSINFER_GDN_ENABLE_BLOCK_SHAPE_TUNING"
+COMPOSITE_REFERENCE_HARNESS_ENV = "MSINFER_GDN_ENABLE_COMPOSITE_REFERENCE_HARNESS"
+COMPOSITE_COMPILED_HARNESS_ENV = "MSINFER_GDN_ENABLE_COMPOSITE_COMPILED_HARNESS"
 TRACE_PHASES_ENV = "MSINFER_GDN_PROFILE_PHASES"
 
 
@@ -174,6 +179,11 @@ def build_runtime_env(
     persistent_policy: str = "",
     persistent_auto_max_batch: int = 0,
     persistent_auto_max_seq_len: int = 0,
+    adaptive_selector_keys: str = "",
+    experimental_block_policy: bool = False,
+    block_shape_tuning: bool = False,
+    composite_reference_harness: bool = False,
+    composite_compiled_harness: bool = False,
     wrapper_phases: bool = False,
 ) -> dict[str, str]:
     """Build runtime env overrides for the remote benchmark process."""
@@ -184,6 +194,16 @@ def build_runtime_env(
         runtime_env[PERSISTENT_AUTO_MAX_BATCH_ENV] = str(persistent_auto_max_batch)
     if persistent_auto_max_seq_len > 0:
         runtime_env[PERSISTENT_AUTO_MAX_SEQ_LEN_ENV] = str(persistent_auto_max_seq_len)
+    if adaptive_selector_keys:
+        runtime_env[ADAPTIVE_SELECTOR_KEYS_ENV] = adaptive_selector_keys
+    if experimental_block_policy:
+        runtime_env[EXPERIMENTAL_BLOCK_POLICY_ENV] = "1"
+    if block_shape_tuning:
+        runtime_env[BLOCK_SHAPE_TUNING_ENV] = "1"
+    if composite_reference_harness:
+        runtime_env[COMPOSITE_REFERENCE_HARNESS_ENV] = "1"
+    if composite_compiled_harness:
+        runtime_env[COMPOSITE_COMPILED_HARNESS_ENV] = "1"
     if wrapper_phases:
         runtime_env[TRACE_PHASES_ENV] = "1"
     return runtime_env
@@ -369,6 +389,11 @@ def main(
     persistent_policy: str = "",
     persistent_auto_max_batch: int = 0,
     persistent_auto_max_seq_len: int = 0,
+    adaptive_selector_keys: str = "",
+    experimental_block_policy: bool = False,
+    block_shape_tuning: bool = False,
+    composite_reference_harness: bool = False,
+    composite_compiled_harness: bool = False,
     wrapper_phases: bool = False,
     quick: bool = False,
     decision_gate: bool = False,
@@ -389,6 +414,11 @@ def main(
         persistent_policy=persistent_policy,
         persistent_auto_max_batch=persistent_auto_max_batch,
         persistent_auto_max_seq_len=persistent_auto_max_seq_len,
+        adaptive_selector_keys=adaptive_selector_keys,
+        experimental_block_policy=experimental_block_policy,
+        block_shape_tuning=block_shape_tuning,
+        composite_reference_harness=composite_reference_harness,
+        composite_compiled_harness=composite_compiled_harness,
         wrapper_phases=wrapper_phases,
     )
 
